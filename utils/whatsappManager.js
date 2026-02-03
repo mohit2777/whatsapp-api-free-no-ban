@@ -25,11 +25,10 @@ const aiAutoReply = require('./aiAutoReply');
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
 // Typing simulation configuration
-// Average human types ~40 WPM = ~200 chars/min = ~3.3 chars/sec
-// We'll use ~4 chars/sec for slightly faster but realistic typing
-const CHARS_PER_SECOND = 4;
-const MIN_TYPING_MS = 1500;  // Minimum 1.5 seconds
-const MAX_TYPING_MS = 15000; // Maximum 15 seconds
+// Using faster typing to prevent HTTP timeouts while still looking realistic
+const CHARS_PER_SECOND = parseInt(process.env.TYPING_CHARS_PER_SEC) || 8; // 8 chars/sec = fast but human-like
+const MIN_TYPING_MS = 1000;  // Minimum 1 second
+const MAX_TYPING_MS = 5000;  // Maximum 5 seconds (prevents timeout)
 const ONLINE_AFTER_SEND_MS = parseInt(process.env.ONLINE_AFTER_SEND_MS) || 15000; // Stay online 15s after sending
 
 // Message retry counter cache
@@ -630,7 +629,6 @@ class WhatsAppManager {
 
     try {
       // Calculate typing duration based on message length
-      // Average human types ~4 characters per second
       const typingDuration = Math.min(
         Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
         MAX_TYPING_MS
@@ -640,7 +638,7 @@ class WhatsAppManager {
       await sock.sendPresenceUpdate('available', jid);
       
       // Small delay before starting to type (reading the message)
-      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+      await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 400));
       
       // Start typing
       await sock.sendPresenceUpdate('composing', jid);
@@ -702,7 +700,6 @@ class WhatsAppManager {
 
     try {
       // Calculate typing duration based on message length
-      // Average human types ~4 characters per second
       const typingDuration = Math.min(
         Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
         MAX_TYPING_MS
@@ -712,7 +709,7 @@ class WhatsAppManager {
       await sock.sendPresenceUpdate('available', jid);
       
       // Small delay before starting to type (reading the message)
-      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+      await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 400));
       
       // Start typing
       await sock.sendPresenceUpdate('composing', jid);
