@@ -215,12 +215,20 @@ class WebhookDeliveryService {
    */
   async dispatch(accountId, event, data) {
     try {
+      logger.info(`Looking up webhooks for account ${accountId}, event: ${event}`);
       const webhooks = await db.getActiveWebhooks(accountId);
+      logger.info(`Found ${webhooks.length} active webhooks for account ${accountId}`);
+
+      if (webhooks.length === 0) {
+        logger.warn(`No active webhooks found for account ${accountId}`);
+        return;
+      }
 
       for (const webhook of webhooks) {
         // Check if webhook is subscribed to this event type
         const events = webhook.events || ['message'];
         if (!events.includes(event) && !events.includes('*')) {
+          logger.debug(`Webhook ${webhook.url} not subscribed to event ${event}`);
           continue;
         }
 
@@ -231,6 +239,7 @@ class WebhookDeliveryService {
           data
         };
 
+        logger.info(`Queueing webhook to ${webhook.url} for event ${event}`);
         await this.queueWebhook(accountId, webhook, payload);
       }
     } catch (error) {

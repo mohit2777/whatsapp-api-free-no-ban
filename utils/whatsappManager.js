@@ -502,7 +502,10 @@ class WhatsAppManager {
       for (const msg of messages) {
         if (msg.key.fromMe) continue; // Skip own messages
 
-        await this.handleIncomingMessage(accountId, msg);
+        // Handle message in background to not block event loop
+        this.handleIncomingMessage(accountId, msg).catch(err => {
+          logger.error(`Error in message handler for account ${accountId}:`, err.message);
+        });
       }
     });
 
@@ -572,25 +575,36 @@ class WhatsAppManager {
 
       if (!messageText) return;
 
-      logger.debug(`Message received from ${contactId}: ${messageText.substring(0, 50)}...`);
+      logger.info(`Message received from ${contactId}: ${messageText.substring(0, 50)}...`);
 
-      // Save to conversation history
-      await db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType);
+      // Save to conversation history (don't block webhook if this fails)
+      try {
+        await db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType);
+      } catch (dbErr) {
+        logger.error(`Failed to save conversation: ${dbErr.message}`);
+      }
 
       // Dispatch webhook with both phone and JID for flexibility
       // Note: When isLidSender is true, 'from' contains the LID (not a real phone number)
       // Always use 'fromJid' with the 'jid' parameter in API calls to reply
-      webhookDeliveryService.dispatch(accountId, 'message', {
-        messageId: msg.key.id,
-        from: contactId,
-        fromJid: remoteJid,
-        isLidSender: isLidFormat,  // true = 'from' is LID, not a real phone number
-        message: messageText,
-        messageType,
-        isGroup,
-        timestamp: msg.messageTimestamp,
-        pushName: msg.pushName || 'Unknown'
-      });
+      logger.info(`Dispatching webhook for account ${accountId}, event: message`);
+      
+      try {
+        await webhookDeliveryService.dispatch(accountId, 'message', {
+          messageId: msg.key.id,
+          from: contactId,
+          fromJid: remoteJid,
+          isLidSender: isLidFormat,  // true = 'from' is LID, not a real phone number
+          message: messageText,
+          messageType,
+          isGroup,
+          timestamp: msg.messageTimestamp,
+          pushName: msg.pushName || 'Unknown'
+        });
+        logger.info(`Webhook dispatched successfully for account ${accountId}`);
+      } catch (webhookErr) {
+        logger.error(`Webhook dispatch failed: ${webhookErr.message}`);
+      }
 
       // AI Auto-reply (only for text messages, non-group)
       if (messageType === 'text' && !isGroup) {
