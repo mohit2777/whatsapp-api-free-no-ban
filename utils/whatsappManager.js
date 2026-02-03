@@ -43,7 +43,12 @@ class WhatsAppManager {
     this.reconnectAttempts = new Map();
     this.reconnectTimers = new Map(); // accountId -> timer
     this.deletedAccounts = new Set(); // Track deleted accounts to prevent reconnection
+    this.connectionLocks = new Set(); // Prevent concurrent connection attempts
+    this.sessionConflictCounts = new Map(); // Track 440 errors specifically
+    this.lastConnectionAttempt = new Map(); // Track timing to prevent rapid reconnects
     this.maxReconnectAttempts = 5;
+    this.maxSessionConflicts = 3; // Max 440 errors before requiring manual reconnect
+    this.minReconnectInterval = 30000; // Minimum 30 seconds between any reconnection
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -93,6 +98,117 @@ class WhatsAppManager {
   getAccountStatus(accountId) {
     const state = this.connectionStates.get(accountId);
     return state || { status: 'disconnected' };
+  }
+
+  /**
+   * Schedule a reconnection with proper tracking
+   */
+  scheduleReconnect(accountId, delay) {
+    // Cancel any existing reconnect timer
+    const existingTimer = this.reconnectTimers.get(accountId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(accountId);
+      if (!this.deletedAccounts.has(accountId)) {
+        this.connect(accountId).catch(e => {
+          logger.error(`Scheduled reconnection failed for ${accountId}: ${e.message}`);
+        });
+      }
+    }, delay);
+    
+    this.reconnectTimers.set(accountId, timer);
+  }
+
+  /**
+   * Handle session conflict (status 440) - CRITICAL for ban prevention
+   */
+  async handleSessionConflict(accountId) {
+    const conflictCount = (this.sessionConflictCounts.get(accountId) || 0) + 1;
+    this.sessionConflictCounts.set(accountId, conflictCount);
+
+    logger.warn(`Session conflict #${conflictCount} for account ${accountId}`);
+
+    if (conflictCount >= this.maxSessionConflicts) {
+      // Too many conflicts - stop trying, require manual intervention
+      logger.error(`Persistent session conflict for ${accountId} (${conflictCount} times), stopping auto-reconnect`);
+      
+      this.connectionStates.set(accountId, { status: 'error', error: 'Session conflict - phone may be using WhatsApp' });
+      await db.updateAccount(accountId, { 
+        status: 'error',
+        error_message: 'Session conflict detected. Please ensure WhatsApp is not open on your phone, wait 5 minutes, then click Reconnect.'
+      }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+      
+      this.emit('account-status', { 
+        accountId, 
+        status: 'error', 
+        message: 'Session conflict - please wait and reconnect manually' 
+      });
+      
+      // Reset conflict counter after 10 minutes
+      setTimeout(() => {
+        this.sessionConflictCounts.delete(accountId);
+      }, 600000);
+      
+      return;
+    }
+
+    // Exponential backoff for 440: 60s, 120s, 240s with jitter
+    const baseDelay = 60000 * Math.pow(2, conflictCount - 1);
+    const jitter = Math.floor(Math.random() * 15000);
+    const delay = baseDelay + jitter;
+
+    logger.info(`Waiting ${delay}ms before reconnect attempt for ${accountId} (conflict #${conflictCount})`);
+    
+    this.connectionStates.set(accountId, { status: 'reconnecting' });
+    this.emit('account-status', { accountId, status: 'reconnecting', message: `Waiting ${Math.round(delay/1000)}s...` });
+    
+    this.scheduleReconnect(accountId, delay);
+  }
+
+  /**
+   * Clear corrupted session and require re-authentication
+   */
+  async clearCorruptedSession(accountId) {
+    logger.warn(`Clearing corrupted session for account ${accountId}`);
+
+    // Clear all tracking
+    this.sessionConflictCounts.delete(accountId);
+    this.reconnectAttempts.delete(accountId);
+    this.connectionLocks.delete(accountId);
+
+    // Cancel any pending reconnect
+    const timer = this.reconnectTimers.get(accountId);
+    if (timer) {
+      clearTimeout(timer);
+      this.reconnectTimers.delete(accountId);
+    }
+
+    // Clear auth state files
+    const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
+    try {
+      await fs.rm(authPath, { recursive: true, force: true });
+      await fs.mkdir(authPath, { recursive: true });
+    } catch (e) {
+      logger.warn(`Could not clear auth files: ${e.message}`);
+    }
+
+    // Update database
+    this.connectionStates.set(accountId, { status: 'disconnected' });
+    await db.updateAccount(accountId, { 
+      status: 'disconnected',
+      session_data: null,
+      qr_code: null,
+      error_message: 'Session corrupted - please scan QR code to reconnect'
+    }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+
+    this.emit('account-status', { 
+      accountId, 
+      status: 'disconnected', 
+      message: 'Session expired - please reconnect' 
+    });
   }
 
   /**
@@ -244,8 +360,11 @@ class WhatsAppManager {
         this.reconnectTimers.delete(accountId);
       }
 
-      // Clear reconnection attempts
+      // Clear all tracking for this account
       this.reconnectAttempts.delete(accountId);
+      this.sessionConflictCounts.delete(accountId);
+      this.connectionLocks.delete(accountId);
+      this.lastConnectionAttempt.delete(accountId);
 
       // Disconnect if connected
       await this.disconnect(accountId, false);
@@ -285,9 +404,32 @@ class WhatsAppManager {
         return;
       }
 
+      // Prevent concurrent connection attempts (causes session conflicts!)
+      if (this.connectionLocks.has(accountId)) {
+        logger.warn(`Connection already in progress for ${accountId}, skipping`);
+        return;
+      }
+
+      // Enforce minimum interval between connection attempts
+      const lastAttempt = this.lastConnectionAttempt.get(accountId);
+      if (lastAttempt) {
+        const elapsed = Date.now() - lastAttempt;
+        if (elapsed < this.minReconnectInterval) {
+          const waitTime = this.minReconnectInterval - elapsed;
+          logger.info(`Rate limiting reconnection for ${accountId}, waiting ${waitTime}ms`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
+
+      // Set connection lock
+      this.connectionLocks.add(accountId);
+      this.lastConnectionAttempt.set(accountId, Date.now());
+
       // Disconnect existing connection if any
       if (this.connections.has(accountId)) {
         await this.disconnect(accountId, false);
+        // Wait after disconnect to prevent rapid reconnect
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       const account = await db.getAccountById(accountId);
@@ -295,6 +437,7 @@ class WhatsAppManager {
         logger.warn(`Account ${accountId} not found in database, skipping connection`);
         this.connectionStates.delete(accountId);
         this.reconnectAttempts.delete(accountId);
+        this.connectionLocks.delete(accountId);
         return;
       }
 
@@ -319,7 +462,7 @@ class WhatsAppManager {
       // Create silent logger for Baileys
       const baileysLogger = pino({ level: 'silent' });
 
-      // Create socket
+      // Create socket with anti-ban settings
       const sock = makeWASocket({
         version,
         auth: {
@@ -331,11 +474,13 @@ class WhatsAppManager {
         browser: ['WhatsApp Multi-Automation', 'Chrome', '120.0.0'],
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
-        markOnlineOnConnect: true,
+        markOnlineOnConnect: false, // Don't mark online immediately - more natural
         getMessage: async (key) => {
           return { conversation: '' };
         },
-        msgRetryCounterCache
+        msgRetryCounterCache,
+        // Anti-ban: Disable link previews and aggressive features
+        linkPreviewImageThumbnailWidth: 0
       });
 
       // Store connection
@@ -344,10 +489,14 @@ class WhatsAppManager {
       // Setup event handlers
       this.setupEventHandlers(accountId, sock, saveCreds);
 
+      // Release lock after short delay (handlers take over)
+      setTimeout(() => this.connectionLocks.delete(accountId), 5000);
+
       logger.info(`Connection initiated for account ${accountId}`);
       
       return sock;
     } catch (error) {
+      this.connectionLocks.delete(accountId);
       logger.error(`Failed to connect account ${accountId}:`, error.message);
       this.connectionStates.set(accountId, { status: 'error', error: error.message });
       await db.updateAccount(accountId, { status: 'error', error_message: error.message });
@@ -359,19 +508,26 @@ class WhatsAppManager {
    * Setup event handlers for WhatsApp socket
    */
   setupEventHandlers(accountId, sock, saveCreds) {
+    // Global error handler for socket events - prevents unhandled rejections
+    sock.ev.on('error', (error) => {
+      logger.error(`Socket error for account ${accountId}: ${error.message}`);
+      // Don't crash, let connection.update handle reconnection
+    });
+
     // Connection update
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      try {
+        const { connection, lastDisconnect, qr } = update;
 
-      if (qr) {
-        // Generate QR code
-        const qrDataUrl = await qrcode.toDataURL(qr);
-        this.connectionStates.set(accountId, { status: 'qr_ready', qr: qrDataUrl });
-        
-        await db.updateAccount(accountId, { 
-          status: 'qr_ready', 
-          qr_code: qrDataUrl 
-        });
+        if (qr) {
+          // Generate QR code
+          const qrDataUrl = await qrcode.toDataURL(qr);
+          this.connectionStates.set(accountId, { status: 'qr_ready', qr: qrDataUrl });
+          
+          await db.updateAccount(accountId, { 
+            status: 'qr_ready', 
+            qr_code: qrDataUrl 
+          });
 
         this.emit('qr-update', { accountId, qr: qrDataUrl });
         logger.info(`QR code generated for account ${accountId}`);
@@ -379,9 +535,13 @@ class WhatsAppManager {
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message || '';
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        logger.warn(`Connection closed for account ${accountId}: ${statusCode}`);
+        logger.warn(`Connection closed for account ${accountId}: ${statusCode} - ${errorMessage}`);
+
+        // Release connection lock
+        this.connectionLocks.delete(accountId);
 
         // Check if account was deleted - don't try to reconnect or update DB
         if (this.deletedAccounts.has(accountId)) {
@@ -389,41 +549,29 @@ class WhatsAppManager {
           return;
         }
 
-        // Status 440 = Connection replaced (session conflict) - delay more and clear auth state
+        // Handle Bad MAC / session corruption errors - require full re-auth
+        if (errorMessage.includes('Bad MAC') || errorMessage.includes('decrypt')) {
+          logger.error(`Session corrupted for ${accountId} (Bad MAC), clearing session`);
+          await this.clearCorruptedSession(accountId);
+          return;
+        }
+
+        // Status 440 = Session conflict - CRITICAL: handle carefully to prevent ban
         if (statusCode === 440) {
-          logger.warn(`Session conflict detected for account ${accountId}, waiting before reconnect...`);
-          const attempts = this.reconnectAttempts.get(accountId) || 0;
-          
-          if (attempts >= 3) {
-            // After 3 attempts with 440, session might be corrupted - require re-auth
-            logger.error(`Persistent session conflict for ${accountId}, clearing session`);
-            this.connectionStates.set(accountId, { status: 'disconnected' });
-            await db.updateAccount(accountId, { 
-              status: 'disconnected', 
-              session_data: null,
-              qr_code: null,
-              error_message: 'Session conflict - please re-scan QR code'
-            }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
-            this.emit('account-status', { accountId, status: 'disconnected', message: 'Session conflict - please reconnect' });
-            return;
-          }
-          
-          this.reconnectAttempts.set(accountId, attempts + 1);
-          const delay = 5000 + (attempts * 5000); // 5s, 10s, 15s delays
-          logger.info(`Reconnecting account ${accountId} in ${delay}ms after 440 (attempt ${attempts + 1})`);
-          
-          const timer = setTimeout(() => {
-            this.reconnectTimers.delete(accountId);
-            this.connect(accountId).catch(e => {
-              logger.error(`Reconnection failed for ${accountId}: ${e.message}`);
-            });
-          }, delay);
-          this.reconnectTimers.set(accountId, timer);
+          await this.handleSessionConflict(accountId);
+          return;
+        }
+
+        // Status 428 = Connection closed prematurely - wait longer
+        if (statusCode === 428) {
+          logger.warn(`Premature close for ${accountId}, waiting 60s before reconnect`);
+          this.scheduleReconnect(accountId, 60000);
           return;
         }
 
         if (statusCode === DisconnectReason.loggedOut) {
-          // User logged out - clear session
+          // User logged out - clear session completely
+          logger.info(`Account ${accountId} logged out, clearing session`);
           this.connectionStates.set(accountId, { status: 'disconnected' });
           await db.updateAccount(accountId, { 
             status: 'disconnected', 
@@ -433,39 +581,38 @@ class WhatsAppManager {
           
           this.emit('account-status', { accountId, status: 'disconnected' });
         } else if (shouldReconnect) {
-          // Attempt reconnection
+          // Standard reconnection with exponential backoff
           const attempts = this.reconnectAttempts.get(accountId) || 0;
           
           if (attempts < this.maxReconnectAttempts) {
             this.reconnectAttempts.set(accountId, attempts + 1);
             this.metrics.reconnections++;
             
-            const delay = Math.min(1000 * Math.pow(2, attempts), 30000);
-            logger.info(`Reconnecting account ${accountId} in ${delay}ms (attempt ${attempts + 1})`);
+            // Exponential backoff with jitter: 30s, 60s, 120s, 240s, 480s + random 0-10s
+            const baseDelay = Math.min(30000 * Math.pow(2, attempts), 480000);
+            const jitter = Math.floor(Math.random() * 10000);
+            const delay = baseDelay + jitter;
             
-            // Store timer reference so it can be cancelled
-            const timer = setTimeout(() => {
-              this.reconnectTimers.delete(accountId);
-              this.connect(accountId).catch(e => {
-                logger.error(`Reconnection failed for ${accountId}: ${e.message}`);
-              });
-            }, delay);
-            this.reconnectTimers.set(accountId, timer);
+            logger.info(`Reconnecting account ${accountId} in ${delay}ms (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
+            this.scheduleReconnect(accountId, delay);
           } else {
             logger.error(`Max reconnection attempts reached for account ${accountId}`);
             this.connectionStates.set(accountId, { status: 'error', error: 'Max reconnection attempts reached' });
             await db.updateAccount(accountId, { status: 'error', error_message: 'Max reconnection attempts reached' })
               .catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'error', message: 'Max reconnection attempts - please reconnect manually' });
           }
         }
       }
 
       if (connection === 'open') {
-        // Successfully connected
+        // Successfully connected - reset all error tracking
         const phoneNumber = sock.user?.id ? this.getPhoneNumber(sock.user.id) : null;
         
         this.connectionStates.set(accountId, { status: 'ready', phoneNumber });
         this.reconnectAttempts.delete(accountId);
+        this.sessionConflictCounts.delete(accountId); // Reset conflict counter on success
+        this.connectionLocks.delete(accountId);
 
         await db.updateAccount(accountId, { 
           status: 'ready', 
@@ -486,6 +633,9 @@ class WhatsAppManager {
           status: 'connected',
           phoneNumber
         });
+      }
+      } catch (error) {
+        logger.error(`Error in connection.update handler for ${accountId}: ${error.message}`);
       }
     });
 
