@@ -1,0 +1,36 @@
+# Render.com Blueprint Specification
+# Deploy: https://render.com/deploy?repo=YOUR_REPO_URL
+
+services:
+  - type: web
+    name: whatsapp-multi-automation
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /ping
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whatsapp-db
+          property: connectionString
+      - key: TYPING_DELAY_MS
+        value: "1500"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+
+databases:
+  - name: whatsapp-db
+    plan: free
+    databaseName: whatsapp_automation
+    postgresMajorVersion: "15"
