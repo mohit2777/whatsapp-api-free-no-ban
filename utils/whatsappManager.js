@@ -24,13 +24,6 @@ const aiAutoReply = require('./aiAutoReply');
 
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
-// Typing simulation configuration
-// Using faster typing to prevent HTTP timeouts while still looking realistic
-const CHARS_PER_SECOND = parseInt(process.env.TYPING_CHARS_PER_SEC) || 8; // 8 chars/sec = fast but human-like
-const MIN_TYPING_MS = 1000;  // Minimum 1 second
-const MAX_TYPING_MS = 5000;  // Maximum 5 seconds (prevents timeout)
-const ONLINE_AFTER_SEND_MS = parseInt(process.env.ONLINE_AFTER_SEND_MS) || 15000; // Stay online 15s after sending
-
 // Message retry counter cache
 const msgRetryCounterCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
 
@@ -628,28 +621,7 @@ class WhatsAppManager {
     }
 
     try {
-      // Calculate typing duration based on message length
-      const typingDuration = Math.min(
-        Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
-        MAX_TYPING_MS
-      );
-
-      // Show online status first
-      await sock.sendPresenceUpdate('available', jid);
-      
-      // Small delay before starting to type (reading the message)
-      await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 400));
-      
-      // Start typing
-      await sock.sendPresenceUpdate('composing', jid);
-      
-      // Wait for realistic typing duration
-      await new Promise(resolve => setTimeout(resolve, typingDuration));
-      
-      // Stop typing
-      await sock.sendPresenceUpdate('paused', jid);
-
-      // Send message
+      // Send message immediately
       const result = await sock.sendMessage(jid, { text: message });
 
       this.metrics.messagesSent++;
@@ -657,20 +629,7 @@ class WhatsAppManager {
       // Save to conversation history
       await db.addConversationMessage(accountId, phone, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${phone} (typed ${typingDuration}ms for ${message.length} chars)`);
-
-      // Keep showing online for a while after sending (non-blocking)
-      setTimeout(async () => {
-        try {
-          await sock.sendPresenceUpdate('available', jid);
-          // Then go offline after the configured duration
-          setTimeout(async () => {
-            try {
-              await sock.sendPresenceUpdate('unavailable', jid);
-            } catch (e) { /* ignore */ }
-          }, ONLINE_AFTER_SEND_MS);
-        } catch (e) { /* ignore */ }
-      }, 100);
+      logger.info(`Message sent to ${phone}`);
 
       return {
         success: true,
@@ -699,28 +658,7 @@ class WhatsAppManager {
     }
 
     try {
-      // Calculate typing duration based on message length
-      const typingDuration = Math.min(
-        Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
-        MAX_TYPING_MS
-      );
-
-      // Show online status first
-      await sock.sendPresenceUpdate('available', jid);
-      
-      // Small delay before starting to type (reading the message)
-      await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 400));
-      
-      // Start typing
-      await sock.sendPresenceUpdate('composing', jid);
-      
-      // Wait for realistic typing duration
-      await new Promise(resolve => setTimeout(resolve, typingDuration));
-      
-      // Stop typing
-      await sock.sendPresenceUpdate('paused', jid);
-
-      // Send message
+      // Send message immediately
       const result = await sock.sendMessage(jid, { text: message });
 
       this.metrics.messagesSent++;
@@ -729,20 +667,7 @@ class WhatsAppManager {
       const contactId = this.getPhoneNumber(jid);
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${jid} (typed ${typingDuration}ms for ${message.length} chars)`);
-
-      // Keep showing online for a while after sending (non-blocking)
-      setTimeout(async () => {
-        try {
-          await sock.sendPresenceUpdate('available', jid);
-          // Then go offline after the configured duration
-          setTimeout(async () => {
-            try {
-              await sock.sendPresenceUpdate('unavailable', jid);
-            } catch (e) { /* ignore */ }
-          }, ONLINE_AFTER_SEND_MS);
-        } catch (e) { /* ignore */ }
-      }, 100);
+      logger.info(`Message sent to ${jid}`);
 
       return {
         success: true,
