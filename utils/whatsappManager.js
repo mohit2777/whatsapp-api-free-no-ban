@@ -23,7 +23,14 @@ const aiAutoReply = require('./aiAutoReply');
 // ============================================================================
 
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
-const TYPING_DELAY_MS = parseInt(process.env.TYPING_DELAY_MS) || 1500;
+
+// Typing simulation configuration
+// Average human types ~40 WPM = ~200 chars/min = ~3.3 chars/sec
+// We'll use ~4 chars/sec for slightly faster but realistic typing
+const CHARS_PER_SECOND = 4;
+const MIN_TYPING_MS = 1500;  // Minimum 1.5 seconds
+const MAX_TYPING_MS = 15000; // Maximum 15 seconds
+const ONLINE_AFTER_SEND_MS = parseInt(process.env.ONLINE_AFTER_SEND_MS) || 15000; // Stay online 15s after sending
 
 // Message retry counter cache
 const msgRetryCounterCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
@@ -622,12 +629,27 @@ class WhatsAppManager {
     }
 
     try {
-      // Simulate typing
-      if (TYPING_DELAY_MS > 0) {
-        await sock.sendPresenceUpdate('composing', jid);
-        await new Promise(resolve => setTimeout(resolve, TYPING_DELAY_MS));
-        await sock.sendPresenceUpdate('paused', jid);
-      }
+      // Calculate typing duration based on message length
+      // Average human types ~4 characters per second
+      const typingDuration = Math.min(
+        Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
+        MAX_TYPING_MS
+      );
+
+      // Show online status first
+      await sock.sendPresenceUpdate('available', jid);
+      
+      // Small delay before starting to type (reading the message)
+      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+      
+      // Start typing
+      await sock.sendPresenceUpdate('composing', jid);
+      
+      // Wait for realistic typing duration
+      await new Promise(resolve => setTimeout(resolve, typingDuration));
+      
+      // Stop typing
+      await sock.sendPresenceUpdate('paused', jid);
 
       // Send message
       const result = await sock.sendMessage(jid, { text: message });
@@ -637,7 +659,20 @@ class WhatsAppManager {
       // Save to conversation history
       await db.addConversationMessage(accountId, phone, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${phone} from account ${accountId}`);
+      logger.info(`Message sent to ${phone} (typed ${typingDuration}ms for ${message.length} chars)`);
+
+      // Keep showing online for a while after sending (non-blocking)
+      setTimeout(async () => {
+        try {
+          await sock.sendPresenceUpdate('available', jid);
+          // Then go offline after the configured duration
+          setTimeout(async () => {
+            try {
+              await sock.sendPresenceUpdate('unavailable', jid);
+            } catch (e) { /* ignore */ }
+          }, ONLINE_AFTER_SEND_MS);
+        } catch (e) { /* ignore */ }
+      }, 100);
 
       return {
         success: true,
@@ -666,12 +701,27 @@ class WhatsAppManager {
     }
 
     try {
-      // Simulate typing
-      if (TYPING_DELAY_MS > 0) {
-        await sock.sendPresenceUpdate('composing', jid);
-        await new Promise(resolve => setTimeout(resolve, TYPING_DELAY_MS));
-        await sock.sendPresenceUpdate('paused', jid);
-      }
+      // Calculate typing duration based on message length
+      // Average human types ~4 characters per second
+      const typingDuration = Math.min(
+        Math.max(Math.ceil(message.length / CHARS_PER_SECOND) * 1000, MIN_TYPING_MS),
+        MAX_TYPING_MS
+      );
+
+      // Show online status first
+      await sock.sendPresenceUpdate('available', jid);
+      
+      // Small delay before starting to type (reading the message)
+      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+      
+      // Start typing
+      await sock.sendPresenceUpdate('composing', jid);
+      
+      // Wait for realistic typing duration
+      await new Promise(resolve => setTimeout(resolve, typingDuration));
+      
+      // Stop typing
+      await sock.sendPresenceUpdate('paused', jid);
 
       // Send message
       const result = await sock.sendMessage(jid, { text: message });
@@ -682,7 +732,20 @@ class WhatsAppManager {
       const contactId = this.getPhoneNumber(jid);
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${jid} from account ${accountId}`);
+      logger.info(`Message sent to ${jid} (typed ${typingDuration}ms for ${message.length} chars)`);
+
+      // Keep showing online for a while after sending (non-blocking)
+      setTimeout(async () => {
+        try {
+          await sock.sendPresenceUpdate('available', jid);
+          // Then go offline after the configured duration
+          setTimeout(async () => {
+            try {
+              await sock.sendPresenceUpdate('unavailable', jid);
+            } catch (e) { /* ignore */ }
+          }, ONLINE_AFTER_SEND_MS);
+        } catch (e) { /* ignore */ }
+      }, 100);
 
       return {
         success: true,
