@@ -530,6 +530,13 @@ class WhatsAppManager {
       const sock = this.connections.get(accountId);
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
+
+      // Send read receipt (blue ticks) for the incoming message
+      try {
+        await sock.readMessages([msg.key]);
+      } catch (readErr) {
+        logger.debug(`Could not send read receipt: ${readErr.message}`);
+      }
       
       // Check if sender is using LID format (privacy protected)
       const isLidFormat = remoteJid?.includes('@lid');
@@ -621,7 +628,14 @@ class WhatsAppManager {
     }
 
     try {
-      // Send message immediately
+      // Simulate typing before sending (makes it look natural)
+      await sock.sendPresenceUpdate('composing', jid);
+      // Brief delay to show typing indicator (300-800ms based on message length)
+      const typingDelay = Math.min(300 + message.length * 10, 800);
+      await new Promise(resolve => setTimeout(resolve, typingDelay));
+      await sock.sendPresenceUpdate('paused', jid);
+
+      // Send message
       const result = await sock.sendMessage(jid, { text: message });
 
       this.metrics.messagesSent++;
@@ -658,7 +672,14 @@ class WhatsAppManager {
     }
 
     try {
-      // Send message immediately
+      // Simulate typing before sending (makes it look natural)
+      await sock.sendPresenceUpdate('composing', jid);
+      // Brief delay to show typing indicator (300-800ms based on message length)
+      const typingDelay = Math.min(300 + message.length * 10, 800);
+      await new Promise(resolve => setTimeout(resolve, typingDelay));
+      await sock.sendPresenceUpdate('paused', jid);
+
+      // Send message
       const result = await sock.sendMessage(jid, { text: message });
 
       this.metrics.messagesSent++;
@@ -712,6 +733,11 @@ class WhatsAppManager {
     }
 
     try {
+      // Simulate typing before sending media (makes it look natural)
+      await sock.sendPresenceUpdate('composing', jid);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await sock.sendPresenceUpdate('paused', jid);
+
       let messageContent;
 
       switch (mediaType) {
