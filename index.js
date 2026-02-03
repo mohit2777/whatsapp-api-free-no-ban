@@ -401,10 +401,14 @@ app.post('/api/send', messageLimiter, validate(schemas.sendMessage), async (req,
 // Send media via file upload
 app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, res) => {
   try {
-    const { api_key, phone, caption, mediaType } = req.body;
+    const { api_key, to, caption, mediaType } = req.body;
 
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No media file provided' });
+    }
+
+    if (!to) {
+      return res.status(400).json({ success: false, error: 'Missing required field: to (phone number or JID)' });
     }
 
     const account = await db.getAccountByApiKey(api_key);
@@ -418,7 +422,7 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
 
     const result = await whatsappManager.sendMedia(
       account.id,
-      phone,
+      to,
       req.file.buffer,
       mediaType || 'document',
       caption || '',

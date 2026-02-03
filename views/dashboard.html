@@ -232,10 +232,19 @@ curl -X POST https://YOUR_DOMAIN/api/send \
   }'</code></pre>
 
                             <h3>📷 2. Send Media via File Upload</h3>
-                            <p class="info-text">POST /api/send-media (multipart/form-data)</p>
-                            <pre><code>curl -X POST https://YOUR_DOMAIN/api/send-media \
+                            <p class="info-text">POST /api/send-media (multipart/form-data) - Use <code>to</code> for both phone and JID</p>
+                            <pre><code># Send to phone number:
+curl -X POST https://YOUR_DOMAIN/api/send-media \
   -F "api_key=YOUR_API_KEY" \
-  -F "phone=918005780278" \
+  -F "to=918005780278" \
+  -F "mediaType=image" \
+  -F "caption=Check this out!" \
+  -F "media=@/path/to/image.jpg"
+
+# Reply using fromJid from webhook:
+curl -X POST https://YOUR_DOMAIN/api/send-media \
+  -F "api_key=YOUR_API_KEY" \
+  -F "to={{ $json.data.fromJid }}" \
   -F "mediaType=image" \
   -F "caption=Check this out!" \
   -F "media=@/path/to/image.jpg"
