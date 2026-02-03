@@ -200,10 +200,30 @@ app.get('/dashboard', requireAuth, (req, res) => {
 });
 
 // ============================================================================
-// HEALTH CHECK
+// HEALTH CHECK & KEEPALIVE
 // ============================================================================
 
+// Simple ping for basic health checks
 app.get('/ping', (req, res) => res.send('pong'));
+
+// Keepalive endpoint - trigger this with a cron job (GET request) to prevent Render from sleeping
+// Works with n8n Cron Trigger → HTTP Request Node (GET to this URL)
+app.get('/keepalive', (req, res) => {
+  const uptime = process.uptime();
+  const metrics = whatsappManager.getMetrics();
+  
+  res.json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(uptime),
+    uptimeFormatted: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`,
+    connections: metrics.activeConnections,
+    messagesSent: metrics.messagesSent,
+    messagesReceived: metrics.messagesReceived
+  });
+  
+  logger.debug('Keepalive ping received');
+});
 
 app.get('/api/health', async (req, res) => {
   try {
