@@ -390,6 +390,39 @@ class WhatsAppManager {
           return;
         }
 
+        // Status 440 = Connection replaced (session conflict) - delay more and clear auth state
+        if (statusCode === 440) {
+          logger.warn(`Session conflict detected for account ${accountId}, waiting before reconnect...`);
+          const attempts = this.reconnectAttempts.get(accountId) || 0;
+          
+          if (attempts >= 3) {
+            // After 3 attempts with 440, session might be corrupted - require re-auth
+            logger.error(`Persistent session conflict for ${accountId}, clearing session`);
+            this.connectionStates.set(accountId, { status: 'disconnected' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected', 
+              session_data: null,
+              qr_code: null,
+              error_message: 'Session conflict - please re-scan QR code'
+            }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'Session conflict - please reconnect' });
+            return;
+          }
+          
+          this.reconnectAttempts.set(accountId, attempts + 1);
+          const delay = 5000 + (attempts * 5000); // 5s, 10s, 15s delays
+          logger.info(`Reconnecting account ${accountId} in ${delay}ms after 440 (attempt ${attempts + 1})`);
+          
+          const timer = setTimeout(() => {
+            this.reconnectTimers.delete(accountId);
+            this.connect(accountId).catch(e => {
+              logger.error(`Reconnection failed for ${accountId}: ${e.message}`);
+            });
+          }, delay);
+          this.reconnectTimers.set(accountId, timer);
+          return;
+        }
+
         if (statusCode === DisconnectReason.loggedOut) {
           // User logged out - clear session
           this.connectionStates.set(accountId, { status: 'disconnected' });

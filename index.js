@@ -99,11 +99,19 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 let sessionStore = null;
 
-if (process.env.DATABASE_URL) {
+// Only use PostgreSQL if DATABASE_URL is set AND looks valid (not a placeholder)
+const dbUrl = process.env.DATABASE_URL;
+const isValidDbUrl = dbUrl && 
+  dbUrl.includes('://') && 
+  !dbUrl.includes('user:password') && 
+  !dbUrl.includes('@host:') &&
+  !dbUrl.includes('localhost') || (process.env.NODE_ENV !== 'production');
+
+if (isValidDbUrl) {
   try {
     const pgPool = new pg.Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      connectionString: dbUrl,
+      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
       connectionTimeoutMillis: 30000,
       idleTimeoutMillis: 60000,
       max: 3
@@ -122,7 +130,7 @@ if (process.env.DATABASE_URL) {
 
     logger.info('Using PostgreSQL for session storage');
   } catch (e) {
-    logger.warn('PostgreSQL session setup failed, using MemoryStore');
+    logger.warn('PostgreSQL session setup failed, using MemoryStore:', e.message);
   }
 }
 
