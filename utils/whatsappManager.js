@@ -46,9 +46,10 @@ class WhatsAppManager {
     this.connectionLocks = new Set(); // Prevent concurrent connection attempts
     this.sessionConflictCounts = new Map(); // Track 440 errors specifically
     this.lastConnectionAttempt = new Map(); // Track timing to prevent rapid reconnects
+    this.isShuttingDown = false; // Prevent reconnection during shutdown
     this.maxReconnectAttempts = 5;
     this.maxSessionConflicts = 3; // Max 440 errors before requiring manual reconnect
-    this.minReconnectInterval = 30000; // Minimum 30 seconds between any reconnection
+    this.minReconnectInterval = 60000; // Minimum 60 seconds between any reconnection
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -104,6 +105,12 @@ class WhatsAppManager {
    * Schedule a reconnection with proper tracking
    */
   scheduleReconnect(accountId, delay) {
+    // Don't schedule reconnect if shutting down
+    if (this.isShuttingDown) {
+      logger.info(`Not scheduling reconnect for ${accountId} - app is shutting down`);
+      return;
+    }
+
     // Cancel any existing reconnect timer
     const existingTimer = this.reconnectTimers.get(accountId);
     if (existingTimer) {
@@ -112,7 +119,7 @@ class WhatsAppManager {
 
     const timer = setTimeout(() => {
       this.reconnectTimers.delete(accountId);
-      if (!this.deletedAccounts.has(accountId)) {
+      if (!this.deletedAccounts.has(accountId) && !this.isShuttingDown) {
         this.connect(accountId).catch(e => {
           logger.error(`Scheduled reconnection failed for ${accountId}: ${e.message}`);
         });
@@ -536,16 +543,29 @@ class WhatsAppManager {
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorMessage = lastDisconnect?.error?.message || '';
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
         logger.warn(`Connection closed for account ${accountId}: ${statusCode} - ${errorMessage}`);
 
         // Release connection lock
         this.connectionLocks.delete(accountId);
 
+        // Don't reconnect if app is shutting down
+        if (this.isShuttingDown) {
+          logger.info(`App shutting down, not reconnecting account ${accountId}`);
+          return;
+        }
+
         // Check if account was deleted - don't try to reconnect or update DB
         if (this.deletedAccounts.has(accountId)) {
           logger.info(`Account ${accountId} was deleted, skipping reconnection`);
+          return;
+        }
+
+        // Handle undefined status code (usually happens during shutdown or network issues)
+        if (statusCode === undefined) {
+          logger.info(`Undefined status code for ${accountId}, waiting 60s before reconnect`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          this.scheduleReconnect(accountId, 60000);
           return;
         }
 
@@ -580,7 +600,7 @@ class WhatsAppManager {
           }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
           
           this.emit('account-status', { accountId, status: 'disconnected' });
-        } else if (shouldReconnect) {
+        } else {
           // Standard reconnection with exponential backoff
           const attempts = this.reconnectAttempts.get(accountId) || 0;
           
@@ -588,12 +608,13 @@ class WhatsAppManager {
             this.reconnectAttempts.set(accountId, attempts + 1);
             this.metrics.reconnections++;
             
-            // Exponential backoff with jitter: 30s, 60s, 120s, 240s, 480s + random 0-10s
-            const baseDelay = Math.min(30000 * Math.pow(2, attempts), 480000);
-            const jitter = Math.floor(Math.random() * 10000);
+            // Exponential backoff with jitter: 60s, 120s, 240s, 480s, 960s + random 0-30s
+            const baseDelay = Math.min(60000 * Math.pow(2, attempts), 960000);
+            const jitter = Math.floor(Math.random() * 30000);
             const delay = baseDelay + jitter;
             
-            logger.info(`Reconnecting account ${accountId} in ${delay}ms (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
+            logger.info(`Reconnecting account ${accountId} in ${Math.round(delay/1000)}s (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
+            this.connectionStates.set(accountId, { status: 'reconnecting' });
             this.scheduleReconnect(accountId, delay);
           } else {
             logger.error(`Max reconnection attempts reached for account ${accountId}`);
@@ -1131,6 +1152,17 @@ class WhatsAppManager {
   async shutdown() {
     logger.info('Shutting down WhatsApp manager...');
     
+    // Set shutdown flag to prevent reconnection attempts
+    this.isShuttingDown = true;
+    
+    // Cancel all pending reconnection timers
+    for (const [accountId, timer] of this.reconnectTimers) {
+      clearTimeout(timer);
+      logger.debug(`Cancelled reconnect timer for ${accountId}`);
+    }
+    this.reconnectTimers.clear();
+    
+    // Disconnect all accounts gracefully
     for (const [accountId, sock] of this.connections) {
       try {
         await this.saveSession(accountId);
@@ -1142,6 +1174,11 @@ class WhatsAppManager {
 
     this.connections.clear();
     this.connectionStates.clear();
+    this.connectionLocks.clear();
+    this.sessionConflictCounts.clear();
+    this.reconnectAttempts.clear();
+    
+    logger.info('WhatsApp manager shutdown complete');
   }
 }
 
