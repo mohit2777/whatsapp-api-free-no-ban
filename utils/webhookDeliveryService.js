@@ -62,14 +62,21 @@ class WebhookDeliveryService {
         next_retry_at: new Date().toISOString()
       });
 
-      logger.debug(`Webhook queued for ${webhook.url}`);
+      logger.info(`Webhook queued successfully for ${webhook.url}`);
     } catch (error) {
-      // If queue table doesn't exist, deliver directly
-      if (error.name === 'MissingWebhookQueueTableError') {
-        await this.deliverWebhook(webhook, payload);
-      } else {
-        logger.error('Failed to queue webhook:', error.message);
-      }
+      // If queue table doesn't exist or any error, deliver directly
+      logger.warn(`Queue failed (${error.message}), delivering webhook directly to ${webhook.url}`);
+      
+      // Deliver directly in background
+      this.deliverWebhook(webhook, payload).then(result => {
+        if (result.success) {
+          logger.info(`Direct webhook delivery successful: ${webhook.url}`);
+        } else {
+          logger.error(`Direct webhook delivery failed: ${webhook.url} - ${result.error}`);
+        }
+      }).catch(err => {
+        logger.error(`Direct webhook delivery error: ${err.message}`);
+      });
     }
   }
 
@@ -166,6 +173,8 @@ class WebhookDeliveryService {
    */
   async deliverWebhook(webhook, payload) {
     try {
+      logger.info(`Delivering webhook to ${webhook.url}`);
+      
       const headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'WhatsApp-Multi-Automation/4.0'
@@ -178,16 +187,21 @@ class WebhookDeliveryService {
         headers['X-Webhook-Signature-256'] = signature;
       }
 
+      logger.debug(`Webhook payload: ${JSON.stringify(payload).substring(0, 200)}...`);
+
       const response = await axios.post(webhook.url, payload, {
         headers,
-        timeout: 10000,
+        timeout: 30000, // Increased timeout to 30 seconds
         validateStatus: (status) => status < 500
       });
 
+      logger.info(`Webhook response from ${webhook.url}: ${response.status}`);
+
       if (response.status >= 200 && response.status < 300) {
-        logger.debug(`Webhook delivered successfully: ${webhook.url}`);
+        logger.info(`Webhook delivered successfully: ${webhook.url}`);
         return { success: true, statusCode: response.status };
       } else {
+        logger.warn(`Webhook returned non-success status: ${response.status}`);
         return { 
           success: false, 
           statusCode: response.status, 
@@ -195,6 +209,7 @@ class WebhookDeliveryService {
         };
       }
     } catch (error) {
+      logger.error(`Webhook delivery failed to ${webhook.url}: ${error.message}`);
       return { 
         success: false, 
         error: error.message 

@@ -668,10 +668,21 @@ class WhatsAppManager {
 
     // Incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      logger.debug(`messages.upsert event: type=${type}, count=${messages.length}`);
+      
+      // Handle both 'notify' (new messages) and 'append' (history sync)
+      if (type !== 'notify') {
+        logger.debug(`Ignoring messages.upsert with type: ${type}`);
+        return;
+      }
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue; // Skip own messages
+        logger.debug(`Processing message: fromMe=${msg.key.fromMe}, remoteJid=${msg.key.remoteJid}`);
+        
+        if (msg.key.fromMe) {
+          logger.debug('Skipping own message');
+          continue;
+        }
 
         // Handle message in background to not block event loop
         this.handleIncomingMessage(accountId, msg).catch(err => {
@@ -745,11 +756,35 @@ class WhatsAppManager {
       } else if (msg.message?.videoMessage) {
         messageText = msg.message.videoMessage.caption || '[Video]';
         messageType = 'video';
+      } else if (msg.message?.stickerMessage) {
+        messageText = '[Sticker]';
+        messageType = 'sticker';
+      } else if (msg.message?.contactMessage) {
+        messageText = msg.message.contactMessage.displayName || '[Contact]';
+        messageType = 'contact';
+      } else if (msg.message?.locationMessage) {
+        messageText = '[Location]';
+        messageType = 'location';
+      } else if (msg.message?.reactionMessage) {
+        messageText = msg.message.reactionMessage.text || '[Reaction]';
+        messageType = 'reaction';
+      } else {
+        // Log unknown message types for debugging
+        const msgTypes = Object.keys(msg.message || {});
+        logger.debug(`Unknown message type from ${contactId}: ${msgTypes.join(', ')}`);
+        messageText = `[${msgTypes[0] || 'Unknown'}]`;
+        messageType = 'unknown';
       }
 
-      if (!messageText) {
-        logger.debug(`Empty message text for ${contactId}`);
+      // Skip if still no message content and not a known type
+      if (!messageText && messageType === 'text') {
+        logger.debug(`No message content for ${contactId}, skipping webhook`);
         return;
+      }
+
+      // Ensure we have some text for the webhook
+      if (!messageText) {
+        messageText = `[${messageType}]`;
       }
 
       logger.info(`Message received from ${contactId}: ${messageText.substring(0, 50)}...`);
