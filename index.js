@@ -379,21 +379,27 @@ app.post('/api/send', messageLimiter, validate(schemas.sendMessage), async (req,
   try {
     const { api_key, to, message } = req.body;
 
+    logger.info(`[API] /api/send called - to: ${to}, message length: ${message.length}`);
+
     const account = await db.getAccountByApiKey(api_key);
     if (!account) {
+      logger.warn(`[API] Invalid API key`);
       return res.status(401).json({ success: false, error: 'Invalid API key' });
     }
 
     if (account.status !== 'ready') {
+      logger.warn(`[API] Account not ready: ${account.status}`);
       return res.status(400).json({ success: false, error: 'Account not connected' });
     }
 
+    logger.info(`[API] Sending message via account ${account.id}`);
     // Auto-detect if 'to' is a JID (contains @) or phone number
     const result = await whatsappManager.sendMessageAuto(account.id, to, message);
     
+    logger.info(`[API] Message sent successfully: ${result.messageId}`);
     res.json({ success: true, ...result });
   } catch (error) {
-    logger.error('Error sending message:', error);
+    logger.error('[API] Error sending message:', error.message);
     res.status(500).json({ success: false, error: error.message || 'Failed to send message' });
   }
 });
@@ -403,23 +409,30 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
   try {
     const { api_key, to, caption, mediaType } = req.body;
 
+    logger.info(`[API] /api/send-media called - to: ${to}, file: ${req.file?.originalname}, type: ${mediaType}`);
+
     if (!req.file) {
+      logger.warn('[API] No media file provided');
       return res.status(400).json({ success: false, error: 'No media file provided' });
     }
 
     if (!to) {
+      logger.warn('[API] Missing to field');
       return res.status(400).json({ success: false, error: 'Missing required field: to (phone number or JID)' });
     }
 
     const account = await db.getAccountByApiKey(api_key);
     if (!account) {
+      logger.warn('[API] Invalid API key');
       return res.status(401).json({ success: false, error: 'Invalid API key' });
     }
 
     if (account.status !== 'ready') {
+      logger.warn(`[API] Account not ready: ${account.status}`);
       return res.status(400).json({ success: false, error: 'Account not connected' });
     }
 
+    logger.info(`[API] Sending media via account ${account.id}`);
     const result = await whatsappManager.sendMedia(
       account.id,
       to,
@@ -430,9 +443,10 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
       req.file.originalname
     );
 
+    logger.info(`[API] Media sent successfully: ${result.messageId}`);
     res.json({ success: true, ...result });
   } catch (error) {
-    logger.error('Error sending media:', error);
+    logger.error('[API] Error sending media:', error.message);
     res.status(500).json({ success: false, error: error.message || 'Failed to send media' });
   }
 });
@@ -442,24 +456,31 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
   try {
     const { api_key, to, caption, mediaType, mediaUrl, mediaBase64, mimetype, filename } = req.body;
 
+    logger.info(`[API] /api/send-media-url called - to: ${to}, type: ${mediaType}, hasUrl: ${!!mediaUrl}, hasBase64: ${!!mediaBase64}`);
+
     if (!api_key) {
+      logger.warn('[API] Missing api_key');
       return res.status(400).json({ success: false, error: 'api_key is required' });
     }
 
     if (!to) {
+      logger.warn('[API] Missing to field');
       return res.status(400).json({ success: false, error: 'to is required (phone number or JID)' });
     }
 
     if (!mediaUrl && !mediaBase64) {
+      logger.warn('[API] Missing both mediaUrl and mediaBase64');
       return res.status(400).json({ success: false, error: 'Either mediaUrl or mediaBase64 is required' });
     }
 
     const account = await db.getAccountByApiKey(api_key);
     if (!account) {
+      logger.warn('[API] Invalid API key');
       return res.status(401).json({ success: false, error: 'Invalid API key' });
     }
 
     if (account.status !== 'ready') {
+      logger.warn(`[API] Account not ready: ${account.status}`);
       return res.status(400).json({ success: false, error: 'Account not connected' });
     }
 

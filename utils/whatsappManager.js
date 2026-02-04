@@ -702,15 +702,18 @@ class WhatsAppManager {
       this.metrics.messagesReceived++;
 
       const sock = this.connections.get(accountId);
+      if (!sock) {
+        logger.warn(`Socket not found for account ${accountId}`);
+        return;
+      }
+
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Send read receipt (blue ticks) for the incoming message
-      try {
-        await sock.readMessages([msg.key]);
-      } catch (readErr) {
-        logger.debug(`Could not send read receipt: ${readErr.message}`);
-      }
+      // Send read receipt in background (don't wait)
+      sock.readMessages([msg.key]).catch(err => {
+        logger.debug(`Could not send read receipt: ${err.message}`);
+      });
       
       // Check if sender is using LID format (privacy protected)
       const isLidFormat = remoteJid?.includes('@lid');
@@ -744,54 +747,55 @@ class WhatsAppManager {
         messageType = 'video';
       }
 
-      if (!messageText) return;
+      if (!messageText) {
+        logger.debug(`Empty message text for ${contactId}`);
+        return;
+      }
 
       logger.info(`Message received from ${contactId}: ${messageText.substring(0, 50)}...`);
 
-      // Save to conversation history (don't block webhook if this fails)
-      try {
-        await db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType);
-      } catch (dbErr) {
+      // Save to conversation history in background (don't block webhook)
+      db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType).catch(dbErr => {
         logger.error(`Failed to save conversation: ${dbErr.message}`);
-      }
+      });
 
-      // Dispatch webhook with both phone and JID for flexibility
-      // Note: When isLidSender is true, 'from' contains the LID (not a real phone number)
-      // Always use 'fromJid' with the 'jid' parameter in API calls to reply
-      logger.info(`Dispatching webhook for account ${accountId}, event: message`);
+      // Dispatch webhook immediately (don't wait - fire and forget)
+      // The webhook service will handle queuing and retries
+      logger.info(`Triggering webhook dispatch for account ${accountId}`);
       
-      try {
-        await webhookDeliveryService.dispatch(accountId, 'message', {
-          messageId: msg.key.id,
-          from: contactId,
-          fromJid: remoteJid,
-          isLidSender: isLidFormat,  // true = 'from' is LID, not a real phone number
-          message: messageText,
-          messageType,
-          isGroup,
-          timestamp: msg.messageTimestamp,
-          pushName: msg.pushName || 'Unknown'
-        });
-        logger.info(`Webhook dispatched successfully for account ${accountId}`);
-      } catch (webhookErr) {
-        logger.error(`Webhook dispatch failed: ${webhookErr.message}`);
-      }
+      webhookDeliveryService.dispatch(accountId, 'message', {
+        messageId: msg.key.id,
+        from: contactId,
+        fromJid: remoteJid,
+        isLidSender: isLidFormat,  // true = 'from' is LID, not a real phone number
+        message: messageText,
+        messageType,
+        isGroup,
+        timestamp: msg.messageTimestamp,
+        pushName: msg.pushName || 'Unknown'
+      }).catch(webhookErr => {
+        logger.error(`Webhook dispatch error: ${webhookErr.message}`);
+      });
 
       // AI Auto-reply (only for text messages, non-group)
       if (messageType === 'text' && !isGroup) {
-        const aiReply = await aiAutoReply.generateReply({
+        aiAutoReply.generateReply({
           accountId,
           contactId,
           message: messageText
+        }).then(aiReply => {
+          if (aiReply) {
+            // Send reply in background
+            this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
+              logger.error(`Failed to send AI reply: ${err.message}`);
+            });
+          }
+        }).catch(err => {
+          logger.error(`AI reply generation failed: ${err.message}`);
         });
-
-        if (aiReply) {
-          // Use the replyJid to send response (works with both LID and phone JIDs)
-          await this.sendMessageToJid(accountId, replyJid, aiReply);
-        }
       }
     } catch (error) {
-      logger.error(`Error handling message for account ${accountId}:`, error.message);
+      logger.error(`Error handling message for account ${accountId}: ${error.message}`);
     }
   }
 
