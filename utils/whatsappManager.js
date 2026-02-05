@@ -640,9 +640,24 @@ class WhatsAppManager {
 
         // Handle undefined status code (usually happens during shutdown or network issues)
         if (statusCode === undefined) {
-          logger.info(`Undefined status code for ${accountId}, waiting 60s before reconnect`);
-          this.connectionStates.set(accountId, { status: 'reconnecting' });
-          this.scheduleReconnect(accountId, 60000);
+          const account = await db.getAccountById(accountId).catch(() => null);
+          
+          if (!account?.session_data) {
+            // New account - undefined error during QR scan
+            logger.info(`Undefined status for new account ${accountId}, allowing manual retry`);
+            this.connectionStates.set(accountId, { status: 'disconnected', error: 'Connection interrupted' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected',
+              qr_code: null,
+              error_message: 'Connection was interrupted. Please click Reconnect to try again.'
+            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'Connection interrupted - click Reconnect' });
+          } else {
+            // Established account - wait and reconnect
+            logger.info(`Undefined status code for ${accountId}, waiting 60s before reconnect`);
+            this.connectionStates.set(accountId, { status: 'reconnecting' });
+            this.scheduleReconnect(accountId, 60000);
+          }
           return;
         }
 
@@ -722,11 +737,38 @@ class WhatsAppManager {
           return;
         }
 
-        // Status 515 = Stream error - needs restart but with longer delay
+        // Status 515 = Stream error - needs restart but handle differently for new vs established accounts
         if (statusCode === 515) {
-          logger.warn(`Stream error for ${accountId}, waiting 120s before reconnect`);
-          this.connectionStates.set(accountId, { status: 'reconnecting' });
-          this.scheduleReconnect(accountId, 120000);
+          const account = await db.getAccountById(accountId).catch(() => null);
+          
+          if (!account?.session_data) {
+            // New account - stream error during QR scan/auth
+            // This is common during initial connection, allow immediate retry
+            logger.warn(`Stream error for new account ${accountId}, clearing auth state for fresh start`);
+            
+            // Clear any partial auth state that may be corrupted
+            const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
+            try {
+              await fs.rm(authPath, { recursive: true, force: true });
+              await fs.mkdir(authPath, { recursive: true });
+            } catch (e) {
+              // Ignore
+            }
+            
+            this.connectionStates.set(accountId, { status: 'disconnected', error: 'Connection failed during authentication' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected',
+              qr_code: null,
+              error_message: 'Connection failed during QR scan. Please click Reconnect to try again.'
+            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'Connection failed - click Reconnect' });
+          } else {
+            // Established account - use longer delay
+            logger.warn(`Stream error for ${accountId}, waiting 120s before reconnect`);
+            this.connectionStates.set(accountId, { status: 'reconnecting' });
+            this.scheduleReconnect(accountId, 120000);
+          }
           return;
         }
 
@@ -1302,6 +1344,19 @@ class WhatsAppManager {
    * Reconnect account (user-initiated)
    */
   async reconnect(accountId) {
+    // Debounce: ignore reconnect requests within 5 seconds of each other
+    const lastReconnectTime = this.lastReconnectRequest?.get(accountId);
+    if (lastReconnectTime && (Date.now() - lastReconnectTime) < 5000) {
+      logger.info(`Ignoring rapid reconnect request for ${accountId} (debounce)`);
+      return null;
+    }
+    
+    // Track this reconnect request
+    if (!this.lastReconnectRequest) {
+      this.lastReconnectRequest = new Map();
+    }
+    this.lastReconnectRequest.set(accountId, Date.now());
+    
     logger.info(`Manual reconnect requested for account ${accountId}`);
     
     // Clear all tracking to allow fresh connection
