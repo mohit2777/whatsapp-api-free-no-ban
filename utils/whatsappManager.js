@@ -414,12 +414,21 @@ class WhatsAppManager {
       // Prevent concurrent connection attempts (causes session conflicts!)
       if (this.connectionLocks.has(accountId)) {
         logger.warn(`Connection already in progress for ${accountId}, skipping`);
-        return;
+        return null;
       }
 
+      // Double-check with a small delay to catch race conditions
+      this.connectionLocks.add(accountId);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Check if this is a new account (no existing session data)
+      const accountCheck = await db.getAccountById(accountId);
+      const isNewAccount = !accountCheck?.session_data;
+
       // Enforce minimum interval between connection attempts
+      // But skip rate limiting for new accounts that need QR scanning
       const lastAttempt = this.lastConnectionAttempt.get(accountId);
-      if (lastAttempt) {
+      if (lastAttempt && !isNewAccount) {
         const elapsed = Date.now() - lastAttempt;
         if (elapsed < this.minReconnectInterval) {
           const waitTime = this.minReconnectInterval - elapsed;
@@ -439,7 +448,7 @@ class WhatsAppManager {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      const account = await db.getAccountById(accountId);
+      const account = accountCheck; // Use already-fetched account
       if (!account) {
         logger.warn(`Account ${accountId} not found in database, skipping connection`);
         this.connectionStates.delete(accountId);
@@ -497,9 +506,11 @@ class WhatsAppManager {
       this.setupEventHandlers(accountId, sock, saveCreds);
 
       // Release lock after short delay (handlers take over)
-      setTimeout(() => this.connectionLocks.delete(accountId), 5000);
+      // Increase delay for new accounts that need QR scanning
+      const lockReleaseDelay = isNewAccount ? 120000 : 5000; // 2 minutes for new accounts
+      setTimeout(() => this.connectionLocks.delete(accountId), lockReleaseDelay);
 
-      logger.info(`Connection initiated for account ${accountId}`);
+      logger.info(`Connection initiated for account ${accountId} (new: ${isNewAccount})`);
       
       return sock;
     } catch (error) {
@@ -527,18 +538,30 @@ class WhatsAppManager {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-          // Generate QR code
-          const qrDataUrl = await qrcode.toDataURL(qr);
+          // Generate QR code with higher quality for better scanning
+          const qrDataUrl = await qrcode.toDataURL(qr, {
+            errorCorrectionLevel: 'M',
+            margin: 2,
+            width: 300,
+            color: {
+              dark: '#000000',
+              light: '#ffffff'
+            }
+          });
           this.connectionStates.set(accountId, { status: 'qr_ready', qr: qrDataUrl });
           
           await db.updateAccount(accountId, { 
             status: 'qr_ready', 
-            qr_code: qrDataUrl 
+            qr_code: qrDataUrl,
+            error_message: null
           });
 
-        this.emit('qr-update', { accountId, qr: qrDataUrl });
-        logger.info(`QR code generated for account ${accountId}`);
-      }
+          // Emit to both specific account room and broadcast
+          this.emit('qr-update', { accountId, qr: qrDataUrl });
+          this.emitToAccount(accountId, 'qr-update', { accountId, qr: qrDataUrl });
+          this.emit('account-status', { accountId, status: 'qr_ready' });
+          logger.info(`QR code generated for account ${accountId}`);
+        }
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -585,7 +608,49 @@ class WhatsAppManager {
         // Status 428 = Connection closed prematurely - wait longer
         if (statusCode === 428) {
           logger.warn(`Premature close for ${accountId}, waiting 60s before reconnect`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
           this.scheduleReconnect(accountId, 60000);
+          return;
+        }
+
+        // Status 408 = QR timeout - don't auto-reconnect, wait for user action
+        if (statusCode === 408) {
+          logger.info(`QR timeout for ${accountId}, waiting for user to reconnect`);
+          this.connectionStates.set(accountId, { status: 'disconnected', error: 'QR code expired' });
+          await db.updateAccount(accountId, { 
+            status: 'disconnected', 
+            qr_code: null,
+            error_message: 'QR code expired. Click Reconnect to try again.'
+          }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'disconnected', message: 'QR expired - click Reconnect' });
+          return;
+        }
+
+        // Status 401 = Connection failure - check if this is a new account or authenticated one
+        if (statusCode === 401) {
+          const account = await db.getAccountById(accountId).catch(() => null);
+          const hadSession = account?.session_data != null;
+          
+          if (hadSession) {
+            // Had a session but now invalid - clear it
+            logger.info(`Account ${accountId} session invalid, clearing session`);
+            this.connectionStates.set(accountId, { status: 'disconnected' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected', 
+              session_data: null,
+              qr_code: null 
+            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'Session expired - click Reconnect' });
+          } else {
+            // New account never authenticated - just mark as disconnected, don't spam reconnects
+            logger.info(`New account ${accountId} connection failed, waiting for manual reconnect`);
+            this.connectionStates.set(accountId, { status: 'disconnected', error: 'Connection failed' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected',
+              error_message: 'Connection failed. Click Reconnect to try again.'
+            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'Connection failed - click Reconnect' });
+          }
           return;
         }
 
@@ -600,29 +665,52 @@ class WhatsAppManager {
           }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
           
           this.emit('account-status', { accountId, status: 'disconnected' });
-        } else {
-          // Standard reconnection with exponential backoff
-          const attempts = this.reconnectAttempts.get(accountId) || 0;
+          return;
+        }
+
+        // Status 515 = Stream error - needs restart but with longer delay
+        if (statusCode === 515) {
+          logger.warn(`Stream error for ${accountId}, waiting 120s before reconnect`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          this.scheduleReconnect(accountId, 120000);
+          return;
+        }
+
+        // Other errors - use exponential backoff but only for established accounts
+        const account = await db.getAccountById(accountId).catch(() => null);
+        if (!account?.session_data) {
+          // New account - don't auto-reconnect, wait for user
+          logger.info(`New account ${accountId} error ${statusCode}, waiting for manual reconnect`);
+          this.connectionStates.set(accountId, { status: 'error', error: errorMessage });
+          await db.updateAccount(accountId, { 
+            status: 'error',
+            error_message: `Error ${statusCode}: ${errorMessage}. Click Reconnect to try again.`
+          }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'error', message: errorMessage });
+          return;
+        }
+
+        // Established account with session - try auto-reconnect with exponential backoff
+        const attempts = this.reconnectAttempts.get(accountId) || 0;
+        
+        if (attempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts.set(accountId, attempts + 1);
+          this.metrics.reconnections++;
           
-          if (attempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts.set(accountId, attempts + 1);
-            this.metrics.reconnections++;
-            
-            // Exponential backoff with jitter: 60s, 120s, 240s, 480s, 960s + random 0-30s
-            const baseDelay = Math.min(60000 * Math.pow(2, attempts), 960000);
-            const jitter = Math.floor(Math.random() * 30000);
-            const delay = baseDelay + jitter;
-            
-            logger.info(`Reconnecting account ${accountId} in ${Math.round(delay/1000)}s (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
-            this.connectionStates.set(accountId, { status: 'reconnecting' });
-            this.scheduleReconnect(accountId, delay);
-          } else {
-            logger.error(`Max reconnection attempts reached for account ${accountId}`);
-            this.connectionStates.set(accountId, { status: 'error', error: 'Max reconnection attempts reached' });
-            await db.updateAccount(accountId, { status: 'error', error_message: 'Max reconnection attempts reached' })
-              .catch(e => logger.warn(`Failed to update account status: ${e.message}`));
-            this.emit('account-status', { accountId, status: 'error', message: 'Max reconnection attempts - please reconnect manually' });
-          }
+          // Exponential backoff with jitter: 60s, 120s, 240s, 480s, 960s + random 0-30s
+          const baseDelay = Math.min(60000 * Math.pow(2, attempts), 960000);
+          const jitter = Math.floor(Math.random() * 30000);
+          const delay = baseDelay + jitter;
+          
+          logger.info(`Reconnecting account ${accountId} in ${Math.round(delay/1000)}s (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          this.scheduleReconnect(accountId, delay);
+        } else {
+          logger.error(`Max reconnection attempts reached for account ${accountId}`);
+          this.connectionStates.set(accountId, { status: 'error', error: 'Max reconnection attempts reached' });
+          await db.updateAccount(accountId, { status: 'error', error_message: 'Max reconnection attempts reached' })
+            .catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'error', message: 'Max reconnection attempts - please reconnect manually' });
         }
       }
 
@@ -787,30 +875,32 @@ class WhatsAppManager {
         messageText = `[${messageType}]`;
       }
 
-      logger.info(`Message received from ${contactId}: ${messageText.substring(0, 50)}...`);
+      logger.info(`[MESSAGE] Received from ${contactId}: ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
 
       // Save to conversation history in background (don't block webhook)
       db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType).catch(dbErr => {
-        logger.error(`Failed to save conversation: ${dbErr.message}`);
+        logger.error(`[MESSAGE] Failed to save conversation: ${dbErr.message}`);
       });
 
-      // Dispatch webhook immediately (don't wait - fire and forget)
-      // The webhook service will handle queuing and retries
-      logger.info(`Triggering webhook dispatch for account ${accountId}`);
+      // Dispatch webhook - this is where messages get forwarded to your webhook URL
+      logger.info(`[MESSAGE] Dispatching to webhooks for account ${accountId}...`);
       
-      webhookDeliveryService.dispatch(accountId, 'message', {
-        messageId: msg.key.id,
-        from: contactId,
-        fromJid: remoteJid,
-        isLidSender: isLidFormat,  // true = 'from' is LID, not a real phone number
-        message: messageText,
-        messageType,
-        isGroup,
-        timestamp: msg.messageTimestamp,
-        pushName: msg.pushName || 'Unknown'
-      }).catch(webhookErr => {
-        logger.error(`Webhook dispatch error: ${webhookErr.message}`);
-      });
+      try {
+        await webhookDeliveryService.dispatch(accountId, 'message', {
+          messageId: msg.key.id,
+          from: contactId,
+          fromJid: remoteJid,
+          isLidSender: isLidFormat,
+          message: messageText,
+          messageType,
+          isGroup,
+          timestamp: msg.messageTimestamp,
+          pushName: msg.pushName || 'Unknown'
+        });
+        logger.info(`[MESSAGE] Webhook dispatch completed for account ${accountId}`);
+      } catch (webhookErr) {
+        logger.error(`[MESSAGE] Webhook dispatch error: ${webhookErr.message}`);
+      }
 
       // AI Auto-reply (only for text messages, non-group)
       if (messageType === 'text' && !isGroup) {
@@ -1155,11 +1245,45 @@ class WhatsAppManager {
   }
 
   /**
-   * Reconnect account
+   * Reconnect account (user-initiated)
    */
   async reconnect(accountId) {
+    logger.info(`Manual reconnect requested for account ${accountId}`);
+    
+    // Clear all tracking to allow fresh connection
     this.reconnectAttempts.delete(accountId);
+    this.sessionConflictCounts.delete(accountId);
+    this.lastConnectionAttempt.delete(accountId);
+    
+    // Cancel any pending reconnect timers
+    const existingTimer = this.reconnectTimers.get(accountId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.reconnectTimers.delete(accountId);
+    }
+
+    // Wait for any existing connection lock to clear (max 5 seconds)
+    let lockWaitAttempts = 0;
+    while (this.connectionLocks.has(accountId) && lockWaitAttempts < 10) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      lockWaitAttempts++;
+    }
+    
+    // Force clear the lock if still held
+    this.connectionLocks.delete(accountId);
+    
     await this.disconnect(accountId, false);
+    
+    // Clear QR code from database to force fresh generation
+    await db.updateAccount(accountId, { 
+      qr_code: null, 
+      error_message: null,
+      status: 'initializing'
+    }).catch(e => logger.warn(`Failed to clear QR: ${e.message}`));
+    
+    // Small delay before reconnecting to ensure clean state
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
     return this.connect(accountId);
   }
 
@@ -1167,11 +1291,13 @@ class WhatsAppManager {
    * Get QR code for account
    */
   async getQrCode(accountId) {
+    // First check runtime state (most up-to-date)
     const state = this.connectionStates.get(accountId);
     if (state?.qr) {
       return state.qr;
     }
 
+    // Fallback to database
     const account = await db.getAccountById(accountId);
     return account?.qr_code || null;
   }

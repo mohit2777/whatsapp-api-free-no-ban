@@ -332,40 +332,83 @@ async function reconnectAccount(accountId) {
 
 async function pollQrCode(accountId) {
     const qrContainer = document.getElementById('qrContainer');
-    qrContainer.innerHTML = '<p>Loading QR code...</p>';
+    qrContainer.innerHTML = '<p>Initializing connection...</p>';
 
     let attempts = 0;
-    const maxAttempts = 60;
+    const maxAttempts = 90;
+    let lastQr = null;
+    let qrDisplayed = false;
+    let stopPolling = false;
 
     const poll = async () => {
-        if (currentAccountId !== accountId) return;
+        if (currentAccountId !== accountId || stopPolling) return;
         
         try {
+            // First check account status
+            const accountData = await apiCall(`/api/accounts/${accountId}`);
+            const status = accountData.account?.status || accountData.account?.runtimeStatus;
+            
+            // If connected, stop polling
+            if (status === 'ready') {
+                qrContainer.innerHTML = '<p style="color: var(--success);"><i class="fas fa-check-circle"></i> Connected successfully!</p>';
+                setTimeout(() => closeModal('qrModal'), 2000);
+                loadAccounts();
+                return;
+            }
+            
+            // If error or disconnected with error message, show it and stop
+            if ((status === 'error' || status === 'disconnected') && accountData.account?.error_message) {
+                qrContainer.innerHTML = `
+                    <p style="color: var(--warning); margin-bottom: 10px;">
+                        <i class="fas fa-exclamation-triangle"></i> ${accountData.account.error_message}
+                    </p>
+                    <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
+                        <i class="fas fa-sync"></i> Try Again
+                    </button>
+                `;
+                stopPolling = true;
+                return;
+            }
+            
+            // Try to get QR code
             const data = await apiCall(`/api/accounts/${accountId}/qr`);
             
             if (data.qr) {
-                displayQrCode(data.qr);
-            } else {
-                // Check if connected
-                const accountData = await apiCall(`/api/accounts/${accountId}`);
-                if (accountData.account?.status === 'ready' || accountData.account?.runtimeStatus === 'ready') {
-                    qrContainer.innerHTML = '<p style="color: var(--success);"><i class="fas fa-check-circle"></i> Connected successfully!</p>';
-                    setTimeout(() => closeModal('qrModal'), 2000);
-                    loadAccounts();
-                    return;
+                // Only update display if QR changed (prevents flickering)
+                if (data.qr !== lastQr) {
+                    lastQr = data.qr;
+                    displayQrCode(data.qr);
+                    qrDisplayed = true;
                 }
+            } else if (!qrDisplayed && status === 'initializing') {
+                // Show waiting message only if QR hasn't been displayed yet
+                qrContainer.innerHTML = '<p>Waiting for QR code... <br><small>This may take a few seconds</small></p>';
             }
 
             attempts++;
-            if (attempts < maxAttempts) {
-                setTimeout(poll, 2000);
+            if (attempts < maxAttempts && !stopPolling) {
+                // Poll faster initially (1.5s), then slower (3s)
+                const interval = attempts < 10 ? 1500 : 3000;
+                setTimeout(poll, interval);
+            } else if (!stopPolling) {
+                qrContainer.innerHTML = `
+                    <p style="color: var(--warning); margin-bottom: 10px;">QR code timeout.</p>
+                    <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
+                        <i class="fas fa-sync"></i> Try Again
+                    </button>
+                `;
             }
         } catch (error) {
             console.error('QR poll error:', error);
+            // Continue polling on network errors, but slower
+            if (attempts < maxAttempts && !stopPolling) {
+                setTimeout(poll, 3000);
+            }
         }
     };
 
-    poll();
+    // Start polling after a small delay to let connection initialize
+    setTimeout(poll, 1000);
 }
 
 function displayQrCode(qrDataUrl) {

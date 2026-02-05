@@ -1,6 +1,6 @@
 /**
  * Webhook Delivery Service
- * Handles reliable webhook delivery with retries and dead-letter queue
+ * In-memory webhook queue with retries - no database storage
  */
 
 const axios = require('axios');
@@ -10,15 +10,18 @@ const { db } = require('../config/database');
 
 class WebhookDeliveryService {
   constructor() {
+    this.queue = [];  // In-memory queue
     this.isProcessing = false;
     this.processInterval = null;
+    this.maxRetries = 5;
     this.retryDelays = [
       1000,      // 1 second
       5000,      // 5 seconds
       30000,     // 30 seconds
-      120000,    // 2 minutes
-      300000     // 5 minutes
+      60000,     // 1 minute
+      120000     // 2 minutes
     ];
+    this.maxQueueSize = 1000; // Prevent memory issues
   }
 
   /**
@@ -27,11 +30,12 @@ class WebhookDeliveryService {
   start() {
     if (this.processInterval) return;
 
+    // Process queue every 2 seconds
     this.processInterval = setInterval(() => {
       this.processQueue();
-    }, 5000); // Process every 5 seconds
+    }, 2000);
 
-    logger.info('Webhook delivery service started');
+    logger.info('[WEBHOOK] In-memory delivery service started');
   }
 
   /**
@@ -41,62 +45,102 @@ class WebhookDeliveryService {
     if (this.processInterval) {
       clearInterval(this.processInterval);
       this.processInterval = null;
-      logger.info('Webhook delivery service stopped');
-    }
-  }
-
-  /**
-   * Queue a webhook for delivery
-   */
-  async queueWebhook(accountId, webhook, payload) {
-    try {
-      await db.addToWebhookQueue({
-        account_id: accountId,
-        webhook_id: webhook.id,
-        webhook_url: webhook.url,
-        webhook_secret: webhook.secret || null,
-        payload,
-        status: 'pending',
-        attempt_count: 0,
-        max_retries: 5,
-        next_retry_at: new Date().toISOString()
-      });
-
-      logger.info(`Webhook queued successfully for ${webhook.url}`);
-    } catch (error) {
-      // If queue table doesn't exist or any error, deliver directly
-      logger.warn(`Queue failed (${error.message}), delivering webhook directly to ${webhook.url}`);
       
-      // Deliver directly in background
-      this.deliverWebhook(webhook, payload).then(result => {
-        if (result.success) {
-          logger.info(`Direct webhook delivery successful: ${webhook.url}`);
-        } else {
-          logger.error(`Direct webhook delivery failed: ${webhook.url} - ${result.error}`);
-        }
-      }).catch(err => {
-        logger.error(`Direct webhook delivery error: ${err.message}`);
-      });
+      // Log any pending webhooks that will be lost
+      if (this.queue.length > 0) {
+        logger.warn(`[WEBHOOK] Service stopped with ${this.queue.length} pending webhooks (will be lost)`);
+      }
+      
+      logger.info('[WEBHOOK] Delivery service stopped');
     }
   }
 
   /**
-   * Process pending webhooks from queue
+   * Get queue statistics
+   */
+  getStats() {
+    const pending = this.queue.filter(item => item.status === 'pending').length;
+    const processing = this.queue.filter(item => item.status === 'processing').length;
+    const retrying = this.queue.filter(item => item.attemptCount > 0).length;
+    
+    return {
+      total: this.queue.length,
+      pending,
+      processing,
+      retrying,
+      maxSize: this.maxQueueSize
+    };
+  }
+
+  /**
+   * Queue a webhook for delivery (in-memory)
+   */
+  queueWebhook(accountId, webhook, payload) {
+    // Check queue size limit
+    if (this.queue.length >= this.maxQueueSize) {
+      logger.error(`[WEBHOOK] Queue full (${this.maxQueueSize}), dropping webhook for ${webhook.url}`);
+      return;
+    }
+
+    const item = {
+      id: crypto.randomUUID(),
+      accountId,
+      webhookId: webhook.id,
+      webhookUrl: webhook.url,
+      webhookSecret: webhook.secret || null,
+      payload,
+      status: 'pending',
+      attemptCount: 0,
+      nextRetryAt: Date.now(),
+      createdAt: Date.now(),
+      lastError: null
+    };
+
+    this.queue.push(item);
+    logger.info(`[WEBHOOK] Queued for ${webhook.url} (queue size: ${this.queue.length})`);
+    
+    // Try to process immediately if not already processing
+    if (!this.isProcessing) {
+      setImmediate(() => this.processQueue());
+    }
+  }
+
+  /**
+   * Process pending webhooks from in-memory queue
    */
   async processQueue() {
     if (this.isProcessing) return;
     this.isProcessing = true;
 
     try {
-      const pending = await db.getPendingWebhooks(10);
+      const now = Date.now();
+      
+      // Get items ready to process (pending and retry time has passed)
+      const readyItems = this.queue.filter(item => 
+        item.status === 'pending' && item.nextRetryAt <= now
+      );
 
-      for (const item of pending) {
+      // Process up to 10 at a time
+      const batch = readyItems.slice(0, 10);
+
+      for (const item of batch) {
         await this.processQueueItem(item);
       }
-    } catch (error) {
-      if (error.name !== 'MissingWebhookQueueTableError') {
-        logger.error('Error processing webhook queue:', error.message);
+
+      // Clean up old failed items (older than 10 minutes)
+      const cutoff = now - 600000;
+      const beforeCount = this.queue.length;
+      this.queue = this.queue.filter(item => 
+        item.status !== 'failed' || item.createdAt > cutoff
+      );
+      
+      const removed = beforeCount - this.queue.length;
+      if (removed > 0) {
+        logger.debug(`[WEBHOOK] Cleaned up ${removed} old failed items from queue`);
       }
+
+    } catch (error) {
+      logger.error(`[WEBHOOK] Error processing queue: ${error.message}`);
     } finally {
       this.isProcessing = false;
     }
@@ -106,65 +150,49 @@ class WebhookDeliveryService {
    * Process a single queue item
    */
   async processQueueItem(item) {
-    try {
-      // Mark as processing
-      await db.updateWebhookQueueItem(item.id, {
-        status: 'processing',
-        updated_at: new Date().toISOString()
-      });
+    // Mark as processing
+    item.status = 'processing';
+    item.attemptCount++;
 
-      const startTime = Date.now();
+    const startTime = Date.now();
+    
+    try {
       const result = await this.deliverWebhook(
-        { url: item.webhook_url, secret: item.webhook_secret },
+        { url: item.webhookUrl, secret: item.webhookSecret },
         item.payload
       );
-      const processingTime = Date.now() - startTime;
 
       if (result.success) {
-        await db.updateWebhookQueueItem(item.id, {
-          status: 'success',
-          processing_time_ms: processingTime,
-          last_response_code: result.statusCode,
-          updated_at: new Date().toISOString()
-        });
+        // Success - remove from queue
+        this.queue = this.queue.filter(i => i.id !== item.id);
+        logger.info(`[WEBHOOK] Delivered successfully to ${item.webhookUrl} (${Date.now() - startTime}ms)`);
       } else {
-        throw new Error(result.error);
+        // Failed - handle retry
+        this.handleDeliveryFailure(item, result.error);
       }
     } catch (error) {
-      await this.handleDeliveryFailure(item, error.message);
+      this.handleDeliveryFailure(item, error.message);
     }
   }
 
   /**
    * Handle delivery failure with retry logic
    */
-  async handleDeliveryFailure(item, errorMessage) {
-    const newAttemptCount = item.attempt_count + 1;
+  handleDeliveryFailure(item, errorMessage) {
+    item.lastError = errorMessage;
 
-    if (newAttemptCount >= item.max_retries) {
-      // Move to dead letter
-      await db.updateWebhookQueueItem(item.id, {
-        status: 'dead_letter',
-        attempt_count: newAttemptCount,
-        last_error: errorMessage,
-        updated_at: new Date().toISOString()
-      });
-      
-      logger.warn(`Webhook moved to dead letter after ${newAttemptCount} attempts: ${item.webhook_url}`);
+    if (item.attemptCount >= this.maxRetries) {
+      // Max retries reached - mark as failed (will be cleaned up later)
+      item.status = 'failed';
+      logger.warn(`[WEBHOOK] Failed after ${item.attemptCount} attempts: ${item.webhookUrl} - ${errorMessage}`);
     } else {
-      // Schedule retry
-      const delay = this.retryDelays[Math.min(newAttemptCount - 1, this.retryDelays.length - 1)];
-      const nextRetry = new Date(Date.now() + delay);
-
-      await db.updateWebhookQueueItem(item.id, {
-        status: 'pending',
-        attempt_count: newAttemptCount,
-        next_retry_at: nextRetry.toISOString(),
-        last_error: errorMessage,
-        updated_at: new Date().toISOString()
-      });
-
-      logger.debug(`Webhook retry scheduled for ${nextRetry.toISOString()}: ${item.webhook_url}`);
+      // Schedule retry with exponential backoff
+      const delayIndex = Math.min(item.attemptCount - 1, this.retryDelays.length - 1);
+      const delay = this.retryDelays[delayIndex];
+      item.nextRetryAt = Date.now() + delay;
+      item.status = 'pending';
+      
+      logger.info(`[WEBHOOK] Retry ${item.attemptCount}/${this.maxRetries} scheduled in ${delay/1000}s for ${item.webhookUrl}`);
     }
   }
 
@@ -173,8 +201,6 @@ class WebhookDeliveryService {
    */
   async deliverWebhook(webhook, payload) {
     try {
-      logger.info(`Delivering webhook to ${webhook.url}`);
-      
       const headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'WhatsApp-Multi-Automation/4.0'
@@ -187,21 +213,15 @@ class WebhookDeliveryService {
         headers['X-Webhook-Signature-256'] = signature;
       }
 
-      logger.debug(`Webhook payload: ${JSON.stringify(payload).substring(0, 200)}...`);
-
       const response = await axios.post(webhook.url, payload, {
         headers,
-        timeout: 30000, // Increased timeout to 30 seconds
+        timeout: 15000, // 15 second timeout
         validateStatus: (status) => status < 500
       });
 
-      logger.info(`Webhook response from ${webhook.url}: ${response.status}`);
-
       if (response.status >= 200 && response.status < 300) {
-        logger.info(`Webhook delivered successfully: ${webhook.url}`);
         return { success: true, statusCode: response.status };
       } else {
-        logger.warn(`Webhook returned non-success status: ${response.status}`);
         return { 
           success: false, 
           statusCode: response.status, 
@@ -209,10 +229,10 @@ class WebhookDeliveryService {
         };
       }
     } catch (error) {
-      logger.error(`Webhook delivery failed to ${webhook.url}: ${error.message}`);
+      const errorMsg = error.code === 'ECONNABORTED' ? 'Timeout' : error.message;
       return { 
         success: false, 
-        error: error.message 
+        error: errorMsg
       };
     }
   }
@@ -230,20 +250,23 @@ class WebhookDeliveryService {
    */
   async dispatch(accountId, event, data) {
     try {
-      logger.info(`Looking up webhooks for account ${accountId}, event: ${event}`);
+      logger.info(`[WEBHOOK] Dispatching event '${event}' for account ${accountId}`);
+      
       const webhooks = await db.getActiveWebhooks(accountId);
-      logger.info(`Found ${webhooks.length} active webhooks for account ${accountId}`);
-
-      if (webhooks.length === 0) {
-        logger.warn(`No active webhooks found for account ${accountId}`);
+      
+      if (!webhooks || webhooks.length === 0) {
+        logger.info(`[WEBHOOK] No active webhooks for account ${accountId}`);
         return;
       }
+      
+      logger.info(`[WEBHOOK] Found ${webhooks.length} active webhook(s)`);
 
       for (const webhook of webhooks) {
         // Check if webhook is subscribed to this event type
         const events = webhook.events || ['message'];
+        
         if (!events.includes(event) && !events.includes('*')) {
-          logger.debug(`Webhook ${webhook.url} not subscribed to event ${event}`);
+          logger.debug(`[WEBHOOK] ${webhook.url} not subscribed to '${event}'`);
           continue;
         }
 
@@ -254,11 +277,10 @@ class WebhookDeliveryService {
           data
         };
 
-        logger.info(`Queueing webhook to ${webhook.url} for event ${event}`);
-        await this.queueWebhook(accountId, webhook, payload);
+        this.queueWebhook(accountId, webhook, payload);
       }
     } catch (error) {
-      logger.error(`Failed to dispatch webhooks for account ${accountId}:`, error.message);
+      logger.error(`[WEBHOOK] Dispatch failed: ${error.message}`);
     }
   }
 }
