@@ -10,6 +10,9 @@
 let accounts = [];
 let currentAccountId = null;
 let socket = null;
+let activePollingAccountId = null;  // Track which account is being polled
+let qrGeneratedAt = null;           // Track QR generation time
+let qrTimerInterval = null;         // QR countdown timer
 
 // ============================================================================
 // Initialization
@@ -38,6 +41,11 @@ function initializeSocket() {
     socket.on('connect', () => {
         console.log('Socket connected');
         updateSystemStatus(true);
+        
+        // Re-subscribe to current account if we have one
+        if (currentAccountId) {
+            socket.emit('subscribe-account', currentAccountId);
+        }
     });
 
     socket.on('disconnect', () => {
@@ -46,12 +54,20 @@ function initializeSocket() {
     });
 
     socket.on('account-status', (data) => {
+        console.log('Account status update:', data);
         updateAccountStatus(data.accountId, data.status, data.phoneNumber);
+        
+        // If this is the account we're watching and it's ready, show success
+        if (data.accountId === activePollingAccountId && data.status === 'ready') {
+            showQrSuccess();
+        }
+        
         loadAccounts(); // Refresh full list
     });
 
     socket.on('qr-update', (data) => {
-        if (data.accountId === currentAccountId) {
+        console.log('QR update received:', data.accountId);
+        if (data.accountId === activePollingAccountId) {
             displayQrCode(data.qr);
         }
     });
@@ -172,7 +188,29 @@ function openModal(modalId) {
 }
 
 function closeModal(modalId) {
-    document.getElementById(modalId)?.classList.remove('show');
+    const modal = document.getElementById(modalId);
+    if (modal) {
+        modal.classList.remove('show');
+    }
+    
+    // Cleanup when closing QR modal
+    if (modalId === 'qrModal') {
+        // Stop polling for this account
+        activePollingAccountId = null;
+        
+        // Clear QR timer
+        if (qrTimerInterval) {
+            clearInterval(qrTimerInterval);
+            qrTimerInterval = null;
+        }
+        qrGeneratedAt = null;
+        
+        // Reset QR container
+        const qrContainer = document.getElementById('qrContainer');
+        if (qrContainer) {
+            qrContainer.innerHTML = '<p>Waiting for QR code...</p>';
+        }
+    }
 }
 
 // ============================================================================
@@ -292,9 +330,15 @@ async function createAccount(e) {
         showToast('Account created successfully', 'success');
         loadAccounts();
 
-        // Open QR modal for new account
+        // CRITICAL: Subscribe to socket BEFORE opening modal
+        // Backend now starts connection async, so we have time to subscribe
         currentAccountId = data.account.id;
+        activePollingAccountId = data.account.id;
         socket.emit('subscribe-account', currentAccountId);
+        
+        // Small delay to ensure subscription is processed
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         openModal('qrModal');
         pollQrCode(currentAccountId);
     } catch (error) {
@@ -318,15 +362,22 @@ async function deleteAccount(accountId) {
 
 async function reconnectAccount(accountId) {
     try {
+        // Subscribe FIRST before initiating reconnect
+        currentAccountId = accountId;
+        activePollingAccountId = accountId;
+        socket.emit('subscribe-account', accountId);
+        
+        // Small delay to ensure subscription is processed
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         await apiCall(`/api/accounts/${accountId}/reconnect`, { method: 'POST' });
         showToast('Reconnection initiated', 'info');
         
-        currentAccountId = accountId;
-        socket.emit('subscribe-account', accountId);
         openModal('qrModal');
         pollQrCode(accountId);
     } catch (error) {
         console.error('Failed to reconnect:', error);
+        activePollingAccountId = null;
     }
 }
 
@@ -338,21 +389,22 @@ async function pollQrCode(accountId) {
     const maxAttempts = 90;
     let lastQr = null;
     let qrDisplayed = false;
-    let stopPolling = false;
 
     const poll = async () => {
-        if (currentAccountId !== accountId || stopPolling) return;
+        // CRITICAL: Check against activePollingAccountId to properly cancel on modal close
+        if (activePollingAccountId !== accountId) {
+            console.log(`Polling cancelled for ${accountId} (activePollingAccountId changed)`);
+            return;
+        }
         
         try {
             // First check account status
             const accountData = await apiCall(`/api/accounts/${accountId}`);
             const status = accountData.account?.status || accountData.account?.runtimeStatus;
             
-            // If connected, stop polling
+            // If connected, stop polling and show success
             if (status === 'ready') {
-                qrContainer.innerHTML = '<p style="color: var(--success);"><i class="fas fa-check-circle"></i> Connected successfully!</p>';
-                setTimeout(() => closeModal('qrModal'), 2000);
-                loadAccounts();
+                showQrSuccess();
                 return;
             }
             
@@ -366,7 +418,6 @@ async function pollQrCode(accountId) {
                         <i class="fas fa-sync"></i> Try Again
                     </button>
                 `;
-                stopPolling = true;
                 return;
             }
             
@@ -386,11 +437,11 @@ async function pollQrCode(accountId) {
             }
 
             attempts++;
-            if (attempts < maxAttempts && !stopPolling) {
+            if (attempts < maxAttempts && activePollingAccountId === accountId) {
                 // Poll faster initially (1.5s), then slower (3s)
                 const interval = attempts < 10 ? 1500 : 3000;
                 setTimeout(poll, interval);
-            } else if (!stopPolling) {
+            } else if (activePollingAccountId === accountId) {
                 qrContainer.innerHTML = `
                     <p style="color: var(--warning); margin-bottom: 10px;">QR code timeout.</p>
                     <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
@@ -401,19 +452,73 @@ async function pollQrCode(accountId) {
         } catch (error) {
             console.error('QR poll error:', error);
             // Continue polling on network errors, but slower
-            if (attempts < maxAttempts && !stopPolling) {
+            if (attempts < maxAttempts && activePollingAccountId === accountId) {
                 setTimeout(poll, 3000);
             }
         }
     };
 
     // Start polling after a small delay to let connection initialize
-    setTimeout(poll, 1000);
+    setTimeout(poll, 500);
+}
+
+function showQrSuccess() {
+    const qrContainer = document.getElementById('qrContainer');
+    if (qrContainer) {
+        qrContainer.innerHTML = '<p style="color: var(--success);"><i class="fas fa-check-circle"></i> Connected successfully!</p>';
+    }
+    
+    // Clear timer
+    if (qrTimerInterval) {
+        clearInterval(qrTimerInterval);
+        qrTimerInterval = null;
+    }
+    
+    setTimeout(() => {
+        closeModal('qrModal');
+        loadAccounts();
+    }, 2000);
 }
 
 function displayQrCode(qrDataUrl) {
     const qrContainer = document.getElementById('qrContainer');
-    qrContainer.innerHTML = `<img src="${qrDataUrl}" alt="QR Code">`;
+    qrGeneratedAt = Date.now();
+    
+    qrContainer.innerHTML = `
+        <img src="${qrDataUrl}" alt="QR Code" style="max-width: 280px;">
+        <p class="qr-timer" id="qrTimer" style="margin-top: 10px; font-size: 12px; color: #888;">Scan within 20 seconds</p>
+    `;
+    
+    // Clear existing timer
+    if (qrTimerInterval) {
+        clearInterval(qrTimerInterval);
+    }
+    
+    // Update timer countdown
+    qrTimerInterval = setInterval(() => {
+        if (!qrGeneratedAt || activePollingAccountId === null) {
+            clearInterval(qrTimerInterval);
+            qrTimerInterval = null;
+            return;
+        }
+        
+        const elapsed = Math.floor((Date.now() - qrGeneratedAt) / 1000);
+        const remaining = Math.max(0, 20 - elapsed);
+        const timer = document.getElementById('qrTimer');
+        
+        if (timer) {
+            if (remaining > 5) {
+                timer.textContent = `Scan within ${remaining} seconds`;
+                timer.style.color = '#888';
+            } else if (remaining > 0) {
+                timer.textContent = `Hurry! ${remaining} seconds left`;
+                timer.style.color = '#f39c12';
+            } else {
+                timer.textContent = 'Refreshing QR code...';
+                timer.style.color = '#3498db';
+            }
+        }
+    }, 1000);
 }
 
 async function logout() {

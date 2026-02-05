@@ -46,10 +46,13 @@ class WhatsAppManager {
     this.connectionLocks = new Set(); // Prevent concurrent connection attempts
     this.sessionConflictCounts = new Map(); // Track 440 errors specifically
     this.lastConnectionAttempt = new Map(); // Track timing to prevent rapid reconnects
+    this.lastReconnectRequest = new Map(); // Track manual reconnect requests for debounce
+    this.connectionWatchdogs = new Map(); // Watchdog timers for stuck connections
     this.isShuttingDown = false; // Prevent reconnection during shutdown
     this.maxReconnectAttempts = 5;
     this.maxSessionConflicts = 3; // Max 440 errors before requiring manual reconnect
     this.minReconnectInterval = 60000; // Minimum 60 seconds between any reconnection
+    this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -342,8 +345,13 @@ class WhatsAppManager {
       logger.info(`Account created: ${account.id} (${name})`);
       this.metrics.connectionsTotal++;
 
-      // Start connection
-      await this.connect(account.id);
+      // Start connection in BACKGROUND - don't await
+      // This allows frontend to subscribe to socket events before QR is generated
+      setImmediate(() => {
+        this.connect(account.id).catch(e => {
+          logger.error(`Background connect failed for ${account.id}: ${e.message}`);
+        });
+      });
 
       return account;
     } catch (error) {
@@ -369,11 +377,15 @@ class WhatsAppManager {
         this.reconnectTimers.delete(accountId);
       }
 
+      // Clear watchdog timer
+      this.clearConnectionWatchdog(accountId);
+
       // Clear all tracking for this account
       this.reconnectAttempts.delete(accountId);
       this.sessionConflictCounts.delete(accountId);
       this.connectionLocks.delete(accountId);
       this.lastConnectionAttempt.delete(accountId);
+      this.lastReconnectRequest?.delete(accountId);
       this.connectionStates.delete(accountId);
 
       // Disconnect if connected - end the socket properly
@@ -560,19 +572,82 @@ class WhatsAppManager {
       this.setupEventHandlers(accountId, sock, saveCreds);
 
       // Release lock after short delay (handlers take over)
-      // Increase delay for new accounts that need QR scanning
-      const lockReleaseDelay = isNewAccount ? 120000 : 5000; // 2 minutes for new accounts
+      // Use shorter delay - 30s is enough for QR generation
+      const lockReleaseDelay = isNewAccount ? 30000 : 5000;
       setTimeout(() => this.connectionLocks.delete(accountId), lockReleaseDelay);
+
+      // Setup watchdog timer for new accounts waiting for QR scan
+      // If no QR generated or no connection within 60s, mark as error
+      if (isNewAccount) {
+        this.setupConnectionWatchdog(accountId);
+      }
 
       logger.info(`Connection initiated for account ${accountId} (new: ${isNewAccount})`);
       
       return sock;
     } catch (error) {
       this.connectionLocks.delete(accountId);
+      this.clearConnectionWatchdog(accountId);
       logger.error(`Failed to connect account ${accountId}:`, error.message);
       this.connectionStates.set(accountId, { status: 'error', error: error.message });
       await db.updateAccount(accountId, { status: 'error', error_message: error.message });
       throw error;
+    }
+  }
+
+  /**
+   * Setup watchdog timer for stuck connections
+   */
+  setupConnectionWatchdog(accountId) {
+    // Clear any existing watchdog
+    this.clearConnectionWatchdog(accountId);
+    
+    const watchdog = setTimeout(async () => {
+      const state = this.connectionStates.get(accountId);
+      
+      // Only trigger if still in initializing state (no QR, no connection)
+      if (state?.status === 'initializing') {
+        logger.warn(`Connection watchdog triggered for ${accountId} - stuck in initializing`);
+        
+        this.connectionStates.set(accountId, { 
+          status: 'error', 
+          error: 'Connection timed out' 
+        });
+        
+        await db.updateAccount(accountId, {
+          status: 'error',
+          error_message: 'Connection timed out. Please click Reconnect to try again.'
+        }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+        
+        this.emit('account-status', { 
+          accountId, 
+          status: 'error', 
+          message: 'Connection timed out - click Reconnect' 
+        });
+        
+        // Cleanup
+        this.connectionLocks.delete(accountId);
+        const sock = this.connections.get(accountId);
+        if (sock) {
+          try { sock.end(); } catch (e) { /* ignore */ }
+          this.connections.delete(accountId);
+        }
+      }
+      
+      this.connectionWatchdogs.delete(accountId);
+    }, this.qrTimeoutMs);
+    
+    this.connectionWatchdogs.set(accountId, watchdog);
+  }
+
+  /**
+   * Clear watchdog timer
+   */
+  clearConnectionWatchdog(accountId) {
+    const watchdog = this.connectionWatchdogs.get(accountId);
+    if (watchdog) {
+      clearTimeout(watchdog);
+      this.connectionWatchdogs.delete(accountId);
     }
   }
 
@@ -592,6 +667,9 @@ class WhatsAppManager {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+          // QR generated - clear watchdog timer (connection is progressing)
+          this.clearConnectionWatchdog(accountId);
+          
           // Generate QR code with higher quality for better scanning
           const qrDataUrl = await qrcode.toDataURL(qr, {
             errorCorrectionLevel: 'M',
@@ -623,7 +701,8 @@ class WhatsAppManager {
 
         logger.warn(`Connection closed for account ${accountId}: ${statusCode} - ${errorMessage}`);
 
-        // Release connection lock
+        // Clear watchdog and release lock
+        this.clearConnectionWatchdog(accountId);
         this.connectionLocks.delete(accountId);
 
         // Don't reconnect if app is shutting down
@@ -811,7 +890,9 @@ class WhatsAppManager {
       }
 
       if (connection === 'open') {
-        // Successfully connected - reset all error tracking
+        // Successfully connected - clear watchdog and reset all error tracking
+        this.clearConnectionWatchdog(accountId);
+        
         const phoneNumber = sock.user?.id ? this.getPhoneNumber(sock.user.id) : null;
         
         this.connectionStates.set(accountId, { status: 'ready', phoneNumber });
@@ -1214,14 +1295,17 @@ class WhatsAppManager {
       this.connections.delete(accountId);
     }
 
-    this.connectionStates.delete(accountId);
+    // Only update/emit if state actually changed (prevents double events)
+    const currentState = this.connectionStates.get(accountId);
+    const wasAlreadyDisconnected = currentState?.status === 'disconnected';
+    
+    this.connectionStates.set(accountId, { status: 'disconnected' });
 
-    if (updateDb) {
+    if (updateDb && !wasAlreadyDisconnected) {
       await db.updateAccount(accountId, { status: 'disconnected' });
       this.emit('account-status', { accountId, status: 'disconnected' });
+      logger.info(`Account ${accountId} disconnected`);
     }
-
-    logger.info(`Account ${accountId} disconnected`);
   }
 
   /**
@@ -1351,11 +1435,19 @@ class WhatsAppManager {
       return null;
     }
     
-    // Track this reconnect request
+    // Track this reconnect request (with auto-cleanup to prevent memory leak)
     if (!this.lastReconnectRequest) {
       this.lastReconnectRequest = new Map();
     }
     this.lastReconnectRequest.set(accountId, Date.now());
+    
+    // Cleanup old entries (older than 1 minute)
+    const now = Date.now();
+    for (const [id, time] of this.lastReconnectRequest.entries()) {
+      if (now - time > 60000) {
+        this.lastReconnectRequest.delete(id);
+      }
+    }
     
     logger.info(`Manual reconnect requested for account ${accountId}`);
     
@@ -1436,6 +1528,12 @@ class WhatsAppManager {
     }
     this.reconnectTimers.clear();
     
+    // Cancel all watchdog timers
+    for (const [accountId, watchdog] of this.connectionWatchdogs) {
+      clearTimeout(watchdog);
+    }
+    this.connectionWatchdogs.clear();
+    
     // Disconnect all accounts gracefully
     for (const [accountId, sock] of this.connections) {
       try {
@@ -1451,6 +1549,7 @@ class WhatsAppManager {
     this.connectionLocks.clear();
     this.sessionConflictCounts.clear();
     this.reconnectAttempts.clear();
+    this.lastReconnectRequest?.clear();
     
     logger.info('WhatsApp manager shutdown complete');
   }
