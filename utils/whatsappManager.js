@@ -353,10 +353,12 @@ class WhatsAppManager {
   }
 
   /**
-   * Delete WhatsApp account
+   * Delete WhatsApp account - Complete cleanup
    */
   async deleteAccount(accountId) {
     try {
+      logger.info(`Starting complete deletion of account ${accountId}`);
+      
       // Mark as deleted to prevent reconnection attempts
       this.deletedAccounts.add(accountId);
 
@@ -372,30 +374,82 @@ class WhatsAppManager {
       this.sessionConflictCounts.delete(accountId);
       this.connectionLocks.delete(accountId);
       this.lastConnectionAttempt.delete(accountId);
+      this.connectionStates.delete(accountId);
 
-      // Disconnect if connected
-      await this.disconnect(accountId, false);
-
-      // Delete from database
-      await db.deleteAccount(accountId);
-
-      // Clean up auth state files
-      const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
-      try {
-        await fs.rm(authPath, { recursive: true, force: true });
-      } catch (e) {
-        // Ignore if doesn't exist
+      // Disconnect if connected - end the socket properly
+      const sock = this.connections.get(accountId);
+      if (sock) {
+        try {
+          // Logout to invalidate the session on WhatsApp servers
+          logger.info(`Logging out WhatsApp session for ${accountId}`);
+          await sock.logout();
+          // Wait after logout to ensure it's processed
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (e) {
+          logger.debug(`Logout failed (expected if already disconnected): ${e.message}`);
+        }
+        try {
+          sock.end();
+        } catch (e) {
+          // Ignore
+        }
+        this.connections.delete(accountId);
       }
 
-      logger.info(`Account deleted: ${accountId}`);
+      // Clean up auth state files BEFORE database delete
+      const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
+      try {
+        // First try to remove the directory
+        await fs.rm(authPath, { recursive: true, force: true });
+        
+        // Verify deletion
+        try {
+          await fs.access(authPath);
+          // If we can still access it, try again
+          logger.warn(`Auth files still exist for ${accountId}, retrying deletion`);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await fs.rm(authPath, { recursive: true, force: true });
+        } catch {
+          // Good - directory doesn't exist anymore
+        }
+        
+        logger.info(`Auth files deleted for account ${accountId}`);
+      } catch (e) {
+        logger.warn(`Could not delete auth files: ${e.message}`);
+      }
+
+      // Clear QR code and session data BEFORE full deletion
+      // This helps ensure no stale data remains
+      try {
+        await db.updateAccount(accountId, {
+          session_data: null,
+          qr_code: null,
+          status: 'disconnected'
+        });
+      } catch (e) {
+        // May fail if account already deleted, that's ok
+      }
+
+      // Delete from database (this will cascade delete webhooks, ai_configs, etc.)
+      await db.deleteAccount(accountId);
+      logger.info(`Database records deleted for account ${accountId}`);
+
       this.emit('account-deleted', { accountId });
 
       // Remove from deleted set after a delay (prevent race conditions)
-      setTimeout(() => this.deletedAccounts.delete(accountId), 60000);
+      // Using 30 seconds instead of 60 to allow faster re-creation
+      setTimeout(() => this.deletedAccounts.delete(accountId), 30000);
 
+      logger.info(`Account ${accountId} completely deleted`);
       return true;
     } catch (error) {
       logger.error(`Failed to delete account ${accountId}:`, error.message);
+      // Still try to clean up local state even if DB fails
+      this.connections.delete(accountId);
+      this.connectionStates.delete(accountId);
+      this.reconnectTimers.delete(accountId);
+      this.connectionLocks.delete(accountId);
+      this.deletedAccounts.delete(accountId);
       throw error;
     }
   }

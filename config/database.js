@@ -216,15 +216,69 @@ const db = {
   },
 
   async deleteAccount(id) {
+    // Explicitly delete all related data (even though CASCADE should handle it)
+    // This ensures complete cleanup and handles any orphaned records
+
+    // Delete webhook queue items first
+    try {
+      const { error } = await supabase.from('webhook_delivery_queue').delete().eq('account_id', id);
+      if (error && !error.message.includes('does not exist')) {
+        console.warn(`Warning deleting webhook_delivery_queue: ${error.message}`);
+      }
+    } catch (e) {
+      // Ignore if table doesn't exist
+    }
+
+    // Delete webhooks
+    try {
+      const { error } = await supabase.from('webhooks').delete().eq('account_id', id);
+      if (error && !error.message.includes('does not exist')) {
+        console.warn(`Warning deleting webhooks: ${error.message}`);
+      }
+    } catch (e) {
+      // Ignore if fails
+    }
+
+    // Delete AI config
+    try {
+      const { error } = await supabase.from('ai_configs').delete().eq('account_id', id);
+      if (error && !error.message.includes('does not exist')) {
+        console.warn(`Warning deleting ai_configs: ${error.message}`);
+      }
+    } catch (e) {
+      // Ignore if fails
+    }
+
+    // Delete conversation history
+    try {
+      const { error } = await supabase.from('conversation_history').delete().eq('account_id', id);
+      if (error && !error.message.includes('does not exist')) {
+        console.warn(`Warning deleting conversation_history: ${error.message}`);
+      }
+    } catch (e) {
+      // Ignore if fails
+    }
+
+    // Finally delete the account
     const { error } = await withRetry(
       () => supabase.from('whatsapp_accounts').delete().eq('id', id),
       'deleteAccount'
     );
 
     if (error) throw error;
+    
+    // Clear ALL related caches thoroughly
     cacheManager.invalidate('accounts');
     cacheManager.invalidate(`account:${id}`);
+    cacheManager.invalidate(`ai:${id}`);
     cacheManager.invalidatePattern(`apikey:`);
+    
+    // Verify deletion
+    const { data: checkData } = await supabase.from('whatsapp_accounts').select('id').eq('id', id).single();
+    if (checkData) {
+      throw new Error(`Account ${id} was not properly deleted from database`);
+    }
+
     return true;
   },
 
