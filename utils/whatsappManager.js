@@ -4,7 +4,7 @@
  * No browser/Chromium required - uses WebSocket protocol
  */
 
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers, downloadMediaMessage, getContentType, proto } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
@@ -32,6 +32,61 @@ const recentMessageHashes = new Map();
 const DUPLICATE_WINDOW_MS = 60000;
 
 // ============================================================================
+// HUMAN BEHAVIOR SIMULATION
+// ============================================================================
+
+/**
+ * Generate a random delay within a range (simulates human timing)
+ */
+function humanDelay(minMs, maxMs) {
+  const base = minMs + Math.random() * (maxMs - minMs);
+  // Add slight Gaussian-like jitter for more natural distribution
+  const jitter = (Math.random() + Math.random() + Math.random()) / 3 * (maxMs - minMs) * 0.1;
+  return Math.floor(base + jitter);
+}
+
+/**
+ * Calculate typing delay based on message length (humans type ~40 WPM)
+ */
+function typingDelay(messageLength) {
+  // Average human reads/composes at ~200ms per character, with variation
+  const baseDelay = Math.min(800 + messageLength * 30, 4000);
+  return humanDelay(Math.floor(baseDelay * 0.7), Math.floor(baseDelay * 1.3));
+}
+
+/**
+ * Random delay before reading a message (humans don't read instantly)
+ */
+function readReceiptDelay() {
+  return humanDelay(1500, 5000);
+}
+
+/**
+ * Pick a random browser fingerprint per account (stored in memory)
+ * This prevents all accounts from having identical fingerprints
+ */
+const BROWSER_PROFILES = [
+  () => Browsers.windows('Desktop'),
+  () => Browsers.macOS('Desktop'),
+  () => Browsers.appropriate('Desktop'),
+  () => ['Windows', 'Chrome', '10.0.22631'],
+  () => ['Windows', 'Edge', '10.0.22631'],
+  () => ['Mac OS', 'Safari', '14.6.1'],
+  () => ['Mac OS', 'Chrome', '14.4.1'],
+];
+const accountBrowserCache = new Map();
+
+function getBrowserForAccount(accountId) {
+  if (!accountBrowserCache.has(accountId)) {
+    // Deterministic selection based on accountId hash so it stays consistent across restarts
+    const hash = crypto.createHash('md5').update(accountId).digest();
+    const index = hash[0] % BROWSER_PROFILES.length;
+    accountBrowserCache.set(accountId, BROWSER_PROFILES[index]());
+  }
+  return accountBrowserCache.get(accountId);
+}
+
+// ============================================================================
 // WHATSAPP MANAGER CLASS
 // ============================================================================
 
@@ -44,6 +99,7 @@ class WhatsAppManager {
     this.reconnectTimers = new Map(); // accountId -> timer
     this.deletedAccounts = new Set(); // Track deleted accounts to prevent reconnection
     this.connectionLocks = new Set(); // Prevent concurrent connection attempts
+    this.sessionSaveLocks = new Set(); // Prevent concurrent session saves
     this.sessionConflictCounts = new Map(); // Track 440 errors specifically
     this.lastConnectionAttempt = new Map(); // Track timing to prevent rapid reconnects
     this.lastReconnectRequest = new Map(); // Track manual reconnect requests for debounce
@@ -561,7 +617,11 @@ class WhatsAppManager {
       // Create silent logger for Baileys
       const baileysLogger = pino({ level: 'silent' });
 
+      // Pick a consistent browser fingerprint for this account
+      const browserProfile = getBrowserForAccount(accountId);
+
       // Create socket with proper browser identification
+      // Settings tuned to mimic official WhatsApp Web behavior
       const sock = makeWASocket({
         version,
         auth: {
@@ -570,9 +630,10 @@ class WhatsAppManager {
         },
         printQRInTerminal: false,
         logger: baileysLogger,
-        browser: Browsers.windows('Desktop'),
+        browser: browserProfile,
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
+        // Don't immediately set online — real WhatsApp Web does this lazily
         markOnlineOnConnect: false,
         getMessage: async (key) => {
           return { conversation: '' };
@@ -581,7 +642,18 @@ class WhatsAppManager {
         linkPreviewImageThumbnailWidth: 0,
         qrTimeout: 40000,
         defaultQueryTimeoutMs: 60000,
-        connectTimeoutMs: 60000
+        connectTimeoutMs: 60000,
+        // Patch-based presence to reduce detection surface
+        patchMessageBeforeSending: (message) => {
+          // Don't modify — just pass through. Having the handler
+          // registered prevents Baileys from adding its own metadata
+          return message;
+        },
+        // Firewall / keep-alive tuning
+        keepAliveIntervalMs: 25000, // 25s keep-alive like real WA Web
+        retryRequestDelayMs: 250,
+        // Emit only what we subscribe to
+        emitOwnEvents: false,
       });
 
       // Store connection
@@ -964,6 +1036,17 @@ class WhatsAppManager {
         this.emit('account-status', { accountId, status: 'ready', phoneNumber });
         logger.info(`Account ${accountId} connected successfully (${phoneNumber})`);
 
+        // Set presence to 'unavailable' after connection — mimics real WA Web
+        // (real clients don't stay online 24/7; they go idle)
+        setTimeout(async () => {
+          try {
+            await sock.sendPresenceUpdate('unavailable');
+            logger.debug(`Set initial presence to unavailable for ${accountId}`);
+          } catch (e) {
+            logger.debug(`Could not set initial presence: ${e.message}`);
+          }
+        }, humanDelay(3000, 8000));
+
         // Notify via webhook
         webhookDeliveryService.dispatch(accountId, 'connection', {
           status: 'connected',
@@ -1021,7 +1104,8 @@ class WhatsAppManager {
   }
 
   /**
-   * Handle incoming message
+   * Handle incoming message — extracts all content including media,
+   * then dispatches enriched payload to webhooks
    */
   async handleIncomingMessage(accountId, msg) {
     try {
@@ -1036,94 +1120,226 @@ class WhatsAppManager {
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Send read receipt in background (don't wait)
-      sock.readMessages([msg.key]).catch(err => {
-        logger.debug(`Could not send read receipt: ${err.message}`);
-      });
+      // Delayed read receipt — humans don't read instantly
+      const readDelay = readReceiptDelay();
+      setTimeout(() => {
+        sock.readMessages([msg.key]).catch(err => {
+          logger.debug(`Could not send read receipt: ${err.message}`);
+        });
+      }, readDelay);
       
-      // Check if sender is using LID format (privacy protected)
       const isLidFormat = remoteJid?.includes('@lid');
-      
-      // Extract sender phone number (handles LID format too)
       const senderPhone = this.extractSenderPhone(msg, sock);
-      
-      // Get the raw JID for replying (may be LID or phone-based)
       const replyJid = remoteJid;
       const contactId = senderPhone;
       
-      // Extract message content
+      // ====== EXTRACT MESSAGE CONTENT + MEDIA ======
+
       let messageText = '';
       let messageType = 'text';
+      let mediaData = null; // base64-encoded media for webhook
+      let mediaMimetype = null;
+      let mediaFilename = null;
+      let mediaDuration = null;
+      let mediaFileSize = null;
+      let mediaWidth = null;
+      let mediaHeight = null;
+      let thumbnailBase64 = null;
 
-      if (msg.message?.conversation) {
-        messageText = msg.message.conversation;
-      } else if (msg.message?.extendedTextMessage?.text) {
-        messageText = msg.message.extendedTextMessage.text;
-      } else if (msg.message?.imageMessage) {
-        messageText = msg.message.imageMessage.caption || '[Image]';
+      const message = msg.message;
+      if (!message) return;
+
+      // Unwrap viewOnce/ephemeral wrappers
+      const unwrapped = message.ephemeralMessage?.message
+        || message.viewOnceMessage?.message
+        || message.viewOnceMessageV2?.message
+        || message.documentWithCaptionMessage?.message
+        || message;
+
+      if (unwrapped.conversation) {
+        messageText = unwrapped.conversation;
+        messageType = 'text';
+      } else if (unwrapped.extendedTextMessage?.text) {
+        messageText = unwrapped.extendedTextMessage.text;
+        messageType = 'text';
+      } else if (unwrapped.imageMessage) {
+        const m = unwrapped.imageMessage;
+        messageText = m.caption || '';
         messageType = 'image';
-      } else if (msg.message?.documentMessage) {
-        messageText = msg.message.documentMessage.fileName || '[Document]';
-        messageType = 'document';
-      } else if (msg.message?.audioMessage) {
-        messageText = '[Audio]';
-        messageType = 'audio';
-      } else if (msg.message?.videoMessage) {
-        messageText = msg.message.videoMessage.caption || '[Video]';
+        mediaMimetype = m.mimetype || 'image/jpeg';
+        mediaFileSize = m.fileLength ? Number(m.fileLength) : null;
+        mediaWidth = m.width || null;
+        mediaHeight = m.height || null;
+        if (m.jpegThumbnail) {
+          thumbnailBase64 = Buffer.from(m.jpegThumbnail).toString('base64');
+        }
+      } else if (unwrapped.videoMessage) {
+        const m = unwrapped.videoMessage;
+        messageText = m.caption || '';
         messageType = 'video';
-      } else if (msg.message?.stickerMessage) {
+        mediaMimetype = m.mimetype || 'video/mp4';
+        mediaFileSize = m.fileLength ? Number(m.fileLength) : null;
+        mediaDuration = m.seconds || null;
+        mediaWidth = m.width || null;
+        mediaHeight = m.height || null;
+        if (m.jpegThumbnail) {
+          thumbnailBase64 = Buffer.from(m.jpegThumbnail).toString('base64');
+        }
+      } else if (unwrapped.audioMessage) {
+        const m = unwrapped.audioMessage;
+        messageText = m.ptt ? '[Voice Note]' : '[Audio]';
+        messageType = m.ptt ? 'ptt' : 'audio';
+        mediaMimetype = m.mimetype || 'audio/ogg; codecs=opus';
+        mediaFileSize = m.fileLength ? Number(m.fileLength) : null;
+        mediaDuration = m.seconds || null;
+      } else if (unwrapped.documentMessage) {
+        const m = unwrapped.documentMessage;
+        messageText = m.caption || m.fileName || '[Document]';
+        messageType = 'document';
+        mediaMimetype = m.mimetype || 'application/octet-stream';
+        mediaFilename = m.fileName || 'document';
+        mediaFileSize = m.fileLength ? Number(m.fileLength) : null;
+        if (m.jpegThumbnail) {
+          thumbnailBase64 = Buffer.from(m.jpegThumbnail).toString('base64');
+        }
+      } else if (unwrapped.stickerMessage) {
         messageText = '[Sticker]';
         messageType = 'sticker';
-      } else if (msg.message?.contactMessage) {
-        messageText = msg.message.contactMessage.displayName || '[Contact]';
+        mediaMimetype = unwrapped.stickerMessage.mimetype || 'image/webp';
+        mediaFileSize = unwrapped.stickerMessage.fileLength ? Number(unwrapped.stickerMessage.fileLength) : null;
+      } else if (unwrapped.contactMessage) {
+        messageText = unwrapped.contactMessage.displayName || '[Contact]';
         messageType = 'contact';
-      } else if (msg.message?.locationMessage) {
-        messageText = '[Location]';
+      } else if (unwrapped.contactsArrayMessage) {
+        const names = (unwrapped.contactsArrayMessage.contacts || []).map(c => c.displayName).join(', ');
+        messageText = names || '[Contacts]';
+        messageType = 'contacts';
+      } else if (unwrapped.locationMessage) {
+        const loc = unwrapped.locationMessage;
+        messageText = loc.name || loc.address || '[Location]';
         messageType = 'location';
-      } else if (msg.message?.reactionMessage) {
-        messageText = msg.message.reactionMessage.text || '[Reaction]';
+        // Include lat/lng in media data for webhook
+        mediaData = JSON.stringify({
+          latitude: loc.degreesLatitude,
+          longitude: loc.degreesLongitude,
+          name: loc.name || null,
+          address: loc.address || null,
+          url: loc.url || null
+        });
+        mediaMimetype = 'application/json';
+      } else if (unwrapped.liveLocationMessage) {
+        messageText = '[Live Location]';
+        messageType = 'live_location';
+      } else if (unwrapped.reactionMessage) {
+        messageText = unwrapped.reactionMessage.text || '';
         messageType = 'reaction';
+      } else if (unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV3) {
+        const poll = unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV3;
+        messageText = poll.name || '[Poll]';
+        messageType = 'poll';
+      } else if (unwrapped.listMessage) {
+        messageText = unwrapped.listMessage.description || unwrapped.listMessage.title || '[List]';
+        messageType = 'list';
+      } else if (unwrapped.buttonsMessage || unwrapped.templateMessage) {
+        messageText = unwrapped.buttonsMessage?.contentText || unwrapped.templateMessage?.hydratedFourRowTemplate?.hydratedContentText || '[Interactive]';
+        messageType = 'interactive';
+      } else if (unwrapped.orderMessage) {
+        messageText = '[Order]';
+        messageType = 'order';
+      } else if (unwrapped.protocolMessage) {
+        // Skip protocol messages (message edits, deletes, etc.)
+        logger.debug(`Protocol message from ${contactId}, skipping webhook`);
+        return;
       } else {
-        // Log unknown message types for debugging
-        const msgTypes = Object.keys(msg.message || {});
-        logger.debug(`Unknown message type from ${contactId}: ${msgTypes.join(', ')}`);
+        const msgTypes = Object.keys(unwrapped);
+        logger.debug(`Unhandled message type from ${contactId}: ${msgTypes.join(', ')}`);
         messageText = `[${msgTypes[0] || 'Unknown'}]`;
         messageType = 'unknown';
       }
 
-      // Skip if still no message content and not a known type
       if (!messageText && messageType === 'text') {
         logger.debug(`No message content for ${contactId}, skipping webhook`);
         return;
       }
+      if (!messageText) messageText = `[${messageType}]`;
 
-      // Ensure we have some text for the webhook
-      if (!messageText) {
-        messageText = `[${messageType}]`;
+      // ====== DOWNLOAD MEDIA (if applicable) ======
+      const hasMedia = ['image', 'video', 'audio', 'ptt', 'document', 'sticker'].includes(messageType);
+      
+      if (hasMedia && !mediaData) {
+        try {
+          const buffer = await downloadMediaMessage(
+            msg,
+            'buffer',
+            {},
+            {
+              logger: pino({ level: 'silent' }),
+              reuploadRequest: sock.updateMediaMessage
+            }
+          );
+          
+          if (buffer && buffer.length > 0) {
+            // Only include base64 for files < 10MB to prevent webhook payload bloat
+            if (buffer.length < 10 * 1024 * 1024) {
+              mediaData = buffer.toString('base64');
+            } else {
+              logger.info(`[MESSAGE] Media too large for webhook payload (${(buffer.length / 1024 / 1024).toFixed(1)}MB), sending metadata only`);
+              mediaData = null;
+            }
+            mediaFileSize = buffer.length;
+          }
+        } catch (downloadErr) {
+          logger.warn(`[MESSAGE] Failed to download media: ${downloadErr.message}`);
+          // Continue without media data — still send text/metadata
+        }
       }
 
-      logger.info(`[MESSAGE] Received from ${contactId}: ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
+      logger.info(`[MESSAGE] Received ${messageType} from ${contactId}: ${messageText.substring(0, 50)}${messageText.length > 50 ? '...' : ''}`);
 
-      // Save to conversation history in background (don't block webhook)
+      // Save to conversation history in background
       db.addConversationMessage(accountId, contactId, 'incoming', messageText, messageType).catch(dbErr => {
         logger.error(`[MESSAGE] Failed to save conversation: ${dbErr.message}`);
       });
 
-      // Dispatch webhook - this is where messages get forwarded to your webhook URL
-      logger.info(`[MESSAGE] Dispatching to webhooks for account ${accountId}...`);
+      // ====== BUILD ENRICHED WEBHOOK PAYLOAD ======
+      const webhookPayload = {
+        messageId: msg.key.id,
+        from: contactId,
+        fromJid: remoteJid,
+        isLidSender: isLidFormat,
+        message: messageText,
+        messageType,
+        isGroup,
+        timestamp: msg.messageTimestamp,
+        pushName: msg.pushName || 'Unknown',
+      };
+
+      // Add group info
+      if (isGroup) {
+        webhookPayload.groupJid = remoteJid;
+        webhookPayload.participant = msg.key.participant || null;
+        webhookPayload.participantPhone = msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null;
+      }
+
+      // Add media data when available
+      if (hasMedia || messageType === 'location') {
+        webhookPayload.media = {
+          mimetype: mediaMimetype,
+          filename: mediaFilename || null,
+          fileSize: mediaFileSize || null,
+          duration: mediaDuration || null,
+          width: mediaWidth || null,
+          height: mediaHeight || null,
+          data: mediaData || null,  // base64-encoded file content
+          thumbnail: thumbnailBase64 || null,
+        };
+      }
+
+      // Dispatch webhook
+      logger.info(`[MESSAGE] Dispatching ${messageType} to webhooks for account ${accountId}...`);
       
       try {
-        await webhookDeliveryService.dispatch(accountId, 'message', {
-          messageId: msg.key.id,
-          from: contactId,
-          fromJid: remoteJid,
-          isLidSender: isLidFormat,
-          message: messageText,
-          messageType,
-          isGroup,
-          timestamp: msg.messageTimestamp,
-          pushName: msg.pushName || 'Unknown'
-        });
+        await webhookDeliveryService.dispatch(accountId, 'message', webhookPayload);
         logger.info(`[MESSAGE] Webhook dispatch completed for account ${accountId}`);
       } catch (webhookErr) {
         logger.error(`[MESSAGE] Webhook dispatch error: ${webhookErr.message}`);
@@ -1131,20 +1347,23 @@ class WhatsAppManager {
 
       // AI Auto-reply (only for text messages, non-group)
       if (messageType === 'text' && !isGroup) {
-        aiAutoReply.generateReply({
-          accountId,
-          contactId,
-          message: messageText
-        }).then(aiReply => {
-          if (aiReply) {
-            // Send reply in background
-            this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
-              logger.error(`Failed to send AI reply: ${err.message}`);
-            });
-          }
-        }).catch(err => {
-          logger.error(`AI reply generation failed: ${err.message}`);
-        });
+        // Add human-like delay before AI responds
+        const aiDelay = humanDelay(2000, 6000);
+        setTimeout(() => {
+          aiAutoReply.generateReply({
+            accountId,
+            contactId,
+            message: messageText
+          }).then(aiReply => {
+            if (aiReply) {
+              this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
+                logger.error(`Failed to send AI reply: ${err.message}`);
+              });
+            }
+          }).catch(err => {
+            logger.error(`AI reply generation failed: ${err.message}`);
+          });
+        }, aiDelay);
       }
     } catch (error) {
       logger.error(`Error handling message for account ${accountId}: ${error.message}`);
@@ -1152,7 +1371,7 @@ class WhatsAppManager {
   }
 
   /**
-   * Send text message
+   * Send text message with human-like behavior
    */
   async sendMessage(accountId, phone, message) {
     const sock = this.connections.get(accountId);
@@ -1169,12 +1388,18 @@ class WhatsAppManager {
     }
 
     try {
-      // Simulate typing before sending (makes it look natural)
+      // Go available briefly (like opening a chat)
+      await sock.sendPresenceUpdate('available').catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+
+      // Start typing — duration proportional to message length
       await sock.sendPresenceUpdate('composing', jid);
-      // Brief delay to show typing indicator (300-800ms based on message length)
-      const typingDelay = Math.min(300 + message.length * 10, 800);
-      await new Promise(resolve => setTimeout(resolve, typingDelay));
+      const delay = typingDelay(message.length);
+      await new Promise(resolve => setTimeout(resolve, delay));
       await sock.sendPresenceUpdate('paused', jid);
+
+      // Brief natural pause between typing stop and send
+      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
       // Send message
       const result = await sock.sendMessage(jid, { text: message });
@@ -1183,6 +1408,11 @@ class WhatsAppManager {
       
       // Save to conversation history
       await db.addConversationMessage(accountId, phone, 'outgoing', message, 'text');
+
+      // Go unavailable after sending (like minimizing the window)
+      setTimeout(() => {
+        sock.sendPresenceUpdate('unavailable').catch(() => {});
+      }, humanDelay(2000, 8000));
 
       logger.info(`Message sent to ${phone}`);
 
@@ -1213,12 +1443,17 @@ class WhatsAppManager {
     }
 
     try {
-      // Simulate typing before sending (makes it look natural)
+      // Go available briefly
+      await sock.sendPresenceUpdate('available').catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+
+      // Typing simulation with human-like duration
       await sock.sendPresenceUpdate('composing', jid);
-      // Brief delay to show typing indicator (300-800ms based on message length)
-      const typingDelay = Math.min(300 + message.length * 10, 800);
-      await new Promise(resolve => setTimeout(resolve, typingDelay));
+      const delay = typingDelay(message.length);
+      await new Promise(resolve => setTimeout(resolve, delay));
       await sock.sendPresenceUpdate('paused', jid);
+
+      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
       // Send message
       const result = await sock.sendMessage(jid, { text: message });
@@ -1228,6 +1463,11 @@ class WhatsAppManager {
       // Save to conversation history
       const contactId = this.getPhoneNumber(jid);
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+
+      // Go back to unavailable
+      setTimeout(() => {
+        sock.sendPresenceUpdate('unavailable').catch(() => {});
+      }, humanDelay(2000, 8000));
 
       logger.info(`Message sent to ${jid}`);
 
@@ -1274,10 +1514,15 @@ class WhatsAppManager {
     }
 
     try {
-      // Simulate typing before sending media (makes it look natural)
+      // Human-like media send behavior
+      await sock.sendPresenceUpdate('available').catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
+      
+      // Show composing for realistic duration (media takes time to "select")
       await sock.sendPresenceUpdate('composing', jid);
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, humanDelay(1500, 4000)));
       await sock.sendPresenceUpdate('paused', jid);
+      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
 
       let messageContent;
 
@@ -1319,6 +1564,11 @@ class WhatsAppManager {
       this.metrics.messagesSent++;
       logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
 
+      // Go back to unavailable after media send
+      setTimeout(() => {
+        sock.sendPresenceUpdate('unavailable').catch(() => {});
+      }, humanDelay(3000, 10000));
+
       return {
         success: true,
         messageId: result.key.id,
@@ -1359,7 +1609,7 @@ class WhatsAppManager {
   }
 
   /**
-   * Save session to database
+   * Save session to database with write locking and validation
    */
   async saveSession(accountId) {
     try {
@@ -1369,6 +1619,13 @@ class WhatsAppManager {
         return;
       }
 
+      // Prevent concurrent saves (creds.update fires rapidly)
+      if (this.sessionSaveLocks.has(accountId)) {
+        logger.debug(`Session save already in progress for ${accountId}, skipping`);
+        return;
+      }
+      this.sessionSaveLocks.add(accountId);
+
       const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
       
       // Check if auth directory exists
@@ -1376,6 +1633,7 @@ class WhatsAppManager {
         await fs.access(authPath);
       } catch {
         logger.debug(`Auth path does not exist for account ${accountId}, skipping save`);
+        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
@@ -1383,17 +1641,25 @@ class WhatsAppManager {
       
       if (files.length === 0) {
         logger.debug(`No session files to save for account ${accountId}`);
+        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
       const sessionData = {};
+      let credsValid = false;
+
       for (const file of files) {
         if (file.endsWith('.json')) {
           try {
             const content = await fs.readFile(path.join(authPath, file), 'utf8');
             // Validate it's valid JSON
-            JSON.parse(content);
+            const parsed = JSON.parse(content);
             sessionData[file] = content;
+
+            // Track if creds look valid
+            if (file === 'creds.json') {
+              credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey);
+            }
           } catch (readError) {
             logger.warn(`Failed to read/parse session file ${file}: ${readError.message}`);
           }
@@ -1402,6 +1668,14 @@ class WhatsAppManager {
 
       if (Object.keys(sessionData).length === 0) {
         logger.debug(`No valid session files to save for account ${accountId}`);
+        this.sessionSaveLocks.delete(accountId);
+        return;
+      }
+
+      // Only save if creds.json was found and has valid identity keys
+      if (!sessionData['creds.json'] || !credsValid) {
+        logger.warn(`Session for ${accountId} has no valid creds.json, skipping DB save`);
+        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
@@ -1413,7 +1687,9 @@ class WhatsAppManager {
       });
 
       logger.debug(`Session saved for account ${accountId} (${Object.keys(sessionData).length} files)`);
+      this.sessionSaveLocks.delete(accountId);
     } catch (error) {
+      this.sessionSaveLocks.delete(accountId);
       logger.error(`Failed to save session for account ${accountId}:`, error.message);
     }
   }
