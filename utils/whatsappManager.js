@@ -350,17 +350,26 @@ class WhatsAppManager {
     const msgHash = crypto.createHash('sha256').update(message).digest('hex').slice(0, 16);
     const key = `${accountId}:${jid}:${msgHash}`;
     
+    const now = Date.now();
     const lastSent = recentMessageHashes.get(key);
-    if (lastSent && (Date.now() - lastSent) < DUPLICATE_WINDOW_MS) {
+    if (lastSent && (now - lastSent) < DUPLICATE_WINDOW_MS) {
       return true;
     }
 
-    recentMessageHashes.set(key, Date.now());
+    recentMessageHashes.set(key, now);
     
-    // Cleanup old entries
-    if (recentMessageHashes.size > 10000) {
-      const oldest = recentMessageHashes.keys().next().value;
-      recentMessageHashes.delete(oldest);
+    // Cleanup old entries - evict expired entries instead of just one
+    if (recentMessageHashes.size > 5000) {
+      for (const [k, v] of recentMessageHashes) {
+        if (now - v > DUPLICATE_WINDOW_MS) {
+          recentMessageHashes.delete(k);
+        }
+      }
+      // If still too many, remove oldest entries
+      if (recentMessageHashes.size > 8000) {
+        const keysToDelete = Array.from(recentMessageHashes.keys()).slice(0, 2000);
+        keysToDelete.forEach(k => recentMessageHashes.delete(k));
+      }
     }
 
     return false;

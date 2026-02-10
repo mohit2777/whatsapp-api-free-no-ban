@@ -478,6 +478,12 @@ const MODEL_OPTIONS = {
         { value: 'google/gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
         { value: 'meta-llama/llama-3.3-70b', label: 'Llama 3.3 70B' },
         { value: 'mistralai/mixtral-8x7b', label: 'Mixtral 8x7B' }
+    ],
+    'openrouter-free': [
+        { value: 'meta-llama/llama-3.3-70b:free', label: 'Llama 3.3 70B (Free)' },
+        { value: 'google/gemini-2.0-flash-exp:free', label: 'Gemini 2.0 Flash (Free)' },
+        { value: 'mistralai/mistral-small-3.1-24b-instruct:free', label: 'Mistral Small 3.1 (Free)' },
+        { value: 'qwen/qwen3-32b:free', label: 'Qwen3 32B (Free)' }
     ]
 };
 

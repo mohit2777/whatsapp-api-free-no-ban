@@ -253,12 +253,12 @@ app.get('/api/health', async (req, res) => {
       queue: queueStatus,
       cache: cacheStats,
       webhookQueue: {
-        queueSize: webhookQueue.total,
-        isProcessing: webhookQueue.processing > 0,
-        delivered: webhookQueue.total - webhookQueue.pending - webhookQueue.processing,
+        queueSize: webhookQueue.total || 0,
+        isProcessing: (webhookQueue.processing || 0) > 0,
+        delivered: Math.max(0, (webhookQueue.total || 0) - (webhookQueue.pending || 0) - (webhookQueue.processing || 0)),
         failed: webhookQueue.retrying || 0,
-        pending: webhookQueue.pending,
-        maxSize: webhookQueue.maxSize
+        pending: webhookQueue.pending || 0,
+        maxSize: webhookQueue.maxSize || 1000
       },
       metrics
     });
@@ -417,6 +417,11 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
 
     logger.info(`[API] /api/send-media called - to: ${to}, file: ${req.file?.originalname}, type: ${mediaType}`);
 
+    if (!api_key) {
+      logger.warn('[API] Missing api_key');
+      return res.status(400).json({ success: false, error: 'api_key is required' });
+    }
+
     if (!req.file) {
       logger.warn('[API] No media file provided');
       return res.status(400).json({ success: false, error: 'No media file provided' });
@@ -511,8 +516,8 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
         return res.status(400).json({ success: false, error: 'Only http/https URLs are allowed' });
       }
       const hostname = parsedUrl.hostname.toLowerCase();
-      const blockedPatterns = ['localhost', '127.0.0.1', '0.0.0.0', '::1', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.', '169.254.', 'metadata.google', 'metadata.aws'];
-      if (blockedPatterns.some(p => hostname.startsWith(p) || hostname === p)) {
+      const blockedPatterns = ['localhost', '127.0.0.1', '0.0.0.0', '::1', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.', '169.254.', 'metadata.google', 'metadata.aws', '[::1]', 'fd', 'fc00'];
+      if (blockedPatterns.some(p => hostname.startsWith(p) || hostname === p || hostname.includes(p))) {
         return res.status(400).json({ success: false, error: 'Internal/private URLs are not allowed' });
       }
 
@@ -696,24 +701,22 @@ async function start() {
 }
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down...');
+async function gracefulShutdown(signal) {
+  logger.info(`${signal} received, shutting down...`);
   webhookDeliveryService.stop();
   await whatsappManager.shutdown();
   server.close(() => {
     logger.info('Server closed');
     process.exit(0);
   });
-});
+  // Force exit after 15 seconds if server.close hangs
+  setTimeout(() => {
+    logger.warn('Forced exit after shutdown timeout');
+    process.exit(1);
+  }, 15000).unref();
+}
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down...');
-  webhookDeliveryService.stop();
-  await whatsappManager.shutdown();
-  server.close(() => {
-    logger.info('Server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 start();
