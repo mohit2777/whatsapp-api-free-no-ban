@@ -670,8 +670,6 @@ class WhatsAppManager {
         // Firewall / keep-alive tuning
         keepAliveIntervalMs: 25000, // 25s keep-alive like real WA Web
         retryRequestDelayMs: 250,
-        // Emit only what we subscribe to
-        emitOwnEvents: false,
       });
 
       // Store connection
@@ -769,10 +767,24 @@ class WhatsAppManager {
       // Don't crash, let connection.update handle reconnection
     });
 
+    // Track whether QR was just scanned successfully (pair-success triggers
+    // isNewLogin=true before the server restarts the connection).
+    // We must NOT treat that subsequent close as a failure.
+    let justPaired = false;
+
     // Connection update
     sock.ev.on('connection.update', async (update) => {
       try {
-        const { connection, lastDisconnect, qr } = update;
+        const { connection, lastDisconnect, qr, isNewLogin } = update;
+
+        // Baileys signals pair-success with isNewLogin=true right before
+        // asking the server to restart the connection.  Mark it so the
+        // close handler below reconnects quickly instead of deleting
+        // the freshly-written credentials.
+        if (isNewLogin) {
+          justPaired = true;
+          logger.info(`QR scan successful for account ${accountId}, expecting connection restart`);
+        }
 
         if (qr) {
           // QR generated - clear watchdog timer (connection is progressing)
@@ -825,6 +837,27 @@ class WhatsAppManager {
         // Check if account was deleted - don't try to reconnect or update DB
         if (this.deletedAccounts.has(accountId)) {
           logger.info(`Account ${accountId} was deleted, skipping reconnection`);
+          return;
+        }
+
+        // ── Fast-path: QR just scanned (pair-success → server restart) ──
+        // After a successful QR scan, Baileys sets isNewLogin=true then the
+        // server closes the WS (usually 515 restartRequired or 428).
+        // The creds.update handler is still saving the valid authenticated
+        // credentials in the background.  We must NOT delete the auth files
+        // or treat this as a failure — just reconnect quickly.
+        if (justPaired) {
+          logger.info(`Post-QR-scan restart for ${accountId} (status ${statusCode}), reconnecting in 3s`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          await db.updateAccount(accountId, {
+            status: 'reconnecting',
+            qr_code: null,
+            error_message: null
+          }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'reconnecting', message: 'QR scanned, reconnecting...' });
+          
+          // Give saveCreds/saveSession a moment to finish writing, then reconnect
+          this.scheduleReconnect(accountId, 3000);
           return;
         }
 
@@ -1073,8 +1106,31 @@ class WhatsAppManager {
 
     // Credentials update
     sock.ev.on('creds.update', async () => {
-      await saveCreds();
-      await this.saveSession(accountId);
+      try {
+        await saveCreds();
+        
+        // Only persist to database when creds represent a fully authenticated
+        // session (i.e. QR was scanned and pair-success completed).
+        // Before authentication, creds have registered=false and no 'me' —
+        // saving those to the DB confuses the close handler's new-vs-established
+        // account detection and causes session_data to be non-null even though
+        // the user never actually authenticated.
+        const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
+        try {
+          const credsRaw = await fs.readFile(path.join(authPath, 'creds.json'), 'utf8');
+          const creds = JSON.parse(credsRaw);
+          if (creds.me && creds.registered !== false) {
+            await this.saveSession(accountId);
+          } else {
+            logger.debug(`Skipping DB session save for ${accountId} (not yet authenticated)`);
+          }
+        } catch (readErr) {
+          // If we can't verify, save anyway as a fallback
+          await this.saveSession(accountId);
+        }
+      } catch (error) {
+        logger.error(`Error saving creds for ${accountId}: ${error.message}`);
+      }
     });
 
     // Incoming messages
