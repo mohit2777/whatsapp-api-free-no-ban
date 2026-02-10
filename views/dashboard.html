@@ -3,8 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - WhatsApp Multi-Automation</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <title>Dashboard - WAMulti</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/css/dashboard.css">
 </head>
 <body>
@@ -14,12 +17,16 @@
             <div class="sidebar-header">
                 <div class="logo">
                     <div class="logo-icon"><i class="fab fa-whatsapp"></i></div>
-                    <h2>WA<span>Multi</span></h2>
+                    <div class="logo-text">
+                        <h2>WA<span>Multi</span></h2>
+                        <p class="logo-tagline">Automation Platform</p>
+                    </div>
                 </div>
             </div>
             <nav class="sidebar-nav">
+                <div class="nav-section-label">Main</div>
                 <a href="#" class="nav-link active" data-view="dashboard">
-                    <i class="fas fa-tachometer-alt"></i>
+                    <i class="fas fa-grid-2"></i>
                     <span>Dashboard</span>
                 </a>
                 <a href="#" class="nav-link" data-view="accounts">
@@ -30,6 +37,7 @@
                     <i class="fas fa-link"></i>
                     <span>Webhooks</span>
                 </a>
+                <div class="nav-section-label">Settings</div>
                 <a href="#" class="nav-link" data-view="system">
                     <i class="fas fa-server"></i>
                     <span>System</span>
@@ -40,8 +48,10 @@
                 </a>
             </nav>
             <div class="sidebar-footer">
-                <div class="status-indicator online"></div>
-                <span>System Online</span>
+                <div class="system-status">
+                    <div class="status-indicator online"></div>
+                    <span>System Online</span>
+                </div>
             </div>
         </aside>
 
@@ -49,60 +59,68 @@
         <main class="main-content">
             <!-- Top Bar -->
             <header class="topbar">
-                <button class="menu-toggle" id="menuToggle">
-                    <i class="fas fa-bars"></i>
-                </button>
-                <h1 class="page-title" id="pageTitle">Dashboard</h1>
+                <div class="topbar-left">
+                    <button class="menu-toggle" id="menuToggle">
+                        <i class="fas fa-bars"></i>
+                    </button>
+                    <div class="page-info">
+                        <h1 class="page-title" id="pageTitle">Dashboard</h1>
+                        <p class="page-subtitle" id="pageSubtitle">Overview of your WhatsApp automation</p>
+                    </div>
+                </div>
                 <div class="topbar-actions">
                     <button class="btn btn-primary" id="newAccountBtn">
-                        <i class="fas fa-plus"></i> New Account
+                        <i class="fas fa-plus"></i>
+                        <span>New Account</span>
                     </button>
                     <button class="btn btn-icon" id="logoutBtn" title="Logout">
-                        <i class="fas fa-sign-out-alt"></i>
+                        <i class="fas fa-right-from-bracket"></i>
                     </button>
                 </div>
             </header>
 
             <!-- Content Area -->
             <div class="content" id="content">
-                <!-- Dashboard View -->
+
+                <!-- ============ Dashboard View ============ -->
                 <div class="view active" id="dashboardView">
-                    <!-- Stats -->
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-users"></i></div>
+                            <div class="stat-icon blue"><i class="fas fa-users"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="totalAccounts">0</span>
                                 <span class="stat-label">Total Accounts</span>
+                                <span class="stat-value" id="totalAccounts">0</span>
                             </div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-icon online"><i class="fas fa-check-circle"></i></div>
+                            <div class="stat-icon green"><i class="fas fa-circle-check"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="activeAccounts">0</span>
                                 <span class="stat-label">Active</span>
+                                <span class="stat-value" id="activeAccounts">0</span>
                             </div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-paper-plane"></i></div>
+                            <div class="stat-icon purple"><i class="fas fa-paper-plane"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="messagesSent">0</span>
                                 <span class="stat-label">Messages Sent</span>
+                                <span class="stat-value" id="messagesSent">0</span>
                             </div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-envelope"></i></div>
+                            <div class="stat-icon orange"><i class="fas fa-envelope"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="messagesReceived">0</span>
                                 <span class="stat-label">Messages Received</span>
+                                <span class="stat-value" id="messagesReceived">0</span>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Accounts Table -->
                     <div class="card">
                         <div class="card-header">
-                            <h2>Connected Accounts</h2>
+                            <div class="card-title-group">
+                                <h2>Connected Accounts</h2>
+                                <span class="card-badge" id="accountCountBadge">0 accounts</span>
+                            </div>
                         </div>
                         <div class="table-wrapper">
                             <table class="table">
@@ -115,23 +133,29 @@
                                     </tr>
                                 </thead>
                                 <tbody id="accountsTable">
-                                    <tr>
-                                        <td colspan="4" class="loading">Loading...</td>
-                                    </tr>
+                                    <tr><td colspan="4" class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p>Loading accounts...</p></td></tr>
                                 </tbody>
                             </table>
                         </div>
                     </div>
                 </div>
 
-                <!-- Accounts View -->
+                <!-- ============ Accounts View ============ -->
                 <div class="view" id="accountsView">
                     <div class="card">
                         <div class="card-header">
-                            <h2>Manage Accounts</h2>
-                            <button class="btn btn-primary" id="newAccountBtn2">
-                                <i class="fas fa-plus"></i> New Account
-                            </button>
+                            <div class="card-title-group">
+                                <h2>Manage Accounts</h2>
+                            </div>
+                            <div class="card-actions">
+                                <div class="search-box">
+                                    <i class="fas fa-search"></i>
+                                    <input type="text" id="accountSearchInput" placeholder="Search accounts..." oninput="filterAccounts(this.value)">
+                                </div>
+                                <button class="btn btn-primary" id="newAccountBtn2">
+                                    <i class="fas fa-plus"></i> <span>Add Account</span>
+                                </button>
+                            </div>
                         </div>
                         <div class="table-wrapper">
                             <table class="table">
@@ -146,234 +170,474 @@
                                     </tr>
                                 </thead>
                                 <tbody id="accountsTableFull">
-                                    <tr>
-                                        <td colspan="6" class="loading">Loading...</td>
-                                    </tr>
+                                    <tr><td colspan="6" class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p>Loading...</p></td></tr>
                                 </tbody>
                             </table>
                         </div>
                     </div>
                 </div>
 
-                <!-- Webhooks View -->
+                <!-- ============ Webhooks View ============ -->
                 <div class="view" id="webhooksView">
+                    <!-- Webhook Stats -->
+                    <div class="stats-grid stats-grid-sm">
+                        <div class="stat-card compact">
+                            <div class="stat-icon blue"><i class="fas fa-link"></i></div>
+                            <div class="stat-info">
+                                <span class="stat-label">Total Webhooks</span>
+                                <span class="stat-value" id="webhookTotal">0</span>
+                            </div>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-icon green"><i class="fas fa-circle-check"></i></div>
+                            <div class="stat-info">
+                                <span class="stat-label">Active</span>
+                                <span class="stat-value" id="webhookActive">0</span>
+                            </div>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-icon red"><i class="fas fa-triangle-exclamation"></i></div>
+                            <div class="stat-info">
+                                <span class="stat-label">Failed Deliveries</span>
+                                <span class="stat-value" id="webhookFailed">0</span>
+                            </div>
+                        </div>
+                        <div class="stat-card compact">
+                            <div class="stat-icon purple"><i class="fas fa-chart-line"></i></div>
+                            <div class="stat-info">
+                                <span class="stat-label">Queue Size</span>
+                                <span class="stat-value" id="webhookQueueSize">0</span>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="card">
                         <div class="card-header">
-                            <h2>Webhook Configuration</h2>
+                            <div class="card-title-group">
+                                <h2>Webhook Configuration</h2>
+                            </div>
+                            <div class="card-actions">
+                                <select id="webhookAccountSelect" class="select-modern">
+                                    <option value="">Select Account</option>
+                                </select>
+                            </div>
                         </div>
                         <div class="card-body">
-                            <p class="info-text">Select an account to manage its webhooks.</p>
-                            <select id="webhookAccountSelect" class="select">
-                                <option value="">Select Account</option>
-                            </select>
-                            <div id="webhooksList" style="margin-top: 20px;"></div>
+                            <div id="webhooksList">
+                                <div class="empty-state-card">
+                                    <i class="fas fa-link"></i>
+                                    <p>Select an account to manage its webhooks</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Add Webhook Form -->
+                    <div class="card" id="addWebhookCard" style="display:none; margin-top: 20px;">
+                        <div class="card-header">
+                            <h2>Add Webhook</h2>
+                            <button class="btn btn-icon btn-sm" onclick="document.getElementById('addWebhookCard').style.display='none'">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                        <div class="card-body">
+                            <form id="addWebhookForm">
+                                <input type="hidden" id="webhookFormAccountId">
+                                <div class="form-group">
+                                    <label>Webhook URL</label>
+                                    <input type="url" id="webhookUrl" placeholder="https://your-n8n.com/webhook/..." required class="input-modern">
+                                </div>
+                                <div class="form-group">
+                                    <label>Events</label>
+                                    <div class="checkbox-grid">
+                                        <label class="checkbox-card">
+                                            <input type="checkbox" name="webhookEvents" value="message" checked>
+                                            <span><i class="fas fa-envelope"></i> Messages</span>
+                                        </label>
+                                        <label class="checkbox-card">
+                                            <input type="checkbox" name="webhookEvents" value="connection.update">
+                                            <span><i class="fas fa-plug"></i> Connection</span>
+                                        </label>
+                                        <label class="checkbox-card">
+                                            <input type="checkbox" name="webhookEvents" value="presence.update">
+                                            <span><i class="fas fa-eye"></i> Presence</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Secret Key <span class="label-hint">(optional)</span></label>
+                                    <div class="input-with-btn">
+                                        <input type="text" id="webhookSecret" placeholder="Webhook secret for signature verification" class="input-modern">
+                                        <button type="button" class="btn btn-secondary btn-sm" onclick="generateSecret()">Generate</button>
+                                    </div>
+                                </div>
+                                <button type="submit" class="btn btn-primary">
+                                    <i class="fas fa-plus"></i> Save Webhook
+                                </button>
+                            </form>
                         </div>
                     </div>
                 </div>
 
-                <!-- System View -->
+                <!-- ============ System View ============ -->
                 <div class="view" id="systemView">
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-clock"></i></div>
+                            <div class="stat-icon green"><i class="fas fa-clock"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="sysUptime">-</span>
                                 <span class="stat-label">Uptime</span>
+                                <span class="stat-value" id="sysUptime">-</span>
                             </div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-memory"></i></div>
+                            <div class="stat-icon blue"><i class="fas fa-microchip"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="sysMemory">-</span>
                                 <span class="stat-label">Memory Used</span>
+                                <span class="stat-value" id="sysMemory">-</span>
                             </div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-icon"><i class="fas fa-database"></i></div>
+                            <div class="stat-icon purple"><i class="fas fa-database"></i></div>
                             <div class="stat-info">
-                                <span class="stat-value" id="sysCacheHit">-</span>
                                 <span class="stat-label">Cache Hit Rate</span>
+                                <span class="stat-value" id="sysCacheHit">-</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon orange"><i class="fas fa-bolt"></i></div>
+                            <div class="stat-info">
+                                <span class="stat-label">Node.js</span>
+                                <span class="stat-value" id="sysNodeVersion" style="font-size: 18px;">-</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid-2col">
+                        <!-- Active Connections -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2>Active Connections</h2>
+                                <button class="btn btn-secondary btn-sm" onclick="loadAccounts()">
+                                    <i class="fas fa-refresh"></i> Refresh
+                                </button>
+                            </div>
+                            <div class="card-body" id="activeConnectionsList">
+                                <div class="empty-state-card compact">
+                                    <i class="fas fa-plug"></i>
+                                    <p>Loading connections...</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Webhook Queue -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2>Webhook Queue</h2>
+                                <span class="card-badge green">In-Memory</span>
+                            </div>
+                            <div class="card-body" id="webhookQueueInfo">
+                                <div class="queue-stats">
+                                    <div class="queue-stat">
+                                        <span class="queue-stat-label">Queue Size</span>
+                                        <span class="queue-stat-value" id="queueSize">0 / 1000</span>
+                                    </div>
+                                    <div class="queue-stat">
+                                        <span class="queue-stat-label">Processing</span>
+                                        <span class="queue-stat-value" id="queueProcessing">Idle</span>
+                                    </div>
+                                    <div class="queue-stat">
+                                        <span class="queue-stat-label">Delivered</span>
+                                        <span class="queue-stat-value green" id="queueDelivered">0</span>
+                                    </div>
+                                    <div class="queue-stat">
+                                        <span class="queue-stat-label">Failed</span>
+                                        <span class="queue-stat-value red" id="queueFailedCount">0</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Server Configuration -->
+                    <div class="card" style="margin-top: 20px;">
+                        <div class="card-header">
+                            <h2>Server Configuration</h2>
+                        </div>
+                        <div class="card-body">
+                            <div class="config-grid">
+                                <div class="config-item">
+                                    <span class="config-label">Platform</span>
+                                    <span class="config-value" id="cfgPlatform">Node.js</span>
+                                </div>
+                                <div class="config-item">
+                                    <span class="config-label">Baileys Version</span>
+                                    <span class="config-value">6.7.21</span>
+                                </div>
+                                <div class="config-item">
+                                    <span class="config-label">Session Storage</span>
+                                    <span class="config-value">File System</span>
+                                </div>
+                                <div class="config-item">
+                                    <span class="config-label">Database</span>
+                                    <span class="config-value">Supabase PostgreSQL</span>
+                                </div>
+                                <div class="config-item">
+                                    <span class="config-label">Max Accounts</span>
+                                    <span class="config-value">Unlimited</span>
+                                </div>
+                                <div class="config-item">
+                                    <span class="config-label">AI Providers</span>
+                                    <span class="config-value">OpenAI, Claude, Gemini, Groq, OpenRouter</span>
+                                </div>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- API Docs View -->
+                <!-- ============ API Docs View ============ -->
                 <div class="view" id="apiDocsView">
-                    <div class="card">
-                        <div class="card-header">
-                            <h2>API Documentation for n8n Integration</h2>
-                        </div>
-                        <div class="card-body api-docs">
-                            <div class="api-section">
-                                <h2>🚀 Quick Start</h2>
-                                <p class="info-text">Use your API key from the Accounts page. Replace YOUR_DOMAIN with your server URL.</p>
-                                <p class="info-text" style="color: #2ecc71;"><strong>✅ Simple:</strong> Use the <code>to</code> field for both phone numbers AND JIDs (LIDs). The API auto-detects the format!</p>
+                    <div class="api-docs-layout">
+                        <!-- Sidebar Navigation -->
+                        <div class="api-sidebar">
+                            <div class="api-sidebar-header">
+                                <h3>Endpoints</h3>
+                                <span class="version-tag">v4.0</span>
                             </div>
+                            <nav class="api-nav">
+                                <div class="api-nav-group">
+                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
+                                        <i class="fas fa-key"></i> Authentication
+                                        <i class="fas fa-chevron-down toggle-icon"></i>
+                                    </button>
+                                    <div class="api-nav-items">
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('auth-login')">
+                                            <span class="method-badge post">POST</span> /api/login
+                                        </a>
+                                    </div>
+                                </div>
+                                <div class="api-nav-group">
+                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
+                                        <i class="fas fa-users"></i> Accounts
+                                        <i class="fas fa-chevron-down toggle-icon"></i>
+                                    </button>
+                                    <div class="api-nav-items">
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('get-accounts')">
+                                            <span class="method-badge get">GET</span> /api/accounts
+                                        </a>
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('create-account')">
+                                            <span class="method-badge post">POST</span> /api/accounts
+                                        </a>
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('delete-account')">
+                                            <span class="method-badge delete">DEL</span> /api/accounts/:id
+                                        </a>
+                                    </div>
+                                </div>
+                                <div class="api-nav-group">
+                                    <button class="api-nav-group-toggle active" onclick="toggleApiGroup(this)">
+                                        <i class="fas fa-comment-dots"></i> Messages
+                                        <i class="fas fa-chevron-down toggle-icon"></i>
+                                    </button>
+                                    <div class="api-nav-items show">
+                                        <a href="#" class="api-nav-item active" onclick="showEndpoint('send-text')">
+                                            <span class="method-badge post">POST</span> /api/send
+                                        </a>
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('send-media')">
+                                            <span class="method-badge post">POST</span> /api/send-media
+                                        </a>
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('send-media-url')">
+                                            <span class="method-badge post">POST</span> /api/send-media-url
+                                        </a>
+                                    </div>
+                                </div>
+                                <div class="api-nav-group">
+                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
+                                        <i class="fas fa-link"></i> Webhooks
+                                        <i class="fas fa-chevron-down toggle-icon"></i>
+                                    </button>
+                                    <div class="api-nav-items">
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('get-webhooks')">
+                                            <span class="method-badge get">GET</span> /api/webhooks/:accountId
+                                        </a>
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('add-webhook')">
+                                            <span class="method-badge post">POST</span> /api/webhooks
+                                        </a>
+                                    </div>
+                                </div>
+                                <div class="api-nav-group">
+                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
+                                        <i class="fas fa-server"></i> System
+                                        <i class="fas fa-chevron-down toggle-icon"></i>
+                                    </button>
+                                    <div class="api-nav-items">
+                                        <a href="#" class="api-nav-item" onclick="showEndpoint('health')">
+                                            <span class="method-badge get">GET</span> /api/health
+                                        </a>
+                                    </div>
+                                </div>
+                            </nav>
+                        </div>
 
-                            <h3>📤 1. Send Text Message</h3>
-                            <p class="info-text">POST /api/send - Works with phone number OR JID (fromJid from webhook)</p>
-                            <pre><code># Reply to a message using fromJid from webhook:
-curl -X POST https://YOUR_DOMAIN/api/send \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_API_KEY",
-    "to": "{{ $json.data.fromJid }}",
-    "message": "Thanks for your message!"
-  }'
+                        <!-- API Content -->
+                        <div class="api-content">
+                            <div class="api-endpoint-detail" id="apiEndpointDetail">
+                                <!-- Send Text Message (default) -->
+                                <div class="endpoint-header">
+                                    <span class="method-badge post large">POST</span>
+                                    <code class="endpoint-url">/api/send</code>
+                                </div>
+                                <p class="endpoint-desc">Send a text message to a WhatsApp number or reply using fromJid from webhook.</p>
 
-# Or send to a known phone number:
-curl -X POST https://YOUR_DOMAIN/api/send \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_API_KEY",
-    "to": "918005780278",
-    "message": "Hello!"
-  }'</code></pre>
+                                <div class="api-section">
+                                    <h4>Headers</h4>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>Headers</span></div>
+                                        <pre><code>Content-Type: application/json</code></pre>
+                                    </div>
+                                </div>
 
-                            <h3>📷 2. Send Media via File Upload</h3>
-                            <p class="info-text">POST /api/send-media (multipart/form-data) - Use <code>to</code> for both phone and JID</p>
-                            <pre><code># Send to phone number:
-curl -X POST https://YOUR_DOMAIN/api/send-media \
-  -F "api_key=YOUR_API_KEY" \
-  -F "to=918005780278" \
-  -F "mediaType=image" \
-  -F "caption=Check this out!" \
-  -F "media=@/path/to/image.jpg"
+                                <div class="api-section">
+                                    <h4>Request Body</h4>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>JSON</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>{
+  "api_key": "YOUR_API_KEY",
+  "to": "919876543210",
+  "message": "Hello from WAMulti API!"
+}</code></pre>
+                                    </div>
+                                </div>
 
-# Reply using fromJid from webhook:
-curl -X POST https://YOUR_DOMAIN/api/send-media \
-  -F "api_key=YOUR_API_KEY" \
-  -F "to={{ $json.data.fromJid }}" \
-  -F "mediaType=image" \
-  -F "caption=Check this out!" \
-  -F "media=@/path/to/image.jpg"
-
-# mediaType options: image, video, audio, document</code></pre>
-
-                            <h3>🔗 3. Send Media via URL (Best for n8n)</h3>
-                            <p class="info-text">POST /api/send-media-url - Use <code>to</code> for both phone and JID</p>
-                            <pre><code># Reply with image:
-curl -X POST https://YOUR_DOMAIN/api/send-media-url \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_API_KEY",
-    "to": "{{ $json.data.fromJid }}",
-    "mediaType": "image",
-    "mediaUrl": "https://example.com/image.jpg",
-    "caption": "Here is your image!"
-  }'</code></pre>
-
-                            <h3>📝 4. Send Media via Base64</h3>
-                            <p class="info-text">POST /api/send-media-url (JSON body with base64)</p>
-                            <pre><code>curl -X POST https://YOUR_DOMAIN/api/send-media-url \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_API_KEY",
-    "to": "{{ $json.data.fromJid }}",
-    "mediaType": "document",
-    "mediaBase64": "{{ $binary.data.data }}",
-    "mimetype": "application/pdf",
-    "filename": "document.pdf",
-    "caption": "Your document"
-  }'</code></pre>
-
-                            <h3>✅ Success Response</h3>
-                            <pre><code>{
+                                <div class="api-section">
+                                    <h4>Response</h4>
+                                    <div class="code-block success">
+                                        <div class="code-header"><span>200 OK</span></div>
+                                        <pre><code>{
   "success": true,
-  "messageId": "ABCD1234567890",
+  "messageId": "3EB0F4A2B3C4D5E6F7",
   "timestamp": 1706889600000
 }</code></pre>
+                                    </div>
+                                </div>
 
-                            <h3>❌ Error Response</h3>
-                            <pre><code>{
-  "success": false,
-  "error": "Account not connected"
-}</code></pre>
+                                <div class="api-section">
+                                    <h4>cURL Example</h4>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>Shell</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>curl -X POST https://YOUR_DOMAIN/api/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "YOUR_API_KEY",
+    "to": "919876543210",
+    "message": "Hello from WAMulti!"
+  }'</code></pre>
+                                    </div>
+                                </div>
 
-                            <hr style="margin: 30px 0; border-color: var(--border);">
-
-                            <h2 style="color: var(--primary); margin-bottom: 20px;">🔗 n8n HTTP Request Node Configurations</h2>
-                            
-                            <h3>📥 Step 1: Receive Messages (Webhook Trigger)</h3>
-                            <p class="info-text">Create a Webhook node in n8n as trigger, then add the URL to your account's webhooks in this dashboard.</p>
-                            <pre><code># n8n Webhook Node Setup:
-Method: POST
-Path: /whatsapp-messages
-Copy the Production URL to this dashboard's Webhooks section
-
-# Incoming Webhook Payload:
-{
-  "event": "message",
-  "timestamp": "2026-02-03T12:00:00.000Z",
-  "account_id": "uuid-here",
-  "data": {
-    "messageId": "ABC123",
-    "from": "918005780278",        ← May be LID if sender not in contacts
-    "fromJid": "918005780278@s.whatsapp.net",  ← USE THIS FOR REPLIES!
-    "isLidSender": false,         ← true if 'from' is LID (not real phone)
-    "message": "Hello!",           ← MESSAGE TEXT
-    "messageType": "text",
-    "isGroup": false,
-    "pushName": "John Doe"         ← SENDER'S NAME
-  }
-}
-
-# Access in n8n:
-Reply To:     {{ $json.data.fromJid }}  ← USE THIS IN 'to' FIELD
-Message Text: {{ $json.data.message }}
-Sender Name:  {{ $json.data.pushName }}</code></pre>
-
-                            <h3>📤 Step 2: Send Text Reply (HTTP Request Node)</h3>
-                            <p class="info-text">Use <code>fromJid</code> from webhook in the <code>to</code> field</p>
-                            <pre><code># n8n HTTP Request Node Configuration:
-
-Method: POST
-URL: https://YOUR_DOMAIN/api/send
-Authentication: None
-Body Content Type: JSON
-
-JSON Body (copy this exactly):
-{
+                                <div class="api-section">
+                                    <h4>Reply Using Webhook Data</h4>
+                                    <p class="section-desc">When you receive a webhook, use <code>fromJid</code> in the <code>to</code> field to reply:</p>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>JSON - n8n HTTP Request</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>{
   "api_key": "YOUR_API_KEY",
   "to": "{{ $json.data.fromJid }}",
   "message": "Thanks {{ $json.data.pushName }}! You said: {{ $json.data.message }}"
+}</code></pre>
+                                    </div>
+                                </div>
+
+                                <!-- n8n Integration Guide -->
+                                <div class="integration-card">
+                                    <div class="integration-header">
+                                        <div class="integration-icon">
+                                            <i class="fas fa-diagram-project"></i>
+                                        </div>
+                                        <div>
+                                            <h4>n8n Integration Guide</h4>
+                                            <p>Step-by-step setup for n8n workflows</p>
+                                        </div>
+                                    </div>
+                                    <div class="integration-steps">
+                                        <div class="step">
+                                            <span class="step-num">1</span>
+                                            <div>
+                                                <strong>Create Webhook Trigger</strong>
+                                                <p>Add a Webhook node in n8n. Copy the Production URL and add it in the Webhooks section of this dashboard.</p>
+                                            </div>
+                                        </div>
+                                        <div class="step">
+                                            <span class="step-num">2</span>
+                                            <div>
+                                                <strong>Add HTTP Request Node</strong>
+                                                <p>Method: POST, URL: https://YOUR_DOMAIN/api/send</p>
+                                            </div>
+                                        </div>
+                                        <div class="step">
+                                            <span class="step-num">3</span>
+                                            <div>
+                                                <strong>Set JSON Body</strong>
+                                                <p>Use api_key, to: {{ $json.data.fromJid }}, message: your text</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Webhook Payload Reference -->
+                                <div class="api-section">
+                                    <h4>Incoming Webhook Payload</h4>
+                                    <p class="section-desc">This is the payload your webhook URL will receive when a message comes in:</p>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>Webhook Payload</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>{
+  "event": "message",
+  "timestamp": "2026-02-10T12:00:00.000Z",
+  "account_id": "uuid-here",
+  "data": {
+    "messageId": "ABC123",
+    "from": "918005780278",
+    "fromJid": "918005780278@s.whatsapp.net",
+    "isLidSender": false,
+    "message": "Hello!",
+    "messageType": "text",
+    "isGroup": false,
+    "pushName": "John Doe"
+  }
 }
 
-# Or send to a specific phone number (for campaigns):
-{
-  "api_key": "YOUR_API_KEY",
-  "to": "918005780278",
-  "message": "Hello!"
-}</code></pre>
+// n8n field access:
+// Reply To:     {{ $json.data.fromJid }}
+// Message:      {{ $json.data.message }}
+// Sender Name:  {{ $json.data.pushName }}</code></pre>
+                                    </div>
+                                </div>
 
-                            <h3>🖼️ Step 3: Send Image from URL (HTTP Request Node)</h3>
-                            <pre><code># n8n HTTP Request Node Configuration:
-
-Method: POST
-URL: https://YOUR_DOMAIN/api/send-media-url
-Authentication: None
-Body Content Type: JSON
-
-JSON Body:
-{
+                                <!-- Send Media -->
+                                <div class="api-section">
+                                    <h4>Send Media via URL</h4>
+                                    <div class="endpoint-header compact">
+                                        <span class="method-badge post">POST</span>
+                                        <code class="endpoint-url">/api/send-media-url</code>
+                                    </div>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>JSON</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>{
   "api_key": "YOUR_API_KEY",
   "to": "{{ $json.data.fromJid }}",
   "mediaType": "image",
   "mediaUrl": "https://example.com/image.jpg",
   "caption": "Here's your image!"
-}</code></pre>
+}
 
-                            <h3>📎 Step 4: Send Document from Binary Data (HTTP Request Node)</h3>
-                            <pre><code># n8n HTTP Request Node Configuration:
+// mediaType options: image, video, audio, document</code></pre>
+                                    </div>
+                                </div>
 
-Method: POST
-URL: https://YOUR_DOMAIN/api/send-media-url
-Authentication: None
-Body Content Type: JSON
-
-JSON Body:
-{
+                                <!-- Send Base64 -->
+                                <div class="api-section">
+                                    <h4>Send Media via Base64</h4>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>JSON - For n8n binary data</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>{
   "api_key": "YOUR_API_KEY",
   "to": "{{ $json.data.fromJid }}",
   "mediaType": "document",
@@ -382,46 +646,16 @@ JSON Body:
   "filename": "{{ $binary.data.fileName }}",
   "caption": "Your document"
 }</code></pre>
+                                    </div>
+                                </div>
 
-                            <hr style="margin: 30px 0; border-color: var(--border);">
-
-                            <h2 style="color: var(--primary); margin-bottom: 20px;">📋 Complete n8n Workflow Example</h2>
-                            <pre><code># Auto-Reply Workflow Structure:
-
-[Webhook Trigger] → [IF Node] → [HTTP Request]
-                         ↓
-                   [Set Node for complex replies]
-
-# Step-by-step:
-
-1. Webhook Node (Trigger)
-   - Method: POST
-   - Path: /whatsapp-incoming
-   - Copy Production URL to dashboard webhooks
-
-2. IF Node (Optional - Filter messages)
-   - Condition: {{ $json.event }} = "message"
-   - AND: {{ $json.data.isGroup }} = false
-
-3. HTTP Request Node (Send Reply)
-   - Method: POST
-   - URL: https://YOUR_DOMAIN/api/send
-   - Body: JSON
-   - Content:
-     {
-       "api_key": "YOUR_API_KEY",
-       "to": "{{ $json.data.fromJid }}",
-       "message": "Thanks {{ $json.data.pushName }}!"
-     }
-     
-# The "to" field accepts BOTH:
-# - fromJid from webhook (for replies) 
-# - Phone numbers (for campaigns)</code></pre>
-
-                            <h3>🔐 Webhook Signature Verification (Optional)</h3>
-                            <pre><code># If you set a webhook secret, n8n Code node:
-
-const crypto = require('crypto');
+                                <!-- Webhook Signature -->
+                                <div class="api-section">
+                                    <h4>Webhook Signature Verification</h4>
+                                    <p class="section-desc">If you set a webhook secret, verify signatures in n8n with a Code node:</p>
+                                    <div class="code-block">
+                                        <div class="code-header"><span>JavaScript - n8n Code Node</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
+                                        <pre><code>const crypto = require('crypto');
 const signature = $input.first().headers['x-webhook-signature-256'];
 const payload = JSON.stringify($input.first().json);
 const secret = 'YOUR_WEBHOOK_SECRET';
@@ -434,61 +668,85 @@ const expected = 'sha256=' + crypto
 if (signature !== expected) {
   throw new Error('Invalid signature');
 }
-
 return $input.all();</code></pre>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
+
             </div>
         </main>
     </div>
 
-    <!-- Modals -->
+    <!-- ============ Modals ============ -->
+
+    <!-- QR Modal -->
     <div class="modal" id="qrModal">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>Scan QR Code</h3>
-                <button class="modal-close" id="closeQrModal">&times;</button>
+                <div class="modal-title">
+                    <i class="fas fa-qrcode" style="color: var(--primary)"></i>
+                    <h3>Scan QR Code</h3>
+                </div>
+                <button class="modal-close" id="closeQrModal"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
-                <div id="qrContainer">
-                    <p>Waiting for QR code...</p>
+                <div id="qrContainer" class="qr-container">
+                    <div class="qr-placeholder">
+                        <div class="qr-spinner"></div>
+                        <p>Initializing connection...</p>
+                    </div>
                 </div>
-                <p class="qr-instructions">Open WhatsApp on your phone, go to Settings > Linked Devices > Link a Device</p>
+                <div class="qr-instructions">
+                    <div class="qr-step"><span>1</span> Open WhatsApp on your phone</div>
+                    <div class="qr-step"><span>2</span> Go to Settings → Linked Devices</div>
+                    <div class="qr-step"><span>3</span> Tap "Link a Device" and scan</div>
+                </div>
             </div>
         </div>
     </div>
 
+    <!-- New Account Modal -->
     <div class="modal" id="newAccountModal">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>Create New Account</h3>
-                <button class="modal-close" id="closeNewAccountModal">&times;</button>
+                <div class="modal-title">
+                    <i class="fas fa-user-plus" style="color: var(--primary)"></i>
+                    <h3>Create New Account</h3>
+                </div>
+                <button class="modal-close" id="closeNewAccountModal"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
                 <form id="newAccountForm">
                     <div class="form-group">
                         <label for="accountName">Account Name</label>
-                        <input type="text" id="accountName" required placeholder="My WhatsApp">
+                        <input type="text" id="accountName" required placeholder="e.g. Business Main" class="input-modern">
                     </div>
                     <div class="form-group">
-                        <label for="accountDesc">Description (optional)</label>
-                        <input type="text" id="accountDesc" placeholder="Business account">
+                        <label for="accountDesc">Description <span class="label-hint">(optional)</span></label>
+                        <input type="text" id="accountDesc" placeholder="e.g. Main business account" class="input-modern">
                     </div>
-                    <button type="submit" class="btn btn-primary btn-block">Create Account</button>
+                    <button type="submit" class="btn btn-primary btn-block">
+                        <i class="fas fa-plus"></i> Create Account
+                    </button>
                 </form>
             </div>
         </div>
     </div>
 
+    <!-- AI Config Modal -->
     <div class="modal" id="aiConfigModal">
         <div class="modal-content modal-large">
             <div class="modal-header">
-                <h3>AI Chatbot Configuration</h3>
-                <button class="modal-close" id="closeAiConfigModal">&times;</button>
+                <div class="modal-title">
+                    <i class="fas fa-robot" style="color: var(--primary)"></i>
+                    <h3>AI Chatbot Configuration</h3>
+                </div>
+                <button class="modal-close" id="closeAiConfigModal"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
-                <!-- Chatbot Toggle at Top -->
                 <div class="chatbot-toggle-container">
                     <div class="toggle-info">
                         <i class="fas fa-robot"></i>
@@ -505,7 +763,7 @@ return $input.all();</code></pre>
                     <input type="hidden" id="aiAccountId">
                     <div class="form-group">
                         <label for="aiProvider">AI Provider</label>
-                        <select id="aiProvider" class="select" required>
+                        <select id="aiProvider" class="select-modern" required>
                             <option value="">Select Provider</option>
                             <option value="openai">OpenAI (GPT)</option>
                             <option value="anthropic">Anthropic (Claude)</option>
@@ -516,37 +774,41 @@ return $input.all();</code></pre>
                     </div>
                     <div class="form-group">
                         <label for="aiApiKey">API Key</label>
-                        <input type="password" id="aiApiKey" required placeholder="sk-...">
+                        <input type="password" id="aiApiKey" required placeholder="sk-..." class="input-modern">
                     </div>
                     <div class="form-group">
                         <label for="aiModel">Model</label>
-                        <select id="aiModel" class="select" required>
+                        <select id="aiModel" class="select-modern" required>
                             <option value="">Select Model (choose provider first)</option>
                         </select>
                     </div>
                     <div class="form-group">
                         <label for="aiSystemPrompt">System Prompt</label>
-                        <textarea id="aiSystemPrompt" rows="4" placeholder="You are a helpful customer support assistant. Be friendly and concise."></textarea>
+                        <textarea id="aiSystemPrompt" rows="4" placeholder="You are a helpful customer support assistant..." class="input-modern"></textarea>
                     </div>
                     <div class="form-row">
                         <div class="form-group half">
                             <label for="aiTemperature">Temperature</label>
-                            <input type="number" id="aiTemperature" min="0" max="2" step="0.1" value="0.7">
+                            <input type="number" id="aiTemperature" min="0" max="2" step="0.1" value="0.7" class="input-modern">
                         </div>
                         <div class="form-group half">
                             <label for="aiMemoryLimit">Memory (messages)</label>
-                            <input type="number" id="aiMemoryLimit" min="1" max="50" value="10" title="How many previous messages to remember">
+                            <input type="number" id="aiMemoryLimit" min="1" max="50" value="10" class="input-modern">
                         </div>
                     </div>
                     <div class="form-group">
                         <label class="checkbox-label">
                             <input type="checkbox" id="aiMemoryEnabled" checked>
-                            <span>Enable Conversation Memory (remember previous messages)</span>
+                            <span>Enable Conversation Memory</span>
                         </label>
                     </div>
                     <div class="form-actions">
-                        <button type="button" class="btn btn-danger" id="deleteAiConfig">Delete Config</button>
-                        <button type="submit" class="btn btn-primary">Save Configuration</button>
+                        <button type="button" class="btn btn-danger" id="deleteAiConfig">
+                            <i class="fas fa-trash"></i> Delete Config
+                        </button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save"></i> Save Configuration
+                        </button>
                     </div>
                 </form>
             </div>

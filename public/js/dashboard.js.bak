@@ -1,5 +1,5 @@
 /**
- * WAMulti Dashboard — Premium UI
+ * WhatsApp Multi-Automation Dashboard
  * Client-side JavaScript
  */
 
@@ -10,9 +10,9 @@
 let accounts = [];
 let currentAccountId = null;
 let socket = null;
-let activePollingAccountId = null;
-let qrGeneratedAt = null;
-let qrTimerInterval = null;
+let activePollingAccountId = null;  // Track which account is being polled
+let qrGeneratedAt = null;           // Track QR generation time
+let qrTimerInterval = null;         // QR countdown timer
 
 // ============================================================================
 // Initialization
@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAccounts();
     loadHealth();
 
+    // Refresh data periodically
     setInterval(loadAccounts, 30000);
     setInterval(loadHealth, 60000);
 });
@@ -40,6 +41,8 @@ function initializeSocket() {
     socket.on('connect', () => {
         console.log('Socket connected');
         updateSystemStatus(true);
+        
+        // Re-subscribe to current account if we have one
         if (currentAccountId) {
             socket.emit('subscribe-account', currentAccountId);
         }
@@ -53,10 +56,13 @@ function initializeSocket() {
     socket.on('account-status', (data) => {
         console.log('Account status update:', data);
         updateAccountStatus(data.accountId, data.status, data.phoneNumber);
+        
+        // If this is the account we're watching and it's ready, show success
         if (data.accountId === activePollingAccountId && data.status === 'ready') {
             showQrSuccess();
         }
-        loadAccounts();
+        
+        loadAccounts(); // Refresh full list
     });
 
     socket.on('qr-update', (data) => {
@@ -66,16 +72,21 @@ function initializeSocket() {
         }
     });
 
-    socket.on('account-deleted', () => {
+    socket.on('account-deleted', (data) => {
         loadAccounts();
     });
 }
 
 function updateSystemStatus(online) {
     const indicator = document.querySelector('.sidebar-footer .status-indicator');
-    const text = document.querySelector('.system-status span');
-    if (indicator) indicator.classList.toggle('online', online);
-    if (text) text.textContent = online ? 'System Online' : 'Reconnecting...';
+    const text = document.querySelector('.sidebar-footer span');
+    
+    if (indicator) {
+        indicator.classList.toggle('online', online);
+    }
+    if (text) {
+        text.textContent = online ? 'System Online' : 'Reconnecting...';
+    }
 }
 
 // ============================================================================
@@ -83,42 +94,62 @@ function updateSystemStatus(online) {
 // ============================================================================
 
 function initializeNavigation() {
-    document.querySelectorAll('.nav-link').forEach(link => {
+    const navLinks = document.querySelectorAll('.nav-link');
+    
+    navLinks.forEach(link => {
         link.addEventListener('click', (e) => {
             e.preventDefault();
-            switchView(link.dataset.view);
+            const view = link.dataset.view;
+            switchView(view);
         });
     });
 
-    document.getElementById('menuToggle')?.addEventListener('click', () => {
-        document.getElementById('sidebar').classList.toggle('open');
+    // Mobile menu toggle
+    const menuToggle = document.getElementById('menuToggle');
+    const sidebar = document.getElementById('sidebar');
+    
+    menuToggle?.addEventListener('click', () => {
+        sidebar.classList.toggle('open');
     });
 }
 
-const viewMeta = {
-    'dashboard':  { title: 'Dashboard',         subtitle: 'Overview of your WhatsApp automation' },
-    'accounts':   { title: 'Accounts',           subtitle: 'Manage your WhatsApp accounts' },
-    'webhooks':   { title: 'Webhooks',           subtitle: 'Configure webhook integrations' },
-    'system':     { title: 'System Monitor',     subtitle: 'Server health and configuration' },
-    'api-docs':   { title: 'API Documentation',  subtitle: 'Integration guides and endpoints' }
-};
-
 function switchView(viewName) {
+    // Update nav links
     document.querySelectorAll('.nav-link').forEach(link => {
         link.classList.toggle('active', link.dataset.view === viewName);
     });
 
-    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    // Update views
+    document.querySelectorAll('.view').forEach(view => {
+        view.classList.remove('active');
+    });
+    
+    // Handle special case for api-docs -> apiDocsView
     const viewId = viewName === 'api-docs' ? 'apiDocsView' : `${viewName}View`;
-    document.getElementById(viewId)?.classList.add('active');
+    const view = document.getElementById(viewId);
+    if (view) {
+        view.classList.add('active');
+    }
 
-    const meta = viewMeta[viewName] || {};
-    document.getElementById('pageTitle').textContent = meta.title || viewName;
-    document.getElementById('pageSubtitle').textContent = meta.subtitle || '';
+    // Update title
+    const titles = {
+        'dashboard': 'Dashboard',
+        'accounts': 'Accounts',
+        'webhooks': 'Webhooks',
+        'system': 'System',
+        'api-docs': 'API Documentation'
+    };
+    
+    document.getElementById('pageTitle').textContent = titles[viewName] || viewName;
 
-    if (viewName === 'system') { loadHealth(); renderActiveConnections(); }
-    else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); }
+    // Load view-specific data
+    if (viewName === 'system') {
+        loadHealth();
+    } else if (viewName === 'webhooks') {
+        populateWebhookAccountSelect();
+    }
 
+    // Close mobile menu
     document.getElementById('sidebar')?.classList.remove('open');
 }
 
@@ -127,13 +158,27 @@ function switchView(viewName) {
 // ============================================================================
 
 function initializeModals() {
-    document.getElementById('closeQrModal')?.addEventListener('click', () => closeModal('qrModal'));
-    document.getElementById('closeNewAccountModal')?.addEventListener('click', () => closeModal('newAccountModal'));
-    document.getElementById('closeAiConfigModal')?.addEventListener('click', () => closeModal('aiConfigModal'));
+    // QR Modal
+    document.getElementById('closeQrModal')?.addEventListener('click', () => {
+        closeModal('qrModal');
+    });
 
+    // New Account Modal
+    document.getElementById('closeNewAccountModal')?.addEventListener('click', () => {
+        closeModal('newAccountModal');
+    });
+
+    // AI Config Modal
+    document.getElementById('closeAiConfigModal')?.addEventListener('click', () => {
+        closeModal('aiConfigModal');
+    });
+
+    // Close on backdrop click
     document.querySelectorAll('.modal').forEach(modal => {
         modal.addEventListener('click', (e) => {
-            if (e.target === modal) modal.classList.remove('show');
+            if (e.target === modal) {
+                modal.classList.remove('show');
+            }
         });
     });
 }
@@ -144,15 +189,26 @@ function openModal(modalId) {
 
 function closeModal(modalId) {
     const modal = document.getElementById(modalId);
-    if (modal) modal.classList.remove('show');
-
+    if (modal) {
+        modal.classList.remove('show');
+    }
+    
+    // Cleanup when closing QR modal
     if (modalId === 'qrModal') {
+        // Stop polling for this account
         activePollingAccountId = null;
-        if (qrTimerInterval) { clearInterval(qrTimerInterval); qrTimerInterval = null; }
+        
+        // Clear QR timer
+        if (qrTimerInterval) {
+            clearInterval(qrTimerInterval);
+            qrTimerInterval = null;
+        }
         qrGeneratedAt = null;
+        
+        // Reset QR container
         const qrContainer = document.getElementById('qrContainer');
         if (qrContainer) {
-            qrContainer.innerHTML = '<div class="qr-placeholder"><div class="qr-spinner"></div><p>Initializing connection...</p></div>';
+            qrContainer.innerHTML = '<p>Waiting for QR code...</p>';
         }
     }
 }
@@ -162,16 +218,32 @@ function closeModal(modalId) {
 // ============================================================================
 
 function initializeEventListeners() {
+    // New Account buttons
     document.getElementById('newAccountBtn')?.addEventListener('click', () => openModal('newAccountModal'));
     document.getElementById('newAccountBtn2')?.addEventListener('click', () => openModal('newAccountModal'));
+
+    // Logout
     document.getElementById('logoutBtn')?.addEventListener('click', logout);
+
+    // New Account Form
     document.getElementById('newAccountForm')?.addEventListener('submit', createAccount);
+
+    // AI Config Form
     document.getElementById('aiConfigForm')?.addEventListener('submit', saveAiConfig);
     document.getElementById('deleteAiConfig')?.addEventListener('click', deleteAiConfig);
-    document.getElementById('aiProvider')?.addEventListener('change', (e) => updateModelDropdown(e.target.value));
-    document.getElementById('aiActive')?.addEventListener('change', (e) => updateToggleStatus(e.target));
+    
+    // AI Provider change - update model dropdown
+    document.getElementById('aiProvider')?.addEventListener('change', (e) => {
+        updateModelDropdown(e.target.value);
+    });
+    
+    // AI Active toggle - update status text
+    document.getElementById('aiActive')?.addEventListener('change', (e) => {
+        updateToggleStatus(e.target);
+    });
+
+    // Webhook Account Select
     document.getElementById('webhookAccountSelect')?.addEventListener('change', loadWebhooksForAccount);
-    document.getElementById('addWebhookForm')?.addEventListener('submit', submitWebhookForm);
 }
 
 // ============================================================================
@@ -181,11 +253,19 @@ function initializeEventListeners() {
 async function apiCall(url, options = {}) {
     try {
         const response = await fetch(url, {
-            headers: { 'Content-Type': 'application/json', ...options.headers },
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            },
             ...options
         });
+
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Request failed');
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Request failed');
+        }
+
         return data;
     } catch (error) {
         showToast(error.message, 'error');
@@ -208,56 +288,33 @@ async function loadAccounts() {
 async function loadHealth() {
     try {
         const data = await apiCall('/api/health');
-
+        
+        // Update stats
         if (data.metrics) {
-            document.getElementById('messagesSent').textContent = formatNumber(data.metrics.messagesSent || 0);
-            document.getElementById('messagesReceived').textContent = formatNumber(data.metrics.messagesReceived || 0);
+            document.getElementById('messagesSent').textContent = data.metrics.messagesSent || 0;
+            document.getElementById('messagesReceived').textContent = data.metrics.messagesReceived || 0;
         }
 
+        // Update system view
         if (data.uptime) {
             document.getElementById('sysUptime').textContent = formatUptime(data.uptime);
         }
-
         if (data.memory) {
             const usedMB = Math.round(data.memory.heapUsed / 1024 / 1024);
-            const totalMB = Math.round(data.memory.heapTotal / 1024 / 1024);
             document.getElementById('sysMemory').textContent = `${usedMB} MB`;
         }
-
         if (data.cache) {
             const hitRate = (data.cache.hitRate * 100).toFixed(1);
             document.getElementById('sysCacheHit').textContent = `${hitRate}%`;
-        }
-
-        if (data.nodeVersion) {
-            document.getElementById('sysNodeVersion').textContent = data.nodeVersion;
-        }
-
-        // Update webhook queue stats if available
-        if (data.webhookQueue) {
-            document.getElementById('queueSize').textContent = `${data.webhookQueue.queueSize || 0} / 1000`;
-            document.getElementById('queueProcessing').textContent = data.webhookQueue.isProcessing ? 'Active' : 'Idle';
-            document.getElementById('queueDelivered').textContent = data.webhookQueue.delivered || 0;
-            document.getElementById('queueFailedCount').textContent = data.webhookQueue.failed || 0;
         }
     } catch (error) {
         console.error('Failed to load health:', error);
     }
 }
 
-async function loadWebhookStats() {
-    try {
-        const data = await apiCall('/api/health');
-        if (data.webhookQueue) {
-            document.getElementById('webhookQueueSize').textContent = data.webhookQueue.queueSize || 0;
-        }
-    } catch (error) {
-        console.error('Failed to load webhook stats:', error);
-    }
-}
-
 async function createAccount(e) {
     e.preventDefault();
+    
     const name = document.getElementById('accountName').value;
     const description = document.getElementById('accountDesc').value;
 
@@ -269,13 +326,19 @@ async function createAccount(e) {
 
         closeModal('newAccountModal');
         document.getElementById('newAccountForm').reset();
+        
         showToast('Account created successfully', 'success');
         loadAccounts();
 
+        // CRITICAL: Subscribe to socket BEFORE opening modal
+        // Backend now starts connection async, so we have time to subscribe
         currentAccountId = data.account.id;
         activePollingAccountId = data.account.id;
         socket.emit('subscribe-account', currentAccountId);
+        
+        // Small delay to ensure subscription is processed
         await new Promise(resolve => setTimeout(resolve, 100));
+        
         openModal('qrModal');
         pollQrCode(currentAccountId);
     } catch (error) {
@@ -284,7 +347,10 @@ async function createAccount(e) {
 }
 
 async function deleteAccount(accountId) {
-    if (!confirm('Are you sure you want to delete this account? This cannot be undone.')) return;
+    if (!confirm('Are you sure you want to delete this account? This cannot be undone.')) {
+        return;
+    }
+
     try {
         await apiCall(`/api/accounts/${accountId}`, { method: 'DELETE' });
         showToast('Account deleted', 'success');
@@ -296,12 +362,17 @@ async function deleteAccount(accountId) {
 
 async function reconnectAccount(accountId) {
     try {
+        // Subscribe FIRST before initiating reconnect
         currentAccountId = accountId;
         activePollingAccountId = accountId;
         socket.emit('subscribe-account', accountId);
+        
+        // Small delay to ensure subscription is processed
         await new Promise(resolve => setTimeout(resolve, 100));
+        
         await apiCall(`/api/accounts/${accountId}/reconnect`, { method: 'POST' });
         showToast('Reconnection initiated', 'info');
+        
         openModal('qrModal');
         pollQrCode(accountId);
     } catch (error) {
@@ -310,13 +381,9 @@ async function reconnectAccount(accountId) {
     }
 }
 
-// ============================================================================
-// QR Code Polling
-// ============================================================================
-
 async function pollQrCode(accountId) {
     const qrContainer = document.getElementById('qrContainer');
-    qrContainer.innerHTML = '<div class="qr-placeholder"><div class="qr-spinner"></div><p>Initializing connection...</p></div>';
+    qrContainer.innerHTML = '<p>Initializing connection...</p>';
 
     let attempts = 0;
     const maxAttempts = 90;
@@ -324,111 +391,131 @@ async function pollQrCode(accountId) {
     let qrDisplayed = false;
 
     const poll = async () => {
-        if (activePollingAccountId !== accountId) return;
-
+        // CRITICAL: Check against activePollingAccountId to properly cancel on modal close
+        if (activePollingAccountId !== accountId) {
+            console.log(`Polling cancelled for ${accountId} (activePollingAccountId changed)`);
+            return;
+        }
+        
         try {
+            // First check account status
             const accountData = await apiCall(`/api/accounts/${accountId}`);
             const status = accountData.account?.status || accountData.account?.runtimeStatus;
-
-            if (status === 'ready') { showQrSuccess(); return; }
-
-            if ((status === 'error' || status === 'disconnected') && accountData.account?.error_message) {
-                qrContainer.innerHTML = `
-                    <div class="qr-placeholder">
-                        <i class="fas fa-exclamation-triangle" style="font-size: 32px; color: var(--warning);"></i>
-                        <p style="color: var(--warning);">${accountData.account.error_message}</p>
-                        <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
-                            <i class="fas fa-sync"></i> Try Again
-                        </button>
-                    </div>`;
+            
+            // If connected, stop polling and show success
+            if (status === 'ready') {
+                showQrSuccess();
                 return;
             }
-
+            
+            // If error or disconnected with error message, show it and stop
+            if ((status === 'error' || status === 'disconnected') && accountData.account?.error_message) {
+                qrContainer.innerHTML = `
+                    <p style="color: var(--warning); margin-bottom: 10px;">
+                        <i class="fas fa-exclamation-triangle"></i> ${accountData.account.error_message}
+                    </p>
+                    <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
+                        <i class="fas fa-sync"></i> Try Again
+                    </button>
+                `;
+                return;
+            }
+            
+            // Try to get QR code
             const data = await apiCall(`/api/accounts/${accountId}/qr`);
+            
             if (data.qr) {
+                // Only update display if QR changed (prevents flickering)
                 if (data.qr !== lastQr) {
                     lastQr = data.qr;
                     displayQrCode(data.qr);
                     qrDisplayed = true;
                 }
             } else if (!qrDisplayed && status === 'initializing') {
-                qrContainer.innerHTML = '<div class="qr-placeholder"><div class="qr-spinner"></div><p>Waiting for QR code...<br><small>This may take a few seconds</small></p></div>';
+                // Show waiting message only if QR hasn't been displayed yet
+                qrContainer.innerHTML = '<p>Waiting for QR code... <br><small>This may take a few seconds</small></p>';
             }
 
             attempts++;
             if (attempts < maxAttempts && activePollingAccountId === accountId) {
-                setTimeout(poll, attempts < 10 ? 1500 : 3000);
+                // Poll faster initially (1.5s), then slower (3s)
+                const interval = attempts < 10 ? 1500 : 3000;
+                setTimeout(poll, interval);
             } else if (activePollingAccountId === accountId) {
                 qrContainer.innerHTML = `
-                    <div class="qr-placeholder">
-                        <i class="fas fa-clock" style="font-size: 32px; color: var(--warning);"></i>
-                        <p style="color: var(--warning);">QR code timeout</p>
-                        <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
-                            <i class="fas fa-sync"></i> Try Again
-                        </button>
-                    </div>`;
+                    <p style="color: var(--warning); margin-bottom: 10px;">QR code timeout.</p>
+                    <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
+                        <i class="fas fa-sync"></i> Try Again
+                    </button>
+                `;
             }
         } catch (error) {
             console.error('QR poll error:', error);
+            // Continue polling on network errors, but slower
             if (attempts < maxAttempts && activePollingAccountId === accountId) {
                 setTimeout(poll, 3000);
             }
         }
     };
 
+    // Start polling after a small delay to let connection initialize
     setTimeout(poll, 500);
 }
 
 function showQrSuccess() {
     const qrContainer = document.getElementById('qrContainer');
     if (qrContainer) {
-        qrContainer.innerHTML = `
-            <div class="qr-placeholder">
-                <i class="fas fa-check-circle" style="font-size: 48px; color: var(--success);"></i>
-                <p style="color: var(--success); font-weight: 600;">Connected successfully!</p>
-            </div>`;
+        qrContainer.innerHTML = '<p style="color: var(--success);"><i class="fas fa-check-circle"></i> Connected successfully!</p>';
     }
-    if (qrTimerInterval) { clearInterval(qrTimerInterval); qrTimerInterval = null; }
-    setTimeout(() => { closeModal('qrModal'); loadAccounts(); }, 2000);
+    
+    // Clear timer
+    if (qrTimerInterval) {
+        clearInterval(qrTimerInterval);
+        qrTimerInterval = null;
+    }
+    
+    setTimeout(() => {
+        closeModal('qrModal');
+        loadAccounts();
+    }, 2000);
 }
 
 function displayQrCode(qrDataUrl) {
     const qrContainer = document.getElementById('qrContainer');
     qrGeneratedAt = Date.now();
-
+    
     qrContainer.innerHTML = `
-        <img src="${qrDataUrl}" alt="QR Code">
-        <div class="qr-timer-bar">
-            <div class="qr-timer-fill" id="qrTimerFill"></div>
-        </div>
-        <p class="qr-timer-text" id="qrTimer">Scan within 20 seconds</p>
+        <img src="${qrDataUrl}" alt="QR Code" style="max-width: 280px;">
+        <p class="qr-timer" id="qrTimer" style="margin-top: 10px; font-size: 12px; color: #888;">Scan within 20 seconds</p>
     `;
-
-    if (qrTimerInterval) clearInterval(qrTimerInterval);
-
+    
+    // Clear existing timer
+    if (qrTimerInterval) {
+        clearInterval(qrTimerInterval);
+    }
+    
+    // Update timer countdown
     qrTimerInterval = setInterval(() => {
         if (!qrGeneratedAt || activePollingAccountId === null) {
             clearInterval(qrTimerInterval);
             qrTimerInterval = null;
             return;
         }
+        
         const elapsed = Math.floor((Date.now() - qrGeneratedAt) / 1000);
         const remaining = Math.max(0, 20 - elapsed);
         const timer = document.getElementById('qrTimer');
-        const fill = document.getElementById('qrTimerFill');
-
-        if (fill) fill.style.width = `${(remaining / 20) * 100}%`;
-
+        
         if (timer) {
             if (remaining > 5) {
                 timer.textContent = `Scan within ${remaining} seconds`;
-                timer.style.color = 'var(--text-muted)';
+                timer.style.color = '#888';
             } else if (remaining > 0) {
-                timer.textContent = `Hurry! ${remaining}s left`;
-                timer.style.color = 'var(--warning)';
+                timer.textContent = `Hurry! ${remaining} seconds left`;
+                timer.style.color = '#f39c12';
             } else {
                 timer.textContent = 'Refreshing QR code...';
-                timer.style.color = 'var(--info)';
+                timer.style.color = '#3498db';
             }
         }
     }, 1000);
@@ -447,6 +534,7 @@ async function logout() {
 // AI Config
 // ============================================================================
 
+// Model options per provider
 const MODEL_OPTIONS = {
     openai: [
         { value: 'gpt-4o', label: 'GPT-4o (Latest)' },
@@ -484,7 +572,9 @@ const MODEL_OPTIONS = {
 function updateModelDropdown(provider) {
     const modelSelect = document.getElementById('aiModel');
     const currentValue = modelSelect.value;
+    
     modelSelect.innerHTML = '<option value="">Select Model</option>';
+    
     if (provider && MODEL_OPTIONS[provider]) {
         MODEL_OPTIONS[provider].forEach(model => {
             const option = document.createElement('option');
@@ -497,25 +587,34 @@ function updateModelDropdown(provider) {
 }
 
 function updateToggleStatus(checkbox) {
-    const statusSpan = document.getElementById('toggleStatus');
-    if (statusSpan) statusSpan.textContent = checkbox.checked ? 'Enabled' : 'Disabled';
+    const statusSpan = document.querySelector('.toggle-status');
+    if (statusSpan) {
+        statusSpan.textContent = checkbox.checked ? 'Enabled' : 'Disabled';
+    }
 }
 
 async function openAiConfig(accountId) {
     document.getElementById('aiAccountId').value = accountId;
+    
     try {
         const data = await apiCall(`/api/accounts/${accountId}/ai-config`);
+        
         if (data.config) {
             const provider = data.config.provider || '';
             document.getElementById('aiProvider').value = provider;
             updateModelDropdown(provider);
+            
             document.getElementById('aiApiKey').value = data.config.api_key || '';
             document.getElementById('aiModel').value = data.config.model || '';
             document.getElementById('aiSystemPrompt').value = data.config.system_prompt || '';
             document.getElementById('aiTemperature').value = data.config.temperature || 0.7;
+            
+            // Chatbot toggle
             const isActive = data.config.is_active !== false;
             document.getElementById('aiActive').checked = isActive;
             updateToggleStatus({ checked: isActive });
+            
+            // Memory settings
             document.getElementById('aiMemoryEnabled').checked = data.config.memory_enabled !== false;
             document.getElementById('aiMemoryLimit').value = data.config.memory_limit || 10;
         } else {
@@ -527,6 +626,7 @@ async function openAiConfig(accountId) {
             document.getElementById('aiMemoryLimit').value = 10;
             updateModelDropdown('');
         }
+
         openModal('aiConfigModal');
     } catch (error) {
         console.error('Failed to load AI config:', error);
@@ -535,6 +635,7 @@ async function openAiConfig(accountId) {
 
 async function saveAiConfig(e) {
     e.preventDefault();
+
     const accountId = document.getElementById('aiAccountId').value;
     const config = {
         provider: document.getElementById('aiProvider').value,
@@ -552,9 +653,10 @@ async function saveAiConfig(e) {
             method: 'POST',
             body: JSON.stringify(config)
         });
+
         closeModal('aiConfigModal');
         showToast('AI configuration saved', 'success');
-        loadAccounts();
+        loadAccounts(); // Refresh to show updated chatbot status
     } catch (error) {
         console.error('Failed to save AI config:', error);
     }
@@ -562,7 +664,9 @@ async function saveAiConfig(e) {
 
 async function deleteAiConfig() {
     const accountId = document.getElementById('aiAccountId').value;
+    
     if (!confirm('Delete AI configuration?')) return;
+
     try {
         await apiCall(`/api/accounts/${accountId}/ai-config`, { method: 'DELETE' });
         closeModal('aiConfigModal');
@@ -579,13 +683,12 @@ async function deleteAiConfig() {
 function populateWebhookAccountSelect() {
     const select = document.getElementById('webhookAccountSelect');
     if (!select) return;
-    const currentValue = select.value;
+
     select.innerHTML = '<option value="">Select Account</option>';
     accounts.forEach(account => {
         const option = document.createElement('option');
         option.value = account.id;
         option.textContent = `${account.name} (${account.phone_number || 'Not connected'})`;
-        if (account.id === currentValue) option.selected = true;
         select.appendChild(option);
     });
 }
@@ -595,8 +698,7 @@ async function loadWebhooksForAccount() {
     const container = document.getElementById('webhooksList');
 
     if (!accountId) {
-        container.innerHTML = '<div class="empty-state-card"><i class="fas fa-link"></i><p>Select an account to manage its webhooks</p></div>';
-        document.getElementById('addWebhookCard').style.display = 'none';
+        container.innerHTML = '';
         return;
     }
 
@@ -611,20 +713,13 @@ async function loadWebhooksForAccount() {
 function renderWebhooks(webhooks, accountId) {
     const container = document.getElementById('webhooksList');
 
-    // Update stats
-    document.getElementById('webhookTotal').textContent = webhooks.length;
-    document.getElementById('webhookActive').textContent = webhooks.filter(w => w.is_active).length;
-    document.getElementById('webhookFailed').textContent = webhooks.filter(w => !w.is_active).length;
-
     if (webhooks.length === 0) {
         container.innerHTML = `
-            <div class="empty-state-card">
-                <i class="fas fa-link"></i>
-                <p>No webhooks configured for this account</p>
-                <button class="btn btn-primary" style="margin-top: 12px;" onclick="showAddWebhookForm('${accountId}')">
-                    <i class="fas fa-plus"></i> Add Webhook
-                </button>
-            </div>`;
+            <p class="info-text">No webhooks configured.</p>
+            <button class="btn btn-primary" onclick="addWebhook('${accountId}')">
+                <i class="fas fa-plus"></i> Add Webhook
+            </button>
+        `;
         return;
     }
 
@@ -641,88 +736,61 @@ function renderWebhooks(webhooks, accountId) {
     `;
 
     webhooks.forEach(webhook => {
-        const urlShort = webhook.url.length > 50 ? webhook.url.substring(0, 50) + '...' : webhook.url;
         html += `
             <tr>
-                <td>
-                    <code style="font-family: var(--font-mono, monospace); font-size: 12px; color: var(--text-secondary);" title="${escapeHtml(webhook.url)}">
-                        ${escapeHtml(urlShort)}
-                    </code>
-                </td>
+                <td>${webhook.url}</td>
                 <td>
                     <span class="status-badge ${webhook.is_active ? 'ready' : 'disconnected'}">
                         ${webhook.is_active ? 'Active' : 'Inactive'}
                     </span>
                 </td>
                 <td class="action-buttons">
-                    <button class="btn btn-sm btn-info" onclick="testWebhook('${webhook.id}')" title="Test">
-                        <i class="fas fa-bolt"></i>
-                    </button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteWebhook('${webhook.id}')" title="Delete">
-                        <i class="fas fa-trash"></i>
-                    </button>
+                    <button class="btn btn-sm btn-secondary" onclick="testWebhook('${webhook.id}')">Test</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteWebhook('${webhook.id}')">Delete</button>
                 </td>
-            </tr>`;
+            </tr>
+        `;
     });
 
-    html += `</tbody></table>
-        <div style="margin-top: 16px;">
-            <button class="btn btn-primary" onclick="showAddWebhookForm('${accountId}')">
-                <i class="fas fa-plus"></i> Add Webhook
-            </button>
-        </div>`;
+    html += `
+            </tbody>
+        </table>
+        <button class="btn btn-primary" style="margin-top: 16px;" onclick="addWebhook('${accountId}')">
+            <i class="fas fa-plus"></i> Add Webhook
+        </button>
+    `;
 
     container.innerHTML = html;
 }
 
-function showAddWebhookForm(accountId) {
-    document.getElementById('webhookFormAccountId').value = accountId;
-    document.getElementById('addWebhookCard').style.display = 'block';
-    document.getElementById('webhookUrl').focus();
-}
+async function addWebhook(accountId) {
+    const url = prompt('Enter webhook URL:');
+    if (!url) return;
 
-function generateSecret() {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = 'whsec_';
-    for (let i = 0; i < 32; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
-    document.getElementById('webhookSecret').value = result;
-}
-
-async function submitWebhookForm(e) {
-    e.preventDefault();
-    const accountId = document.getElementById('webhookFormAccountId').value;
-    const url = document.getElementById('webhookUrl').value;
-    const secret = document.getElementById('webhookSecret').value;
-    const events = Array.from(document.querySelectorAll('input[name="webhookEvents"]:checked')).map(cb => cb.value);
-
-    if (!url || events.length === 0) {
-        showToast('Please fill URL and select at least one event', 'error');
-        return;
-    }
+    const secret = prompt('Enter webhook secret (optional):');
 
     try {
         await apiCall(`/api/accounts/${accountId}/webhooks`, {
             method: 'POST',
-            body: JSON.stringify({ url, secret, events })
+            body: JSON.stringify({ url, secret, events: ['message'] })
         });
+
         showToast('Webhook added', 'success');
-        document.getElementById('addWebhookForm').reset();
-        document.getElementById('addWebhookCard').style.display = 'none';
         loadWebhooksForAccount();
     } catch (error) {
         console.error('Failed to add webhook:', error);
     }
 }
 
-async function addWebhook(accountId) {
-    showAddWebhookForm(accountId);
-}
-
 async function testWebhook(webhookId) {
     try {
         const data = await apiCall(`/api/webhooks/${webhookId}/test`, { method: 'POST' });
-        if (data.success) showToast('Webhook test successful', 'success');
-        else showToast(`Webhook test failed: ${data.error}`, 'error');
+        
+        if (data.success) {
+            showToast('Webhook test successful', 'success');
+        } else {
+            showToast(`Webhook test failed: ${data.error}`, 'error');
+        }
     } catch (error) {
         console.error('Failed to test webhook:', error);
     }
@@ -730,6 +798,7 @@ async function testWebhook(webhookId) {
 
 async function deleteWebhook(webhookId) {
     if (!confirm('Delete this webhook?')) return;
+
     try {
         await apiCall(`/api/webhooks/${webhookId}`, { method: 'DELETE' });
         showToast('Webhook deleted', 'success');
@@ -748,31 +817,18 @@ function renderAccountsTable() {
     const tbodyFull = document.getElementById('accountsTableFull');
 
     if (accounts.length === 0) {
-        const emptyRow = `<tr><td colspan="6" class="empty-state">
-            <div class="empty-icon"><i class="fas fa-users"></i></div>
-            <p>No accounts yet. Create one to get started!</p>
-        </td></tr>`;
+        const emptyRow = '<tr><td colspan="6" class="loading">No accounts yet. Create one to get started!</td></tr>';
         if (tbody) tbody.innerHTML = emptyRow;
         if (tbodyFull) tbodyFull.innerHTML = emptyRow;
-        document.getElementById('accountCountBadge').textContent = '0 accounts';
         return;
     }
 
-    document.getElementById('accountCountBadge').textContent = `${accounts.length} account${accounts.length !== 1 ? 's' : ''}`;
-
-    // Dashboard table
+    // Dashboard table (simplified)
     if (tbody) {
         tbody.innerHTML = accounts.map(account => `
             <tr>
-                <td>
-                    <div style="display: flex; align-items: center; gap: 10px;">
-                        <div style="width: 36px; height: 36px; background: var(--primary-glow); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--primary); font-size: 14px;">
-                            <i class="fas fa-user"></i>
-                        </div>
-                        <strong>${escapeHtml(account.name)}</strong>
-                    </div>
-                </td>
-                <td><span style="font-family: var(--font-mono, monospace); font-size: 13px; color: var(--text-secondary);">${account.phone_number || '-'}</span></td>
+                <td><strong>${escapeHtml(account.name)}</strong></td>
+                <td>${account.phone_number || '-'}</td>
                 <td>${renderStatusBadge(account.runtimeStatus || account.status)}</td>
                 <td class="action-buttons">
                     ${renderAccountActions(account)}
@@ -785,18 +841,11 @@ function renderAccountsTable() {
     if (tbodyFull) {
         tbodyFull.innerHTML = accounts.map(account => `
             <tr>
-                <td>
-                    <div style="display: flex; align-items: center; gap: 10px;">
-                        <div style="width: 32px; height: 32px; background: var(--primary-glow); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--primary); font-size: 12px;">
-                            <i class="fas fa-user"></i>
-                        </div>
-                        <strong>${escapeHtml(account.name)}</strong>
-                    </div>
-                </td>
-                <td><span style="font-family: var(--font-mono, monospace); font-size: 13px; color: var(--text-secondary);">${account.phone_number || '-'}</span></td>
+                <td><strong>${escapeHtml(account.name)}</strong></td>
+                <td>${account.phone_number || '-'}</td>
                 <td>${renderStatusBadge(account.runtimeStatus || account.status)}</td>
                 <td>${renderApiKey(account.api_key)}</td>
-                <td><span style="font-size: 13px; color: var(--text-secondary);">${formatDate(account.created_at)}</span></td>
+                <td>${formatDate(account.created_at)}</td>
                 <td class="action-buttons">
                     ${renderAccountActions(account, true)}
                 </td>
@@ -806,7 +855,7 @@ function renderAccountsTable() {
 }
 
 function renderApiKey(apiKey) {
-    if (!apiKey) return '<span style="color: var(--text-muted);">-</span>';
+    if (!apiKey) return '-';
     return `
         <div class="api-key-container">
             <span class="api-key-full" onclick="toggleApiKeyExpand(this)" title="Click to expand">${escapeHtml(apiKey)}</span>
@@ -824,11 +873,24 @@ function toggleApiKeyExpand(element) {
 function copyApiKey(apiKey) {
     navigator.clipboard.writeText(apiKey).then(() => {
         showToast('API key copied to clipboard', 'success');
-    }).catch(() => showToast('Failed to copy', 'error'));
+    }).catch(() => {
+        showToast('Failed to copy', 'error');
+    });
+}
+
+function renderChatbotStatus(account) {
+    // Check if account has AI config and if it's active
+    const isActive = account.ai_active;
+    if (isActive === true) {
+        return '<span class="chatbot-badge enabled"><i class="fas fa-circle"></i> On</span>';
+    } else if (isActive === false) {
+        return '<span class="chatbot-badge disabled"><i class="fas fa-circle"></i> Off</span>';
+    }
+    return '<span class="chatbot-badge disabled"><i class="fas fa-minus"></i> N/A</span>';
 }
 
 function renderStatusBadge(status) {
-    const labels = {
+    const statusLabels = {
         'ready': 'Connected',
         'disconnected': 'Disconnected',
         'qr_ready': 'Scan QR',
@@ -836,7 +898,8 @@ function renderStatusBadge(status) {
         'error': 'Error',
         'auth_failed': 'Auth Failed'
     };
-    return `<span class="status-badge ${status}">${labels[status] || status}</span>`;
+
+    return `<span class="status-badge ${status}">${statusLabels[status] || status}</span>`;
 }
 
 function renderAccountActions(account, showAll = false) {
@@ -844,20 +907,16 @@ function renderAccountActions(account, showAll = false) {
     let actions = '';
 
     if (status === 'qr_ready' || status === 'disconnected' || status === 'initializing') {
-        actions += `<button class="btn btn-sm btn-primary" onclick="reconnectAccount('${account.id}')" title="Connect">
+        actions += `<button class="btn btn-sm btn-primary" onclick="reconnectAccount('${account.id}')">
             <i class="fas fa-qrcode"></i>
         </button>`;
     }
 
     if (status === 'ready') {
-        actions += `<button class="btn btn-sm btn-info" onclick="reconnectAccount('${account.id}')" title="Reconnect">
-            <i class="fas fa-sync"></i>
+        actions += `<button class="btn btn-sm btn-secondary" onclick="openAiConfig('${account.id}')" title="AI Config">
+            <i class="fas fa-robot"></i>
         </button>`;
     }
-
-    actions += `<button class="btn btn-sm btn-purple" onclick="openAiConfig('${account.id}')" title="AI Config">
-        <i class="fas fa-robot"></i>
-    </button>`;
 
     if (showAll) {
         actions += `<button class="btn btn-sm btn-danger" onclick="deleteAccount('${account.id}')" title="Delete">
@@ -868,52 +927,12 @@ function renderAccountActions(account, showAll = false) {
     return actions;
 }
 
-function renderActiveConnections() {
-    const container = document.getElementById('activeConnectionsList');
-    if (!container) return;
-
-    if (accounts.length === 0) {
-        container.innerHTML = '<div class="empty-state-card compact"><i class="fas fa-plug"></i><p>No accounts configured</p></div>';
-        return;
-    }
-
-    container.innerHTML = accounts.map(account => {
-        const status = account.runtimeStatus || account.status;
-        const dotColor = status === 'ready' ? 'green' : (status === 'initializing' ? 'yellow' : 'red');
-        const statusLabel = status === 'ready' ? 'Connected' : (status === 'initializing' ? 'Reconnecting' : 'Disconnected');
-
-        return `
-            <div class="connection-item">
-                <div class="connection-left">
-                    <div class="connection-dot ${dotColor}"></div>
-                    <div>
-                        <div class="connection-name">${escapeHtml(account.name)}</div>
-                        <div class="connection-status">${statusLabel}</div>
-                    </div>
-                </div>
-                <div class="connection-meta">
-                    ${account.phone_number || '-'}
-                </div>
-            </div>
-        `;
-    }).join('');
-}
-
-function filterAccounts(query) {
-    const tbodyFull = document.getElementById('accountsTableFull');
-    if (!tbodyFull) return;
-
-    const q = query.toLowerCase();
-    const rows = tbodyFull.querySelectorAll('tr');
-    rows.forEach(row => {
-        const text = row.textContent.toLowerCase();
-        row.style.display = text.includes(q) ? '' : 'none';
-    });
-}
-
 function updateStats() {
     document.getElementById('totalAccounts').textContent = accounts.length;
-    const active = accounts.filter(a => (a.runtimeStatus || a.status) === 'ready').length;
+    
+    const active = accounts.filter(a => 
+        (a.runtimeStatus || a.status) === 'ready'
+    ).length;
     document.getElementById('activeAccounts').textContent = active;
 }
 
@@ -924,44 +943,7 @@ function updateAccountStatus(accountId, status, phoneNumber) {
         if (phoneNumber) account.phone_number = phoneNumber;
         renderAccountsTable();
         updateStats();
-        renderActiveConnections();
     }
-}
-
-// ============================================================================
-// API Docs Helpers
-// ============================================================================
-
-function toggleApiGroup(btn) {
-    const items = btn.nextElementSibling;
-    const isActive = btn.classList.contains('active');
-    btn.classList.toggle('active', !isActive);
-    items.classList.toggle('show', !isActive);
-}
-
-function showEndpoint(endpoint) {
-    // Remove active class from all items
-    document.querySelectorAll('.api-nav-item').forEach(item => item.classList.remove('active'));
-    // Add active to clicked item
-    event.target.closest('.api-nav-item')?.classList.add('active');
-    // For now, scroll to content (all endpoints shown in single view)
-}
-
-function copyCode(btn) {
-    const code = btn.closest('.code-block').querySelector('code').textContent;
-    navigator.clipboard.writeText(code).then(() => {
-        const original = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
-        btn.style.background = 'var(--primary)';
-        btn.style.color = 'white';
-        btn.style.borderColor = 'var(--primary)';
-        setTimeout(() => {
-            btn.innerHTML = original;
-            btn.style.background = '';
-            btn.style.color = '';
-            btn.style.borderColor = '';
-        }, 2000);
-    }).catch(() => showToast('Failed to copy', 'error'));
 }
 
 // ============================================================================
@@ -972,24 +954,20 @@ function showToast(message, type = 'info') {
     const container = document.getElementById('toastContainer');
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
-
-    const icons = { success: 'check-circle', error: 'exclamation-circle', info: 'info-circle' };
     toast.innerHTML = `
-        <i class="fas fa-${icons[type] || 'info-circle'}" style="color: var(--${type === 'success' ? 'success' : type === 'error' ? 'error' : 'info'})"></i>
+        <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}"></i>
         <span>${escapeHtml(message)}</span>
     `;
-
+    
     container.appendChild(toast);
+
     setTimeout(() => {
         toast.style.opacity = '0';
-        toast.style.transform = 'translateX(20px)';
-        toast.style.transition = 'all 0.3s ease';
         setTimeout(() => toast.remove(), 300);
     }, 4000);
 }
 
 function escapeHtml(text) {
-    if (!text) return '';
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
@@ -998,20 +976,15 @@ function escapeHtml(text) {
 function formatDate(dateString) {
     if (!dateString) return '-';
     const date = new Date(dateString);
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    return date.toLocaleDateString();
 }
 
 function formatUptime(seconds) {
     const days = Math.floor(seconds / 86400);
     const hours = Math.floor((seconds % 86400) / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
-    if (days > 0) return `${days}d ${hours}h ${mins}m`;
+
+    if (days > 0) return `${days}d ${hours}h`;
     if (hours > 0) return `${hours}h ${mins}m`;
     return `${mins}m`;
-}
-
-function formatNumber(num) {
-    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
-    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
-    return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }

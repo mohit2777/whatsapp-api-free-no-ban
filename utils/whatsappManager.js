@@ -4,7 +4,7 @@
  * No browser/Chromium required - uses WebSocket protocol
  */
 
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
@@ -544,7 +544,7 @@ class WhatsAppManager {
       // Create silent logger for Baileys
       const baileysLogger = pino({ level: 'silent' });
 
-      // Create socket with anti-ban settings
+      // Create socket with proper browser identification
       const sock = makeWASocket({
         version,
         auth: {
@@ -553,16 +553,18 @@ class WhatsAppManager {
         },
         printQRInTerminal: false,
         logger: baileysLogger,
-        browser: ['WhatsApp Multi-Automation', 'Chrome', '120.0.0'],
+        browser: Browsers.windows('Desktop'),
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
-        markOnlineOnConnect: false, // Don't mark online immediately - more natural
+        markOnlineOnConnect: false,
         getMessage: async (key) => {
           return { conversation: '' };
         },
         msgRetryCounterCache,
-        // Anti-ban: Disable link previews and aggressive features
-        linkPreviewImageThumbnailWidth: 0
+        linkPreviewImageThumbnailWidth: 0,
+        qrTimeout: 40000,
+        defaultQueryTimeoutMs: 60000,
+        connectTimeoutMs: 60000
       });
 
       // Store connection
@@ -704,6 +706,9 @@ class WhatsAppManager {
         // Clear watchdog and release lock
         this.clearConnectionWatchdog(accountId);
         this.connectionLocks.delete(accountId);
+        
+        // Clean up the dead socket reference
+        this.connections.delete(accountId);
 
         // Don't reconnect if app is shutting down
         if (this.isShuttingDown) {
@@ -774,23 +779,51 @@ class WhatsAppManager {
           return;
         }
 
-        // Status 401 = Connection failure - check if this is a new account or authenticated one
+        // Status 500 = Bad session - clear corrupted session and retry
+        if (statusCode === 500 || statusCode === DisconnectReason.badSession) {
+          logger.warn(`Bad session for ${accountId}, clearing session for re-auth`);
+          await this.clearCorruptedSession(accountId);
+          return;
+        }
+
+        // Status 403 = Forbidden - account may be banned or restricted
+        if (statusCode === 403) {
+          logger.error(`Account ${accountId} forbidden (possibly banned)`);
+          this.connectionStates.set(accountId, { status: 'error', error: 'Account forbidden' });
+          await db.updateAccount(accountId, {
+            status: 'error',
+            error_message: 'Connection forbidden. Your WhatsApp account may be restricted.'
+          }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'error', message: 'Account forbidden' });
+          return;
+        }
+
+        // Status 411 = Multi-device mismatch - clear session
+        if (statusCode === 411) {
+          logger.warn(`Multi-device mismatch for ${accountId}, clearing session`);
+          await this.clearCorruptedSession(accountId);
+          return;
+        }
+
+        // Status 503 = Service unavailable - temporary, retry after delay
+        if (statusCode === 503) {
+          logger.warn(`WhatsApp service unavailable for ${accountId}, retrying in 60s`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          this.scheduleReconnect(accountId, 60000);
+          return;
+        }
+
+        // Status 401 = Connection failure / logged out
         if (statusCode === 401) {
           const account = await db.getAccountById(accountId).catch(() => null);
           const hadSession = account?.session_data != null;
           
           if (hadSession) {
-            // Had a session but now invalid - clear it
-            logger.info(`Account ${accountId} session invalid, clearing session`);
-            this.connectionStates.set(accountId, { status: 'disconnected' });
-            await db.updateAccount(accountId, { 
-              status: 'disconnected', 
-              session_data: null,
-              qr_code: null 
-            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
-            this.emit('account-status', { accountId, status: 'disconnected', message: 'Session expired - click Reconnect' });
+            // Had a session but now invalid - clear session and auth files
+            logger.info(`Account ${accountId} session invalid, clearing for re-auth`);
+            await this.clearCorruptedSession(accountId);
           } else {
-            // New account never authenticated - just mark as disconnected, don't spam reconnects
+            // New account never authenticated - mark disconnected
             logger.info(`New account ${accountId} connection failed, waiting for manual reconnect`);
             this.connectionStates.set(accountId, { status: 'disconnected', error: 'Connection failed' });
             await db.updateAccount(accountId, { 
