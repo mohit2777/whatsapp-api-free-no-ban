@@ -372,11 +372,21 @@ class WhatsAppManager {
   async initializeAccounts() {
     try {
       const accounts = await db.getAccounts();
-      logger.info(`Found ${accounts.length} accounts to initialize`);
+      const toConnect = accounts.filter(a => a.status === 'ready' || a.session_data);
+      logger.info(`Found ${accounts.length} accounts, ${toConnect.length} to initialize`);
 
-      for (const account of accounts) {
-        if (account.status === 'ready' || account.session_data) {
+      for (let i = 0; i < toConnect.length; i++) {
+        const account = toConnect[i];
+        try {
           await this.connect(account.id);
+        } catch (e) {
+          logger.error(`Failed to initialize account ${account.id}: ${e.message}`);
+        }
+        // Stagger connections to avoid hitting WhatsApp servers all at once
+        if (i < toConnect.length - 1) {
+          const staggerDelay = humanDelay(3000, 6000);
+          logger.debug(`Waiting ${staggerDelay}ms before next account initialization`);
+          await new Promise(resolve => setTimeout(resolve, staggerDelay));
         }
       }
     } catch (error) {
@@ -611,8 +621,15 @@ class WhatsAppManager {
 
       const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
-      // Get latest Baileys version
-      const { version } = await fetchLatestBaileysVersion();
+      // Get latest Baileys version (with fallback)
+      let version;
+      try {
+        const versionResult = await fetchLatestBaileysVersion();
+        version = versionResult.version;
+      } catch (versionErr) {
+        logger.warn(`Failed to fetch Baileys version, using fallback: ${versionErr.message}`);
+        version = [2, 3000, 1015901307];
+      }
 
       // Create silent logger for Baileys
       const baileysLogger = pino({ level: 'silent' });
@@ -667,11 +684,10 @@ class WhatsAppManager {
       const lockReleaseDelay = isNewAccount ? 30000 : 5000;
       setTimeout(() => this.connectionLocks.delete(accountId), lockReleaseDelay);
 
-      // Setup watchdog timer for new accounts waiting for QR scan
-      // If no QR generated or no connection within 60s, mark as error
-      if (isNewAccount) {
-        this.setupConnectionWatchdog(accountId);
-      }
+      // Setup watchdog timer to detect stuck connections
+      // If no QR generated or no connection within timeout, mark as error
+      // Applies to ALL connections, not just new accounts
+      this.setupConnectionWatchdog(accountId);
 
       logger.info(`Connection initiated for account ${accountId} (new: ${isNewAccount})`);
       
@@ -855,16 +871,25 @@ class WhatsAppManager {
           return;
         }
 
-        // Status 408 = QR timeout - don't auto-reconnect, wait for user action
+        // Status 408 = QR timeout / connection lost
+        // For new accounts (no session): treat as QR timeout, wait for user
+        // For established accounts: treat as connection lost, auto-reconnect
         if (statusCode === 408) {
-          logger.info(`QR timeout for ${accountId}, waiting for user to reconnect`);
-          this.connectionStates.set(accountId, { status: 'disconnected', error: 'QR code expired' });
-          await db.updateAccount(accountId, { 
-            status: 'disconnected', 
-            qr_code: null,
-            error_message: 'QR code expired. Click Reconnect to try again.'
-          }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
-          this.emit('account-status', { accountId, status: 'disconnected', message: 'QR expired - click Reconnect' });
+          const acct = await db.getAccountById(accountId).catch(() => null);
+          if (!acct?.session_data) {
+            logger.info(`QR timeout for ${accountId}, waiting for user to reconnect`);
+            this.connectionStates.set(accountId, { status: 'disconnected', error: 'QR code expired' });
+            await db.updateAccount(accountId, { 
+              status: 'disconnected', 
+              qr_code: null,
+              error_message: 'QR code expired. Click Reconnect to try again.'
+            }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
+            this.emit('account-status', { accountId, status: 'disconnected', message: 'QR expired - click Reconnect' });
+          } else {
+            logger.warn(`Connection lost (408) for established account ${accountId}, reconnecting in 30s`);
+            this.connectionStates.set(accountId, { status: 'reconnecting' });
+            this.scheduleReconnect(accountId, 30000);
+          }
           return;
         }
 
@@ -902,14 +927,15 @@ class WhatsAppManager {
           return;
         }
 
-        // Status 401 = Connection failure / logged out
-        if (statusCode === 401) {
+        // Status 401 = Logged out / session invalid
+        // (DisconnectReason.loggedOut === 401 in Baileys)
+        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
           const account = await db.getAccountById(accountId).catch(() => null);
           const hadSession = account?.session_data != null;
           
           if (hadSession) {
-            // Had a session but now invalid - clear session and auth files
-            logger.info(`Account ${accountId} session invalid, clearing for re-auth`);
+            // Had a session but now invalid — user logged out or session expired
+            logger.info(`Account ${accountId} logged out / session invalid, clearing for re-auth`);
             await this.clearCorruptedSession(accountId);
           } else {
             // New account never authenticated - mark disconnected
@@ -921,20 +947,6 @@ class WhatsAppManager {
             }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
             this.emit('account-status', { accountId, status: 'disconnected', message: 'Connection failed - click Reconnect' });
           }
-          return;
-        }
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          // User logged out - clear session completely
-          logger.info(`Account ${accountId} logged out, clearing session`);
-          this.connectionStates.set(accountId, { status: 'disconnected' });
-          await db.updateAccount(accountId, { 
-            status: 'disconnected', 
-            session_data: null,
-            qr_code: null 
-          }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
-          
-          this.emit('account-status', { accountId, status: 'disconnected' });
           return;
         }
 
@@ -1268,7 +1280,8 @@ class WhatsAppManager {
       
       if (hasMedia && !mediaData) {
         try {
-          const buffer = await downloadMediaMessage(
+          // Timeout media downloads to prevent hanging the message handler
+          const downloadPromise = downloadMediaMessage(
             msg,
             'buffer',
             {},
@@ -1277,6 +1290,10 @@ class WhatsAppManager {
               reuploadRequest: sock.updateMediaMessage
             }
           );
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Media download timed out after 30s')), 30000)
+          );
+          const buffer = await Promise.race([downloadPromise, timeoutPromise]);
           
           if (buffer && buffer.length > 0) {
             // Only include base64 for files < 10MB to prevent webhook payload bloat
@@ -1612,20 +1629,20 @@ class WhatsAppManager {
    * Save session to database with write locking and validation
    */
   async saveSession(accountId) {
+    // Check if account still exists
+    if (this.deletedAccounts.has(accountId)) {
+      logger.debug(`Skipping session save for deleted account ${accountId}`);
+      return;
+    }
+
+    // Prevent concurrent saves (creds.update fires rapidly)
+    if (this.sessionSaveLocks.has(accountId)) {
+      logger.debug(`Session save already in progress for ${accountId}, skipping`);
+      return;
+    }
+
+    this.sessionSaveLocks.add(accountId);
     try {
-      // Check if account still exists
-      if (this.deletedAccounts.has(accountId)) {
-        logger.debug(`Skipping session save for deleted account ${accountId}`);
-        return;
-      }
-
-      // Prevent concurrent saves (creds.update fires rapidly)
-      if (this.sessionSaveLocks.has(accountId)) {
-        logger.debug(`Session save already in progress for ${accountId}, skipping`);
-        return;
-      }
-      this.sessionSaveLocks.add(accountId);
-
       const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
       
       // Check if auth directory exists
@@ -1633,7 +1650,6 @@ class WhatsAppManager {
         await fs.access(authPath);
       } catch {
         logger.debug(`Auth path does not exist for account ${accountId}, skipping save`);
-        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
@@ -1641,7 +1657,6 @@ class WhatsAppManager {
       
       if (files.length === 0) {
         logger.debug(`No session files to save for account ${accountId}`);
-        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
@@ -1652,11 +1667,9 @@ class WhatsAppManager {
         if (file.endsWith('.json')) {
           try {
             const content = await fs.readFile(path.join(authPath, file), 'utf8');
-            // Validate it's valid JSON
             const parsed = JSON.parse(content);
             sessionData[file] = content;
 
-            // Track if creds look valid
             if (file === 'creds.json') {
               credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey);
             }
@@ -1668,14 +1681,12 @@ class WhatsAppManager {
 
       if (Object.keys(sessionData).length === 0) {
         logger.debug(`No valid session files to save for account ${accountId}`);
-        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
       // Only save if creds.json was found and has valid identity keys
       if (!sessionData['creds.json'] || !credsValid) {
         logger.warn(`Session for ${accountId} has no valid creds.json, skipping DB save`);
-        this.sessionSaveLocks.delete(accountId);
         return;
       }
 
@@ -1687,10 +1698,10 @@ class WhatsAppManager {
       });
 
       logger.debug(`Session saved for account ${accountId} (${Object.keys(sessionData).length} files)`);
-      this.sessionSaveLocks.delete(accountId);
     } catch (error) {
-      this.sessionSaveLocks.delete(accountId);
       logger.error(`Failed to save session for account ${accountId}:`, error.message);
+    } finally {
+      this.sessionSaveLocks.delete(accountId);
     }
   }
 
