@@ -553,7 +553,8 @@ class WhatsAppManager {
       this.connectionLocks.add(accountId);
       
       // Check if this is a new account (no existing session data)
-      const accountCheck = await db.getAccountById(accountId);
+      // Use skipCache=true to get fresh data (avoid stale session_data from cache)
+      const accountCheck = await db.getAccountById(accountId, true);
       const isNewAccount = !accountCheck?.session_data;
 
       // Enforce minimum interval between connection attempts

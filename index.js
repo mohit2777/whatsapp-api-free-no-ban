@@ -101,11 +101,12 @@ let sessionStore = null;
 
 // Only use PostgreSQL if DATABASE_URL is set AND looks valid (not a placeholder)
 const dbUrl = process.env.DATABASE_URL;
-const isValidDbUrl = dbUrl && 
-  dbUrl.includes('://') && 
+const isValidDbUrl = dbUrl && (
+  (dbUrl.includes('://') && 
   !dbUrl.includes('user:password') && 
   !dbUrl.includes('@host:') &&
-  !dbUrl.includes('localhost') || (process.env.NODE_ENV !== 'production');
+  !dbUrl.includes('localhost')) || (process.env.NODE_ENV !== 'production')
+);
 
 if (isValidDbUrl) {
   try {
@@ -173,6 +174,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('subscribe-account', (accountId) => {
+    // Validate accountId format to prevent room pollution
+    if (!accountId || typeof accountId !== 'string' || accountId.length > 100) {
+      logger.warn(`Invalid accountId in subscribe-account from ${socket.id}`);
+      return;
+    }
     socket.join(`account-${accountId}`);
   });
 });
@@ -499,12 +505,23 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
         if (match) detectedMimetype = match[1];
       }
     } else if (mediaUrl) {
-      // Fetch media from URL
+      // SSRF protection: only allow http/https and block internal IPs
+      const parsedUrl = new URL(mediaUrl);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        return res.status(400).json({ success: false, error: 'Only http/https URLs are allowed' });
+      }
+      const hostname = parsedUrl.hostname.toLowerCase();
+      const blockedPatterns = ['localhost', '127.0.0.1', '0.0.0.0', '::1', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.', '169.254.', 'metadata.google', 'metadata.aws'];
+      if (blockedPatterns.some(p => hostname.startsWith(p) || hostname === p)) {
+        return res.status(400).json({ success: false, error: 'Internal/private URLs are not allowed' });
+      }
+
       const axios = require('axios');
       const response = await axios.get(mediaUrl, { 
         responseType: 'arraybuffer',
         timeout: 30000,
-        maxContentLength: 50 * 1024 * 1024 // 50MB limit
+        maxContentLength: 50 * 1024 * 1024, // 50MB limit
+        maxRedirects: 3
       });
       mediaBuffer = Buffer.from(response.data);
       detectedMimetype = detectedMimetype || response.headers['content-type'];

@@ -216,12 +216,16 @@ class WebhookDeliveryService {
       const response = await axios.post(webhook.url, payload, {
         headers,
         timeout: 15000, // 15 second timeout
-        validateStatus: (status) => status < 500
+        validateStatus: () => true // Don't throw on any status — we handle all codes
       });
 
       if (response.status >= 200 && response.status < 300) {
         return { success: true, statusCode: response.status };
+      } else if (response.status === 410) {
+        // 410 Gone — endpoint permanently removed, don't retry
+        return { success: false, statusCode: response.status, error: 'HTTP 410 Gone — endpoint removed' };
       } else {
+        // All other errors (4xx, 5xx) — mark as failed so retry logic kicks in
         return { 
           success: false, 
           statusCode: response.status, 

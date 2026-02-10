@@ -807,10 +807,11 @@ function renderAccountsTable() {
 
 function renderApiKey(apiKey) {
     if (!apiKey) return '<span style="color: var(--text-muted);">-</span>';
+    const safeKey = escapeHtml(apiKey);
     return `
         <div class="api-key-container">
-            <span class="api-key-full" onclick="toggleApiKeyExpand(this)" title="Click to expand">${escapeHtml(apiKey)}</span>
-            <button class="btn-copy" onclick="copyApiKey('${escapeHtml(apiKey)}')" title="Copy">
+            <span class="api-key-full" onclick="toggleApiKeyExpand(this)" title="Click to expand">${safeKey}</span>
+            <button class="btn-copy" onclick="copyApiKey(this)" data-key="${safeKey}" title="Copy">
                 <i class="fas fa-copy"></i>
             </button>
         </div>
@@ -821,7 +822,8 @@ function toggleApiKeyExpand(element) {
     element.classList.toggle('expanded');
 }
 
-function copyApiKey(apiKey) {
+function copyApiKey(btn) {
+    const apiKey = btn.getAttribute('data-key');
     navigator.clipboard.writeText(apiKey).then(() => {
         showToast('API key copied to clipboard', 'success');
     }).catch(() => showToast('Failed to copy', 'error'));

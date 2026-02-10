@@ -75,9 +75,9 @@ class CacheManager {
   }
 
   invalidatePattern(pattern) {
-    const regex = new RegExp(pattern);
+    // Use string startsWith for safety instead of regex to avoid ReDoS
     for (const key of this.cache.keys()) {
-      if (regex.test(key)) this.cache.delete(key);
+      if (key.startsWith(pattern) || key.includes(pattern)) this.cache.delete(key);
     }
   }
 
@@ -161,9 +161,11 @@ const db = {
     return data;
   },
 
-  async getAccountById(id) {
-    const cached = cacheManager.get(`account:${id}`);
-    if (cached) return cached;
+  async getAccountById(id, skipCache = false) {
+    if (!skipCache) {
+      const cached = cacheManager.get(`account:${id}`);
+      if (cached) return cached;
+    }
 
     const { data, error } = await withRetry(
       () => supabase.from('whatsapp_accounts').select('*').eq('id', id).single(),
