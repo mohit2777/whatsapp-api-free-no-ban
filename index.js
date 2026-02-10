@@ -231,21 +231,14 @@ app.get('/api/health', async (req, res) => {
     const cacheStats = db.getCacheStats();
     const metrics = whatsappManager.getMetrics();
 
-    let webhookQueue;
-    try {
-      webhookQueue = await db.getWebhookQueueStats();
-    } catch (error) {
-      if (error instanceof MissingWebhookQueueTableError) {
-        webhookQueue = { error: 'missing_table' };
-      } else {
-        throw error;
-      }
-    }
+    // Use in-memory webhook delivery stats (not the DB table which was removed)
+    const webhookQueue = webhookDeliveryService.getStats();
 
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
+      nodeVersion: process.version,
       memory: process.memoryUsage(),
       systemMemory: {
         total: os.totalmem(),
@@ -253,7 +246,14 @@ app.get('/api/health', async (req, res) => {
       },
       queue: queueStatus,
       cache: cacheStats,
-      webhookQueue,
+      webhookQueue: {
+        queueSize: webhookQueue.total,
+        isProcessing: webhookQueue.processing > 0,
+        delivered: webhookQueue.total - webhookQueue.pending - webhookQueue.processing,
+        failed: webhookQueue.retrying || 0,
+        pending: webhookQueue.pending,
+        maxSize: webhookQueue.maxSize
+      },
       metrics
     });
   } catch (error) {

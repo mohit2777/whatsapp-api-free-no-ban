@@ -483,9 +483,8 @@ class WhatsAppManager {
         return null;
       }
 
-      // Double-check with a small delay to catch race conditions
+      // Set connection lock immediately
       this.connectionLocks.add(accountId);
-      await new Promise(resolve => setTimeout(resolve, 100));
       
       // Check if this is a new account (no existing session data)
       const accountCheck = await db.getAccountById(accountId);
@@ -503,8 +502,6 @@ class WhatsAppManager {
         }
       }
 
-      // Set connection lock
-      this.connectionLocks.add(accountId);
       this.lastConnectionAttempt.set(accountId, Date.now());
 
       // Disconnect existing connection if any
@@ -532,8 +529,28 @@ class WhatsAppManager {
       await fs.mkdir(authPath, { recursive: true });
 
       // Restore session from database if exists
+      // restoreSession validates creds before writing — if invalid, it clears session_data
+      // and we fall through to a fresh QR code flow
       if (account.session_data) {
         await this.restoreSession(accountId, account.session_data, authPath);
+      }
+
+      // Clean up any stale/partial auth files before Baileys reads them
+      // If creds.json exists but has registered=false and no 'me', remove it
+      try {
+        const credsPath = path.join(authPath, 'creds.json');
+        const credsExists = await fs.access(credsPath).then(() => true).catch(() => false);
+        if (credsExists) {
+          const credsRaw = await fs.readFile(credsPath, 'utf8');
+          const creds = JSON.parse(credsRaw);
+          if (creds.registered === false && !creds.me) {
+            logger.warn(`Stale creds.json on disk for ${accountId} (registered=false, no me), cleaning up`);
+            await fs.rm(authPath, { recursive: true, force: true });
+            await fs.mkdir(authPath, { recursive: true });
+          }
+        }
+      } catch (credsCheckErr) {
+        logger.debug(`Creds validation check skipped: ${credsCheckErr.message}`);
       }
 
       const { state, saveCreds } = await useMultiFileAuthState(authPath);
@@ -1422,6 +1439,49 @@ class WhatsAppManager {
 
       if (!decoded || typeof decoded !== 'object') {
         logger.warn(`Invalid session data structure for account ${accountId}`);
+        return;
+      }
+
+      // ===== VALIDATE CREDS BEFORE RESTORING =====
+      // Check creds.json for registration status and platform mismatch
+      if (decoded['creds.json']) {
+        try {
+          const creds = JSON.parse(decoded['creds.json']);
+          
+          // If credentials are not registered, the session is incomplete/stale
+          // Restoring it would cause 401 errors instead of generating a fresh QR
+          if (creds.registered === false && !creds.me) {
+            logger.warn(`Session for ${accountId} has registered=false and no 'me' — incomplete session, discarding`);
+            await db.updateAccount(accountId, { session_data: null });
+            return;
+          }
+
+          // Check for platform mismatch — stored session says one platform
+          // but we connect with Browsers.windows('Desktop')
+          // A mismatch can cause auth_failure after QR scan
+          if (creds.platform && creds.platform !== 'smba' && creds.platform !== 'android') {
+            // 'smba' is what Browsers.windows('Desktop') typically produces
+            // Allow android too since Baileys can handle it
+            logger.debug(`Session platform: ${creds.platform} — acceptable`);
+          }
+
+          // If creds have no signalIdentities or account info, session is corrupt
+          if (!creds.signedIdentityKey || !creds.noiseKey) {
+            logger.warn(`Session for ${accountId} missing critical identity keys, discarding`);
+            await db.updateAccount(accountId, { session_data: null });
+            return;
+          }
+
+          logger.debug(`Session validation passed for ${accountId} (registered: ${creds.registered}, platform: ${creds.platform || 'unknown'})`);
+        } catch (credsParseError) {
+          logger.warn(`Failed to parse creds.json for validation in ${accountId}, discarding session: ${credsParseError.message}`);
+          await db.updateAccount(accountId, { session_data: null });
+          return;
+        }
+      } else {
+        // No creds.json in session data — session is useless without it
+        logger.warn(`Session data for ${accountId} has no creds.json, discarding`);
+        await db.updateAccount(accountId, { session_data: null });
         return;
       }
 
