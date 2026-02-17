@@ -14,14 +14,14 @@ class WebhookDeliveryService {
     this.processInterval = null;
     this.maxRetries = 5;
     this.retryDelays = [
-      1000,      // 1 second
-      5000,      // 5 seconds
+      3000,      // 3 seconds  — give cold-start services time to wake
+      10000,     // 10 seconds — second chance after wake-up
       30000,     // 30 seconds
       60000,     // 1 minute
       120000     // 2 minutes
     ];
     this.maxQueueSize = 1000; // Prevent memory issues
-    this.processingTimeout = 30000; // 30s max for an item to stay in 'processing'
+    this.processingTimeout = 45000; // 45s max for an item to stay in 'processing' (increased for cold-start timeouts)
     this.activeDeliveries = 0; // Track concurrent deliveries
     this.maxConcurrent = 15;   // Max concurrent HTTP requests
     this.deliveryStats = { sent: 0, failed: 0, retries: 0 }; // Lifetime stats
@@ -269,7 +269,7 @@ class WebhookDeliveryService {
 
       const response = await axios.post(webhook.url, payload, {
         headers,
-        timeout: 10000, // 10 second timeout (reduced from 15 to prevent queue backup)
+        timeout: 30000, // 30s timeout — Render/Railway free-tier cold starts take 20-50s
         validateStatus: () => true // Don't throw on any status — we handle all codes
       });
 
@@ -287,10 +287,12 @@ class WebhookDeliveryService {
         };
       }
     } catch (error) {
-      const errorMsg = error.code === 'ECONNABORTED' ? 'Timeout (10s)' 
-        : error.code === 'ECONNREFUSED' ? 'Connection refused'
-        : error.code === 'ENOTFOUND' ? 'DNS lookup failed'
-        : error.code === 'ETIMEDOUT' ? 'Connection timed out'
+      const errorMsg = error.code === 'ECONNABORTED' ? `Timeout (30s) — target may be cold-starting` 
+        : error.code === 'ECONNREFUSED' ? 'Connection refused — target not running'
+        : error.code === 'ENOTFOUND' ? 'DNS lookup failed — check URL'
+        : error.code === 'ETIMEDOUT' ? 'Connection timed out — target unreachable'
+        : error.code === 'ECONNRESET' ? 'Connection reset by target'
+        : error.code === 'ERR_TLS_CERT_ALTNAME_INVALID' ? 'TLS certificate mismatch'
         : error.message;
       return { 
         success: false, 

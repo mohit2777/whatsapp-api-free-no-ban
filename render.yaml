@@ -20,17 +20,15 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
       - key: DATABASE_URL
-        fromDatabase:
-          name: whatsapp-db
-          property: connectionString
+        sync: false
       - key: TYPING_DELAY_MS
         value: "1500"
       - key: SESSION_COOKIE_SECURE
         value: "true"
-
-databases:
-  - name: whatsapp-db
-    plan: free
-    databaseName: whatsapp_automation
-    postgresMajorVersion: "15"

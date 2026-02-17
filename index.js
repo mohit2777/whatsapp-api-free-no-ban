@@ -99,8 +99,21 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 let sessionStore = null;
 
-// Only use PostgreSQL if DATABASE_URL is set AND looks valid (not a placeholder)
-const dbUrl = process.env.DATABASE_URL;
+// Try DATABASE_URL first, then derive from SUPABASE_URL if available.
+// Supabase projects expose a direct Postgres URL at db.<ref>.supabase.co:5432
+let dbUrl = process.env.DATABASE_URL;
+
+// If no DATABASE_URL, try to build one from Supabase env vars
+if (!dbUrl && process.env.SUPABASE_URL && process.env.SUPABASE_DB_PASSWORD) {
+  // Extract project ref from SUPABASE_URL (https://<ref>.supabase.co)
+  const match = process.env.SUPABASE_URL.match(/https:\/\/([^.]+)\.supabase\.co/);
+  if (match) {
+    const ref = match[1];
+    dbUrl = `postgresql://postgres.${ref}:${process.env.SUPABASE_DB_PASSWORD}@aws-0-ap-south-1.pooler.supabase.com:6543/postgres`;
+    logger.info('Built DATABASE_URL from SUPABASE_URL + SUPABASE_DB_PASSWORD');
+  }
+}
+
 const isValidDbUrl = dbUrl && (
   (dbUrl.includes('://') && 
   !dbUrl.includes('user:password') && 
