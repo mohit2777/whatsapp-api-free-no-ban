@@ -1282,10 +1282,13 @@ class WhatsAppManager {
     sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         if (update.update?.status) {
+          const remoteJid = update.key.remoteJid;
+          const phone = this.getPhoneNumber(remoteJid);
           webhookDeliveryService.dispatch(accountId, 'message.status', {
             messageId: update.key.id,
             status: update.update.status,
-            remoteJid: update.key.remoteJid
+            remoteJid,
+            phone: phone || null
           });
         }
       }
@@ -1665,6 +1668,7 @@ class WhatsAppManager {
         success: true,
         messageId: result.key.id,
         to: jid,
+        phone: this.getPhoneNumber(jid) || phone,
         timestamp: Date.now()
       };
     } catch (error) {
@@ -1724,6 +1728,7 @@ class WhatsAppManager {
         success: true,
         messageId: result.key.id,
         to: resolvedJid,
+        phone: this.getPhoneNumber(resolvedJid) || jid.split('@')[0],
         timestamp: Date.now()
       };
     } catch (error) {
@@ -1818,6 +1823,8 @@ class WhatsAppManager {
       return {
         success: true,
         messageId: result.key.id,
+        to: jid,
+        phone: this.getPhoneNumber(jid) || phoneOrJid,
         timestamp: Date.now()
       };
     } catch (error) {
