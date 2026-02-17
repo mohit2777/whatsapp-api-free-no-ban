@@ -1058,6 +1058,8 @@ class WhatsAppManager {
         // Firewall / keep-alive tuning
         keepAliveIntervalMs: 25000, // 25s keep-alive like real WA Web
         retryRequestDelayMs: 250,
+        // Allow more retry attempts for failed decryptions (default is 5)
+        maxMsgRetryCount: 10,
       });
 
       // Store connection
@@ -1697,10 +1699,23 @@ class WhatsAppManager {
       const message = msg.message;
       if (!message) {
         // Distinguish stub notifications (group events) from decryption failures
-        if (msg.messageStubType) {
+        if (msg.messageStubType === 2) {
+          // StubType 2 = CIPHERTEXT: Baileys received the message but FAILED to
+          // decrypt it. The Signal session with this contact is corrupted.
+          // Baileys auto-sends up to 5 retry receipts, but if those also fail
+          // the session stays broken. Force-reset the Signal session so the
+          // NEXT message from this contact can be decrypted successfully.
+          logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}). Forcing Signal session reset...`);
+          try {
+            await sock.assertSessions([remoteJid], true);
+            logger.info(`[MESSAGE] Signal session reset for ${remoteJid} — next message should decrypt OK`);
+          } catch (sessErr) {
+            logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
+          }
+        } else if (msg.messageStubType) {
           logger.info(`[MESSAGE] Notification stub from ${contactId} (stubType: ${msg.messageStubType}, pushName: ${msg.pushName || 'N/A'}) — no webhook sent.`);
         } else {
-          logger.warn(`[MESSAGE] Received message from ${contactId} (pushName: ${msg.pushName || 'Unknown'}) but msg.message is null — likely decryption failure (Bad MAC) or empty notification. No webhook sent. msgId=${msg.key.id}`);
+          logger.warn(`[MESSAGE] Received message from ${contactId} (pushName: ${msg.pushName || 'Unknown'}) but msg.message is null — likely decryption failure or empty notification. No webhook sent. msgId=${msg.key.id}`);
         }
         return;
       }
