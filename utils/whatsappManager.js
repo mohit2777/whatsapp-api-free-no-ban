@@ -1240,7 +1240,7 @@ class WhatsAppManager {
           logger.info(`Post-QR-scan restart for ${accountId} (status ${statusCode}), reconnecting in 3s`);
           this.connectionStates.set(accountId, { status: 'reconnecting' });
           await db.updateAccount(accountId, {
-            status: 'reconnecting',
+            status: 'initializing',
             qr_code: null,
             error_message: null
           }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
@@ -1499,12 +1499,13 @@ class WhatsAppManager {
       try {
         await saveCreds();
         
+        // Brief delay to ensure creds.json is fully flushed to disk
+        // before we try to read it back. Without this, rapid creds.update
+        // events cause "Unexpected end of JSON input" from partial reads.
+        await new Promise(r => setTimeout(r, 100));
+        
         // Only persist to database when creds represent a fully authenticated
         // session (i.e. QR was scanned and pair-success completed).
-        // Before authentication, creds have registered=false and no 'me' —
-        // saving those to the DB confuses the close handler's new-vs-established
-        // account detection and causes session_data to be non-null even though
-        // the user never actually authenticated.
         const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
         try {
           const credsRaw = await fs.readFile(path.join(authPath, 'creds.json'), 'utf8');
@@ -1515,8 +1516,17 @@ class WhatsAppManager {
             logger.debug(`Skipping DB session save for ${accountId} (not yet authenticated)`);
           }
         } catch (readErr) {
-          // If we can't verify, save anyway as a fallback
-          await this.saveSession(accountId);
+          // File might still be partially written — wait and retry once
+          await new Promise(r => setTimeout(r, 250));
+          try {
+            const credsRaw = await fs.readFile(path.join(authPath, 'creds.json'), 'utf8');
+            const creds = JSON.parse(credsRaw);
+            if (creds.me && creds.registered !== false) {
+              await this.saveSession(accountId);
+            }
+          } catch (retryErr) {
+            logger.debug(`Skipping session save for ${accountId} — creds.json not ready yet: ${retryErr.message}`);
+          }
         }
       } catch (error) {
         logger.error(`Error saving creds for ${accountId}: ${error.message}`);
@@ -1543,11 +1553,14 @@ class WhatsAppManager {
       }
 
       for (const msg of messages) {
-        logger.info(`[MESSAGE] messages.upsert: fromMe=${msg.key.fromMe}, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}, pushName=${msg.pushName || 'N/A'}`);
-        
+        // Log incoming (non-fromMe) messages at INFO, own messages at DEBUG
+        // to avoid log spam from history sync of sent messages
         if (msg.key.fromMe) {
+          logger.debug(`[MESSAGE] messages.upsert: fromMe=true, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}`);
           continue;
         }
+
+        logger.info(`[MESSAGE] messages.upsert: fromMe=false, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}, pushName=${msg.pushName || 'N/A'}`);
 
         // Handle message in background to not block event loop
         this.handleIncomingMessage(accountId, msg).catch(err => {
@@ -2248,16 +2261,25 @@ class WhatsAppManager {
 
       for (const file of files) {
         if (file.endsWith('.json')) {
-          try {
-            const content = await fs.readFile(path.join(authPath, file), 'utf8');
-            const parsed = JSON.parse(content);
-            sessionData[file] = content;
+          // Retry read once if parse fails (creds.json may be mid-write)
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const content = await fs.readFile(path.join(authPath, file), 'utf8');
+              const parsed = JSON.parse(content);
+              sessionData[file] = content;
 
-            if (file === 'creds.json') {
-              credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey);
+              if (file === 'creds.json') {
+                credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey);
+              }
+              break; // success
+            } catch (readError) {
+              if (attempt === 0) {
+                // Wait briefly and retry — file may be partially written
+                await new Promise(r => setTimeout(r, 150));
+              } else {
+                logger.warn(`Failed to read/parse session file ${file}: ${readError.message}`);
+              }
             }
-          } catch (readError) {
-            logger.warn(`Failed to read/parse session file ${file}: ${readError.message}`);
           }
         }
       }

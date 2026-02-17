@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS whatsapp_accounts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
     description TEXT,
-    status VARCHAR(50) DEFAULT 'initializing' CHECK (status IN ('initializing', 'qr_ready', 'ready', 'disconnected', 'auth_failed', 'error')),
+    status VARCHAR(50) DEFAULT 'initializing' CHECK (status IN ('initializing', 'qr_ready', 'ready', 'disconnected', 'auth_failed', 'error', 'reconnecting')),
     phone_number VARCHAR(50),
     api_key VARCHAR(64) UNIQUE,
     session_data TEXT,
