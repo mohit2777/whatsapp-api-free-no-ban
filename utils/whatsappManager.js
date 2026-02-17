@@ -398,8 +398,18 @@ class WhatsAppManager {
     
     const trimmed = to.trim();
     
-    // Already has a JID suffix — use as-is
+    // Already has a JID suffix
     if (trimmed.includes('@')) {
+      // If it's a @lid JID and we know the phone number, prefer phone JID
+      // (both work in Baileys, but phone JID is more universally compatible)
+      if (trimmed.includes('@lid')) {
+        const lidNumber = trimmed.split('@')[0];
+        const phoneFromLid = this.lidToPhone.get(lidNumber);
+        if (phoneFromLid) {
+          logger.info(`[RESOLVE] Resolved ${trimmed} → ${phoneFromLid}@s.whatsapp.net via LID mapping`);
+          return `${phoneFromLid}@s.whatsapp.net`;
+        }
+      }
       return trimmed;
     }
     
