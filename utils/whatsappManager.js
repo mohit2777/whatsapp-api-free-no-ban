@@ -1536,15 +1536,14 @@ class WhatsAppManager {
 
       // Only process 'notify' type for webhook dispatch (not history sync)
       if (type !== 'notify') {
-        logger.debug(`Ignoring messages.upsert with type: ${type}`);
+        logger.info(`[MESSAGE] Ignoring messages.upsert batch (type=${type}, count=${messages.length}) — only 'notify' triggers webhooks`);
         return;
       }
 
       for (const msg of messages) {
-        logger.debug(`Processing message: fromMe=${msg.key.fromMe}, remoteJid=${msg.key.remoteJid}`);
+        logger.info(`[MESSAGE] messages.upsert: fromMe=${msg.key.fromMe}, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}, pushName=${msg.pushName || 'N/A'}`);
         
         if (msg.key.fromMe) {
-          logger.debug('Skipping own message');
           continue;
         }
 
@@ -1696,7 +1695,15 @@ class WhatsAppManager {
       let thumbnailBase64 = null;
 
       const message = msg.message;
-      if (!message) return;
+      if (!message) {
+        // Distinguish stub notifications (group events) from decryption failures
+        if (msg.messageStubType) {
+          logger.info(`[MESSAGE] Notification stub from ${contactId} (stubType: ${msg.messageStubType}, pushName: ${msg.pushName || 'N/A'}) — no webhook sent.`);
+        } else {
+          logger.warn(`[MESSAGE] Received message from ${contactId} (pushName: ${msg.pushName || 'Unknown'}) but msg.message is null — likely decryption failure (Bad MAC) or empty notification. No webhook sent. msgId=${msg.key.id}`);
+        }
+        return;
+      }
 
       // Unwrap viewOnce/ephemeral wrappers
       const unwrapped = message.ephemeralMessage?.message
@@ -1797,17 +1804,17 @@ class WhatsAppManager {
         messageType = 'order';
       } else if (unwrapped.protocolMessage) {
         // Skip protocol messages (message edits, deletes, etc.)
-        logger.debug(`Protocol message from ${contactId}, skipping webhook`);
+        logger.info(`[MESSAGE] Protocol message from ${contactId} (type: ${unwrapped.protocolMessage.type || 'unknown'}), skipping webhook`);
         return;
       } else {
         const msgTypes = Object.keys(unwrapped);
-        logger.debug(`Unhandled message type from ${contactId}: ${msgTypes.join(', ')}`);
+        logger.info(`[MESSAGE] Unhandled message type from ${contactId}: ${msgTypes.join(', ')}`);
         messageText = `[${msgTypes[0] || 'Unknown'}]`;
         messageType = 'unknown';
       }
 
       if (!messageText && messageType === 'text') {
-        logger.debug(`No message content for ${contactId}, skipping webhook`);
+        logger.warn(`[MESSAGE] Empty text message from ${contactId}, skipping webhook`);
         return;
       }
       if (!messageText) messageText = `[${messageType}]`;
