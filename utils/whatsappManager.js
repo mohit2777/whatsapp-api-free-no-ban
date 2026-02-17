@@ -115,6 +115,12 @@ class WhatsAppManager {
       connectionsTotal: 0,
       reconnections: 0
     };
+
+    // Bidirectional LID ↔ Phone mapping
+    // Keys: LID number (e.g. "110789050532030") → phone number (e.g. "919876543210")
+    // and vice-versa for reverse lookups
+    this.lidToPhone = new Map();
+    this.phoneToLid = new Map();
   }
 
   /**
@@ -285,15 +291,41 @@ class WhatsAppManager {
   }
 
   /**
-   * Get phone number from JID
+   * Register a LID ↔ Phone mapping (bidirectional)
+   */
+  registerLidPhoneMapping(lidJidOrNumber, phoneJidOrNumber) {
+    if (!lidJidOrNumber || !phoneJidOrNumber) return;
+    
+    const lid = String(lidJidOrNumber).split('@')[0];
+    const phone = String(phoneJidOrNumber).split('@')[0];
+    
+    // Don't map a number to itself
+    if (lid === phone) return;
+    // Sanity check: phone numbers are typically 7-15 digits
+    if (!/^\d{7,15}$/.test(phone)) return;
+    
+    if (!this.lidToPhone.has(lid)) {
+      logger.info(`[LID-MAP] Mapped LID ${lid} → phone ${phone}`);
+    }
+    this.lidToPhone.set(lid, phone);
+    this.phoneToLid.set(phone, lid);
+  }
+
+  /**
+   * Get phone number from JID.
+   * Resolves LID → phone using the mapping if available.
    */
   getPhoneNumber(jid) {
     if (!jid) return null;
     
     // Handle LID format (e.g., "110789050532030@lid")
     if (jid.includes('@lid')) {
-      // LID format - return as-is since we can't convert without mapping
-      return jid.split('@')[0];
+      const lidNumber = jid.split('@')[0];
+      // Try to resolve via mapping
+      const phone = this.lidToPhone.get(lidNumber);
+      if (phone) return phone;
+      // Return raw LID number as fallback
+      return lidNumber;
     }
     
     const decoded = jidDecode(jid);
@@ -301,45 +333,114 @@ class WhatsAppManager {
   }
 
   /**
-   * Try to get real phone number from message
-   * Handles both regular JIDs and LID format
+   * Try to get real phone number from message.
+   * Returns { phone, lid, fromJid } with as much info as available.
    */
-  extractSenderPhone(msg, sock) {
+  extractSenderInfo(msg, sock) {
     const remoteJid = msg.key.remoteJid;
+    const isLidFormat = remoteJid?.includes('@lid');
     
     // For group messages, participant contains the actual sender
     if (msg.key.participant) {
-      return this.getPhoneNumber(msg.key.participant);
-    }
-    
-    // Check if it's a LID (Linked ID) format
-    if (remoteJid?.includes('@lid')) {
-      // Try to get from verifiedBizName or pushName context
-      // The LID can be used to reply, but we should try to get real number
+      const participantJid = msg.key.participant;
+      const isParticipantLid = participantJid?.includes('@lid');
+      const number = participantJid.split('@')[0];
       
-      // Check device list cache for mapping
-      const lidNumber = remoteJid.split('@')[0];
-      
-      // Try to find phone number from sock store
-      if (sock?.store?.contacts) {
-        const contact = sock.store.contacts[remoteJid];
-        if (contact?.id && !contact.id.includes('@lid')) {
-          return this.getPhoneNumber(contact.id);
-        }
+      if (isParticipantLid) {
+        const resolvedPhone = this.lidToPhone.get(number) || null;
+        return { phone: resolvedPhone, lid: number, fromJid: participantJid };
+      } else {
+        const decoded = jidDecode(participantJid);
+        const phone = decoded?.user || number;
+        const resolvedLid = this.phoneToLid.get(phone) || null;
+        return { phone, lid: resolvedLid, fromJid: participantJid };
       }
-      
-      // Return LID with a prefix indicator so user knows it's not a phone
-      return lidNumber;
     }
     
-    return this.getPhoneNumber(remoteJid);
+    if (isLidFormat) {
+      const lidNumber = remoteJid.split('@')[0];
+      // Try to resolve via mapping
+      const resolvedPhone = this.lidToPhone.get(lidNumber) || null;
+      return { phone: resolvedPhone, lid: lidNumber, fromJid: remoteJid };
+    }
+    
+    // Standard phone JID
+    const decoded = jidDecode(remoteJid);
+    const phone = decoded?.user || remoteJid?.split('@')[0] || null;
+    const resolvedLid = this.phoneToLid.get(phone) || null;
+    return { phone, lid: resolvedLid, fromJid: remoteJid };
   }
 
   /**
-   * Format phone number to JID
+   * Legacy alias for backward compatibility
+   */
+  extractSenderPhone(msg, sock) {
+    const info = this.extractSenderInfo(msg, sock);
+    return info.phone || info.lid || null;
+  }
+
+  /**
+   * Format phone number to standard WhatsApp JID
    */
   formatJid(phone) {
     const cleaned = phone.replace(/[^0-9]/g, '');
+    return `${cleaned}@s.whatsapp.net`;
+  }
+
+  /**
+   * Resolve a 'to' value to the correct JID for sending.
+   * Supports: phone numbers, LIDs, phone@s.whatsapp.net, lid@lid, group@g.us
+   */
+  async resolveRecipientJid(accountId, to) {
+    if (!to || typeof to !== 'string') {
+      throw new Error('Invalid recipient: must be a non-empty string');
+    }
+    
+    const trimmed = to.trim();
+    
+    // Already has a JID suffix — use as-is
+    if (trimmed.includes('@')) {
+      return trimmed;
+    }
+    
+    // Bare number — need to figure out if it's a phone or LID
+    const cleaned = trimmed.replace(/[^0-9]/g, '');
+    if (!cleaned) {
+      throw new Error('Invalid recipient: no digits found');
+    }
+    
+    // 1. Check if this number is a known LID → resolve to phone JID
+    const phoneFromLid = this.lidToPhone.get(cleaned);
+    if (phoneFromLid) {
+      logger.info(`[RESOLVE] ${cleaned} is a known LID, resolved to phone ${phoneFromLid}`);
+      return `${phoneFromLid}@s.whatsapp.net`;
+    }
+    
+    // 2. Check if this number is a known phone → use standard phone JID
+    if (this.phoneToLid.has(cleaned)) {
+      return `${cleaned}@s.whatsapp.net`;
+    }
+    
+    // 3. Try sock.onWhatsApp() to verify the number and get JID + LID
+    const sock = this.connections.get(accountId);
+    if (sock) {
+      try {
+        const [result] = await sock.onWhatsApp(cleaned) || [];
+        if (result?.exists) {
+          // Register the mapping for future use
+          if (result.lid) {
+            this.registerLidPhoneMapping(result.lid, result.jid);
+          }
+          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${result.jid}`);
+          return result.jid;
+        }
+      } catch (err) {
+        logger.debug(`[RESOLVE] onWhatsApp failed for ${cleaned}: ${err.message}`);
+      }
+    }
+    
+    // 4. Fallback: assume it's a phone number (most common case)
+    logger.info(`[RESOLVE] ${cleaned} not in mapping, assuming phone number`);
     return `${cleaned}@s.whatsapp.net`;
   }
 
@@ -1179,6 +1280,34 @@ class WhatsAppManager {
         }
       }
     });
+
+    // === LID ↔ Phone mapping from contact sync ===
+    // Baileys emits contacts.upsert during app state sync with both
+    // id (phone@s.whatsapp.net) and lid (lid@lid) fields.
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const contact of contacts) {
+        if (contact.id && contact.lid) {
+          this.registerLidPhoneMapping(contact.lid, contact.id);
+        }
+      }
+    });
+
+    sock.ev.on('contacts.update', (contacts) => {
+      for (const contact of contacts) {
+        if (contact.id && contact.lid) {
+          this.registerLidPhoneMapping(contact.lid, contact.id);
+        }
+      }
+    });
+
+    // WhatsApp fires this when a user explicitly shares their phone number
+    // in a LID-based conversation — definitive LID→phone mapping
+    sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+      if (lid && jid) {
+        this.registerLidPhoneMapping(lid, jid);
+        logger.info(`[LID-MAP] Phone number shared: ${lid} → ${jid}`);
+      }
+    });
   }
 
   /**
@@ -1207,9 +1336,27 @@ class WhatsAppManager {
       }, readDelay);
       
       const isLidFormat = remoteJid?.includes('@lid');
-      const senderPhone = this.extractSenderPhone(msg, sock);
+      const senderInfo = this.extractSenderInfo(msg, sock);
+      const senderPhone = senderInfo.phone || senderInfo.lid || null;
       const replyJid = remoteJid;
       const contactId = senderPhone;
+
+      // If sender is a LID and we don't have a phone mapping, try onWhatsApp in background.
+      // This won't help THIS message (it's async), but will populate the map for future messages.
+      if (isLidFormat && !senderInfo.phone && sock) {
+        // Don't await — let it resolve in the background
+        (async () => {
+          try {
+            // Try to resolve via contacts or other means
+            // onWhatsApp takes a phone number, not a LID, so we can't use it here.
+            // But we can check if there's a mapping from contacts sync that we missed.
+            // This is primarily handled by the contacts.upsert event listener.
+            logger.info(`[LID-MAP] No phone mapping for LID ${senderInfo.lid} (pushName: ${msg.pushName || 'Unknown'})`);
+          } catch (e) {
+            // Ignore
+          }
+        })();
+      }
       
       // ====== EXTRACT MESSAGE CONTENT + MEDIA ======
 
@@ -1387,9 +1534,11 @@ class WhatsAppManager {
       // ====== BUILD ENRICHED WEBHOOK PAYLOAD ======
       const webhookPayload = {
         messageId: msg.key.id,
-        from: contactId,
-        fromJid: remoteJid,
-        isLidSender: isLidFormat,
+        from: senderInfo.phone || senderInfo.lid,  // Best identifier: phone if resolved, else LID
+        phone: senderInfo.phone || null,            // Resolved phone number (null if only LID available)
+        lid: senderInfo.lid || null,                // LID identifier (null if only phone available)
+        fromJid: remoteJid,                         // Raw JID from Baileys
+        isLidSender: isLidFormat,                   // Whether the original message used LID format
         message: messageText,
         messageType,
         isGroup,
@@ -1455,6 +1604,7 @@ class WhatsAppManager {
 
   /**
    * Send text message with human-like behavior
+   * Accepts any format: phone number, LID, JID
    */
   async sendMessage(accountId, phone, message) {
     const sock = this.connections.get(accountId);
@@ -1462,7 +1612,8 @@ class WhatsAppManager {
       throw new Error('Account not connected');
     }
 
-    const jid = this.formatJid(phone);
+    // Resolve phone/LID/JID to the correct JID for sending
+    const jid = await this.resolveRecipientJid(accountId, phone);
 
     // Check for duplicate
     if (this.isDuplicateMessage(accountId, jid, message)) {
@@ -1476,10 +1627,10 @@ class WhatsAppManager {
       await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
 
       // Start typing — duration proportional to message length
-      await sock.sendPresenceUpdate('composing', jid);
+      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
       const delay = typingDelay(message.length);
       await new Promise(resolve => setTimeout(resolve, delay));
-      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
 
       // Brief natural pause between typing stop and send
       await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
@@ -1490,22 +1641,24 @@ class WhatsAppManager {
       this.metrics.messagesSent++;
       
       // Save to conversation history
-      await db.addConversationMessage(accountId, phone, 'outgoing', message, 'text');
+      const contactId = this.getPhoneNumber(jid) || phone;
+      await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
       // Go unavailable after sending (like minimizing the window)
       setTimeout(() => {
         sock.sendPresenceUpdate('unavailable').catch(() => {});
       }, humanDelay(2000, 8000));
 
-      logger.info(`Message sent to ${phone}`);
+      logger.info(`Message sent to ${phone} (resolved: ${jid})`);
 
       return {
         success: true,
         messageId: result.key.id,
+        to: jid,
         timestamp: Date.now()
       };
     } catch (error) {
-      logger.error(`Failed to send message to ${phone}:`, error.message);
+      logger.error(`Failed to send message to ${phone} (${jid}):`, error.message);
       throw error;
     }
   }
@@ -1519,8 +1672,11 @@ class WhatsAppManager {
       throw new Error('Account not connected');
     }
 
+    // Resolve the JID (handles LID→phone mapping, bare numbers, etc.)
+    const resolvedJid = await this.resolveRecipientJid(accountId, jid);
+
     // Check for duplicate
-    if (this.isDuplicateMessage(accountId, jid, message)) {
+    if (this.isDuplicateMessage(accountId, resolvedJid, message)) {
       logger.warn(`Duplicate message blocked for ${jid}`);
       throw new Error('Duplicate message detected');
     }
@@ -1531,20 +1687,20 @@ class WhatsAppManager {
       await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
 
       // Typing simulation with human-like duration
-      await sock.sendPresenceUpdate('composing', jid);
+      await sock.sendPresenceUpdate('composing', resolvedJid).catch(() => {});
       const delay = typingDelay(message.length);
       await new Promise(resolve => setTimeout(resolve, delay));
-      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => {});
 
       await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
       // Send message
-      const result = await sock.sendMessage(jid, { text: message });
+      const result = await sock.sendMessage(resolvedJid, { text: message });
 
       this.metrics.messagesSent++;
       
       // Save to conversation history
-      const contactId = this.getPhoneNumber(jid);
+      const contactId = this.getPhoneNumber(resolvedJid);
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
       // Go back to unavailable
@@ -1552,35 +1708,37 @@ class WhatsAppManager {
         sock.sendPresenceUpdate('unavailable').catch(() => {});
       }, humanDelay(2000, 8000));
 
-      logger.info(`Message sent to ${jid}`);
+      logger.info(`Message sent to ${jid} (resolved: ${resolvedJid})`);
 
       return {
         success: true,
         messageId: result.key.id,
+        to: resolvedJid,
         timestamp: Date.now()
       };
     } catch (error) {
-      logger.error(`Failed to send message to ${jid}:`, error.message);
+      logger.error(`Failed to send message to ${jid} (${resolvedJid}):`, error.message);
       throw error;
     }
   }
 
   /**
-   * Send message with auto-detection of phone number vs JID
-   * @param {string} to - Phone number (e.g. "918005780278") or JID (e.g. "110789050532030@lid")
+   * Send message with auto-detection of phone number vs JID.
+   * Now uses resolveRecipientJid for all formats:
+   * - Phone numbers: "918005780278"
+   * - LID numbers: "110789050532030" (auto-resolved via mapping)
+   * - Phone JID: "918005780278@s.whatsapp.net"
+   * - LID JID: "110789050532030@lid"
+   * - Group JID: "120363123456@g.us"
    */
   async sendMessageAuto(accountId, to, message) {
-    // Auto-detect: if it contains '@' it's a JID, otherwise it's a phone number
-    if (to.includes('@')) {
-      return this.sendMessageToJid(accountId, to, message);
-    } else {
-      return this.sendMessage(accountId, to, message);
-    }
+    // resolveRecipientJid handles ALL formats — no need to branch
+    return this.sendMessage(accountId, to, message);
   }
 
   /**
    * Send media message
-   * @param {string} phoneOrJid - Phone number or full JID (including LID format)
+   * @param {string} phoneOrJid - Phone number, LID, or full JID (all formats supported)
    */
   async sendMedia(accountId, phoneOrJid, mediaBuffer, mediaType, caption = '', mimetype = '', filename = '') {
     const sock = this.connections.get(accountId);
@@ -1588,13 +1746,8 @@ class WhatsAppManager {
       throw new Error('Account not connected');
     }
 
-    // Check if it's already a JID or a phone number
-    let jid;
-    if (phoneOrJid.includes('@')) {
-      jid = phoneOrJid; // Already a JID
-    } else {
-      jid = this.formatJid(phoneOrJid); // Convert phone to JID
-    }
+    // Resolve recipient JID (handles phone, LID, JID formats)
+    const jid = await this.resolveRecipientJid(accountId, phoneOrJid);
 
     try {
       // Human-like media send behavior
@@ -1602,9 +1755,9 @@ class WhatsAppManager {
       await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
       
       // Show composing for realistic duration (media takes time to "select")
-      await sock.sendPresenceUpdate('composing', jid);
+      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
       await new Promise(resolve => setTimeout(resolve, humanDelay(1500, 4000)));
-      await sock.sendPresenceUpdate('paused', jid);
+      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
       await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
 
       let messageContent;
