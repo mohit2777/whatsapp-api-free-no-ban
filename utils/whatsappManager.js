@@ -4,7 +4,7 @@
  * No browser/Chromium required - uses WebSocket protocol
  */
 
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers, downloadMediaMessage, getContentType, proto } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers, downloadMediaMessage, getContentType, proto, isJidBroadcast, isJidNewsletter, isJidStatusBroadcast } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
@@ -64,6 +64,34 @@ const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
 // Message retry counter cache
 const msgRetryCounterCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
+
+// ============================================================================
+// MESSAGE STORE FOR RETRY SYSTEM
+// ============================================================================
+// Baileys needs getMessage() to return real message content for its retry
+// mechanism (when WA server requests a message re-send for decryption).
+// Without this, retries fail silently and messages can't be decrypted.
+// We keep a bounded LRU-style cache of recently sent/received messages.
+// ============================================================================
+const MESSAGE_STORE_MAX = 5000;
+const messageStore = new Map(); // key: `${remoteJid}|${msgId}` → proto.Message
+
+function storeMessage(key, message) {
+  if (!key?.id || !message) return;
+  const storeKey = `${key.remoteJid}|${key.id}`;
+  messageStore.set(storeKey, message);
+  // Evict oldest entries when cache grows too large
+  if (messageStore.size > MESSAGE_STORE_MAX) {
+    const firstKey = messageStore.keys().next().value;
+    messageStore.delete(firstKey);
+  }
+}
+
+function getStoredMessage(key) {
+  if (!key?.id) return undefined;
+  const storeKey = `${key.remoteJid}|${key.id}`;
+  return messageStore.get(storeKey);
+}
 
 // Duplicate message prevention
 const recentMessageHashes = new Map();
@@ -347,6 +375,62 @@ class WhatsAppManager {
     }
     this.lidToPhone.set(lid, phone);
     this.phoneToLid.set(phone, lid);
+
+    // Persist mappings to disk asynchronously (fire-and-forget).
+    // Survives restarts so LID resolution works immediately on reconnect.
+    this._saveLidMappingsDebounced();
+  }
+
+  /**
+   * Debounced save of LID mappings to disk (batches rapid updates)
+   */
+  _saveLidMappingsDebounced() {
+    if (this._lidSaveTimer) clearTimeout(this._lidSaveTimer);
+    this._lidSaveTimer = setTimeout(() => this._persistLidMappings(), 5000);
+  }
+
+  /**
+   * Write LID mappings to a JSON file in the auth_states directory
+   */
+  async _persistLidMappings() {
+    try {
+      const data = {};
+      for (const [lid, phone] of this.lidToPhone) {
+        data[lid] = phone;
+      }
+      const filePath = path.join(AUTH_STATES_DIR, 'lid_mappings.json');
+      await fs.writeFile(filePath, JSON.stringify(data), 'utf8');
+      logger.debug(`[LID-MAP] Persisted ${Object.keys(data).length} LID mappings to disk`);
+    } catch (err) {
+      logger.warn(`[LID-MAP] Failed to persist LID mappings: ${err.message}`);
+    }
+  }
+
+  /**
+   * Load persisted LID mappings from disk (called on startup)
+   */
+  async _loadLidMappings() {
+    try {
+      const filePath = path.join(AUTH_STATES_DIR, 'lid_mappings.json');
+      const raw = await fs.readFile(filePath, 'utf8');
+      const data = JSON.parse(raw);
+      let count = 0;
+      for (const [lid, phone] of Object.entries(data)) {
+        if (!this.lidToPhone.has(lid)) {
+          this.lidToPhone.set(lid, phone);
+          this.phoneToLid.set(phone, lid);
+          count++;
+        }
+      }
+      if (count > 0) {
+        logger.info(`[LID-MAP] Loaded ${count} persisted LID mappings from disk`);
+      }
+    } catch (err) {
+      // File doesn't exist yet on first run, that's fine
+      if (err.code !== 'ENOENT') {
+        logger.warn(`[LID-MAP] Failed to load LID mappings: ${err.message}`);
+      }
+    }
   }
 
   /**
@@ -553,6 +637,9 @@ class WhatsAppManager {
    */
   async initializeAccounts() {
     try {
+      // Load persisted LID mappings before connecting accounts
+      await this._loadLidMappings();
+
       const accounts = await db.getAccounts();
       const toConnect = accounts.filter(a => a.status === 'ready' || a.session_data);
       logger.info(`Found ${accounts.length} accounts, ${toConnect.length} to initialize`);
@@ -571,9 +658,90 @@ class WhatsAppManager {
           await new Promise(resolve => setTimeout(resolve, staggerDelay));
         }
       }
+
+      // Start periodic health monitor after all accounts initialized
+      this._startHealthMonitor();
     } catch (error) {
       logger.error('Failed to initialize accounts:', error.message);
     }
+  }
+
+  // ============================================================================
+  // CONNECTION HEALTH MONITOR
+  // ============================================================================
+  // Periodically checks all accounts that should be connected.
+  // If an account is stuck in 'reconnecting' for too long or the socket
+  // appears dead, forces a fresh reconnection.
+  // ============================================================================
+  _startHealthMonitor() {
+    // Run every 5 minutes
+    const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
+    // Max time an account can be in 'reconnecting' state before forced action
+    const MAX_RECONNECTING_MS = 10 * 60 * 1000;
+
+    this._healthMonitorInterval = setInterval(async () => {
+      if (this.isShuttingDown) return;
+
+      try {
+        const accounts = await db.getAccounts();
+        const now = Date.now();
+
+        for (const account of accounts) {
+          if (this.deletedAccounts.has(account.id)) continue;
+          if (this.isShuttingDown) break;
+
+          const state = this.connectionStates.get(account.id);
+          const sock = this.connections.get(account.id);
+          const hasSession = !!account.session_data;
+
+          // Skip accounts without sessions (not yet authenticated)
+          if (!hasSession) continue;
+
+          // Case 1: Account should be connected but has no socket and no pending reconnect
+          if (!sock && !this.reconnectTimers.has(account.id) && !this.connectionLocks.has(account.id)) {
+            const stateStatus = state?.status;
+            if (stateStatus !== 'qr_ready' && stateStatus !== 'initializing') {
+              logger.warn(`[HEALTH] Account ${account.id} has no active connection, triggering reconnect`);
+              this.scheduleReconnect(account.id, humanDelay(5000, 15000));
+            }
+          }
+
+          // Case 2: Account stuck in 'reconnecting' state for too long
+          if (state?.status === 'reconnecting') {
+            const lastAttempt = this.lastConnectionAttempt.get(account.id) || 0;
+            if (now - lastAttempt > MAX_RECONNECTING_MS) {
+              logger.warn(`[HEALTH] Account ${account.id} stuck in reconnecting for ${Math.round((now - lastAttempt) / 60000)}min, forcing reconnect`);
+              // Reset counters and force reconnect
+              this.reconnectAttempts.delete(account.id);
+              this.connectionLocks.delete(account.id);
+              const timer = this.reconnectTimers.get(account.id);
+              if (timer) {
+                clearTimeout(timer);
+                this.reconnectTimers.delete(account.id);
+              }
+              this.scheduleReconnect(account.id, humanDelay(3000, 8000));
+            }
+          }
+
+          // Case 3: Account in 'error' state with a session — try self-healing
+          if (state?.status === 'error' && hasSession) {
+            const attempts = this.reconnectAttempts.get(account.id) || 0;
+            // Only auto-heal if we haven't exceeded max attempts recently
+            if (attempts < this.maxReconnectAttempts) {
+              logger.info(`[HEALTH] Account ${account.id} in error state with valid session, attempting recovery`);
+              this.reconnectAttempts.set(account.id, attempts + 1);
+              this.scheduleReconnect(account.id, humanDelay(30000, 60000));
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(`[HEALTH] Health monitor error: ${err.message}`);
+      }
+    }, HEALTH_CHECK_INTERVAL);
+
+    // Don't prevent process exit
+    this._healthMonitorInterval.unref?.();
+    logger.info('[HEALTH] Connection health monitor started (5 min interval)');
   }
 
   /**
@@ -835,9 +1003,47 @@ class WhatsAppManager {
         syncFullHistory: false,
         // Don't immediately set online — real WhatsApp Web does this lazily
         markOnlineOnConnect: false,
+
+        // ── getMessage: CRITICAL for message retry system ──
+        // When WA server can't decrypt a message, it asks the client to
+        // re-send the original message content. Without this, the retry
+        // fails silently, causing Bad MAC errors and lost messages.
         getMessage: async (key) => {
+          const stored = getStoredMessage(key);
+          if (stored) {
+            logger.debug(`[RETRY] Found stored message for retry: ${key.id}`);
+            return stored;
+          }
+          logger.debug(`[RETRY] No stored message found for ${key.id}, returning empty`);
           return { conversation: '' };
         },
+
+        // ── shouldIgnoreJid: reduces Bad MAC / session noise ──
+        // Skip broadcast, newsletter, status, and meta AI JIDs.
+        // These JIDs generate signal sessions that are rarely needed
+        // and are a major source of Bad MAC / decrypt errors.
+        shouldIgnoreJid: (jid) => {
+          return isJidBroadcast(jid)
+            || isJidNewsletter(jid)
+            || isJidStatusBroadcast(jid)
+            || jid?.endsWith('@bot');  // Meta AI bots
+        },
+
+        // ── shouldSyncHistoryMessage: allow critical sync types ──
+        // Baileys warns: "DISABLING ALL SYNC PREVENTS BAILEYS FROM
+        // ACCESSING INITIAL LID MAPPINGS". We allow INITIAL_BOOTSTRAP
+        // and PUSH_NAME to get LID mappings on first connection.
+        shouldSyncHistoryMessage: (msg) => {
+          // Always sync these types for LID mapping population
+          const syncType = msg.syncType;
+          const allowedTypes = [
+            proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
+            proto.HistorySync.HistorySyncType.PUSH_NAME,
+            proto.HistorySync.HistorySyncType.RECENT,
+          ];
+          return allowedTypes.includes(syncType);
+        },
+
         msgRetryCounterCache,
         linkPreviewImageThumbnailWidth: 0,
         qrTimeout: 40000,
@@ -1318,8 +1524,17 @@ class WhatsAppManager {
     // Incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       logger.debug(`messages.upsert event: type=${type}, count=${messages.length}`);
-      
-      // Handle both 'notify' (new messages) and 'append' (history sync)
+
+      // Store ALL messages (including history) in cache for retry system.
+      // This is critical: when WA server asks us to re-send a message for
+      // decryption, getMessage() looks up the stored content.
+      for (const msg of messages) {
+        if (msg.key && msg.message) {
+          storeMessage(msg.key, msg.message);
+        }
+      }
+
+      // Only process 'notify' type for webhook dispatch (not history sync)
       if (type !== 'notify') {
         logger.debug(`Ignoring messages.upsert with type: ${type}`);
         return;
@@ -1381,6 +1596,40 @@ class WhatsAppManager {
       if (lid && jid) {
         this.registerLidPhoneMapping(lid, jid);
         logger.info(`[LID-MAP] Phone number shared: ${lid} → ${jid}`);
+      }
+    });
+
+    // ── History sync: bulk LID mapping population ──
+    // On first connection (or reconnect), Baileys syncs history including
+    // contacts with both phone JID and LID. This is the primary source
+    // of LID→phone mappings. Without this, most LIDs stay unresolved.
+    sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
+      let mappedCount = 0;
+
+      // Extract LID mappings from synced contacts
+      if (contacts?.length) {
+        for (const contact of contacts) {
+          if (contact.id && contact.lid) {
+            this.registerLidPhoneMapping(contact.lid, contact.id);
+            mappedCount++;
+          }
+        }
+      }
+
+      // Store synced messages in the message store for retry system
+      if (messages?.length) {
+        for (const msg of messages) {
+          if (msg.key && msg.message) {
+            storeMessage(msg.key, msg.message);
+          }
+        }
+      }
+
+      if (mappedCount > 0) {
+        logger.info(`[HISTORY-SYNC] Registered ${mappedCount} LID→phone mappings from history sync`);
+      }
+      if (messages?.length) {
+        logger.debug(`[HISTORY-SYNC] Stored ${messages.length} messages for retry cache`);
       }
     });
   }
@@ -1713,6 +1962,9 @@ class WhatsAppManager {
       // Send message
       const result = await sock.sendMessage(jid, { text: message });
 
+      // Store sent message for retry system
+      if (result?.key && result?.message) storeMessage(result.key, result.message);
+
       this.metrics.messagesSent++;
       
       // Save to conversation history
@@ -1772,6 +2024,9 @@ class WhatsAppManager {
 
       // Send message
       const result = await sock.sendMessage(resolvedJid, { text: message });
+
+      // Store sent message for retry system
+      if (result?.key && result?.message) storeMessage(result.key, result.message);
 
       this.metrics.messagesSent++;
       
@@ -1874,6 +2129,9 @@ class WhatsAppManager {
 
       const result = await sock.sendMessage(jid, messageContent);
 
+      // Store sent message for retry system
+      if (result?.key && result?.message) storeMessage(result.key, result.message);
+
       this.metrics.messagesSent++;
       logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
 
@@ -1933,9 +2191,14 @@ class WhatsAppManager {
       return;
     }
 
-    // Prevent concurrent saves (creds.update fires rapidly)
+    // Prevent concurrent saves but queue a follow-up if one is pending.
+    // creds.update fires rapidly during key exchanges — dropping saves
+    // causes Signal pre-key desync which leads to Bad MAC errors.
     if (this.sessionSaveLocks.has(accountId)) {
-      logger.debug(`Session save already in progress for ${accountId}, skipping`);
+      // Mark that another save is needed after the current one finishes
+      if (!this._pendingSessionSaves) this._pendingSessionSaves = new Set();
+      this._pendingSessionSaves.add(accountId);
+      logger.debug(`Session save queued for ${accountId} (one already in progress)`);
       return;
     }
 
@@ -2000,6 +2263,14 @@ class WhatsAppManager {
       logger.error(`Failed to save session for account ${accountId}:`, error.message);
     } finally {
       this.sessionSaveLocks.delete(accountId);
+
+      // Process any queued save that arrived while we were saving
+      if (this._pendingSessionSaves?.has(accountId)) {
+        this._pendingSessionSaves.delete(accountId);
+        logger.debug(`Processing queued session save for ${accountId}`);
+        // Use setImmediate to avoid deep recursion
+        setImmediate(() => this.saveSession(accountId));
+      }
     }
   }
 
@@ -2198,6 +2469,12 @@ class WhatsAppManager {
     
     // Set shutdown flag to prevent reconnection attempts
     this.isShuttingDown = true;
+
+    // Stop health monitor
+    if (this._healthMonitorInterval) {
+      clearInterval(this._healthMonitorInterval);
+      this._healthMonitorInterval = null;
+    }
     
     // Cancel all pending reconnection timers
     for (const [accountId, timer] of this.reconnectTimers) {
@@ -2211,6 +2488,9 @@ class WhatsAppManager {
       clearTimeout(watchdog);
     }
     this.connectionWatchdogs.clear();
+
+    // Persist LID mappings one last time
+    await this._persistLidMappings();
     
     // Disconnect all accounts gracefully
     for (const [accountId, sock] of this.connections) {
