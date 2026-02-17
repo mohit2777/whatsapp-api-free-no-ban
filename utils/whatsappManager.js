@@ -534,6 +534,9 @@ class WhatsAppManager {
 
   /**
    * Resolve a 'to' value to the correct JID for sending.
+   * CRITICAL: Must send to the SAME JID format as the active conversation.
+   * If the conversation is on @lid, sending to @s.whatsapp.net will corrupt
+   * the Signal encryption session and cause CIPHERTEXT failures.
    * Supports: phone numbers, LIDs, phone@s.whatsapp.net, lid@lid, group@g.us
    */
   async resolveRecipientJid(accountId, to) {
@@ -543,61 +546,33 @@ class WhatsAppManager {
     
     const trimmed = to.trim();
     
-    // Already has a JID suffix
+    // Already has a JID suffix — use as-is (user explicitly chose the format)
     if (trimmed.includes('@')) {
-      // If it's a @lid JID, try to resolve to phone JID
-      // (both work in Baileys, but phone JID is more universally compatible)
-      if (trimmed.includes('@lid')) {
-        const lidNumber = trimmed.split('@')[0];
-        
-        // 1. Check in-memory mapping first
-        const phoneFromLid = this.lidToPhone.get(lidNumber);
-        if (phoneFromLid) {
-          logger.info(`[RESOLVE] Resolved ${trimmed} → ${phoneFromLid}@s.whatsapp.net via LID mapping`);
-          return `${phoneFromLid}@s.whatsapp.net`;
-        }
-        
-        // 2. If no mapping, try onWhatsApp with the LID number
-        //    (sometimes returns phone JID even when input is a LID number)
-        const sock = this.connections.get(accountId);
-        if (sock) {
-          try {
-            const [result] = await sock.onWhatsApp(lidNumber) || [];
-            if (result?.exists && result.jid) {
-              // Got a phone JID back — register mapping for future use
-              if (result.lid) {
-                this.registerLidPhoneMapping(result.lid, result.jid);
-              }
-              logger.info(`[RESOLVE] Resolved ${trimmed} → ${result.jid} via onWhatsApp lookup`);
-              return result.jid;
-            }
-          } catch (err) {
-            logger.debug(`[RESOLVE] onWhatsApp lookup failed for LID ${lidNumber}: ${err.message}`);
-          }
-        }
-        
-        // 3. Fall through — send to @lid JID as-is (Baileys supports it)
-        logger.info(`[RESOLVE] No phone mapping for ${trimmed}, sending to LID JID directly`);
-      }
       return trimmed;
     }
     
-    // Bare number — need to figure out if it's a phone or LID
+    // Bare number — need to figure out the correct JID format
     const cleaned = trimmed.replace(/[^0-9]/g, '');
     if (!cleaned) {
       throw new Error('Invalid recipient: no digits found');
     }
     
-    // 1. Check if this number is a known LID → resolve to phone JID
+    // 1. Check if this number is a known LID number → send to LID JID
+    //    (the input IS a LID number, resolve to phone for sending)
     const phoneFromLid = this.lidToPhone.get(cleaned);
     if (phoneFromLid) {
-      logger.info(`[RESOLVE] ${cleaned} is a known LID, resolved to phone ${phoneFromLid}`);
-      return `${phoneFromLid}@s.whatsapp.net`;
+      // This number is a LID. Check if the phone has an active LID conversation
+      // Send to LID JID to preserve Signal session integrity
+      logger.info(`[RESOLVE] ${cleaned} is a known LID → phone ${phoneFromLid}, sending to LID JID to preserve Signal session`);
+      return `${cleaned}@lid`;
     }
     
-    // 2. Check if this number is a known phone → use standard phone JID
-    if (this.phoneToLid.has(cleaned)) {
-      return `${cleaned}@s.whatsapp.net`;
+    // 2. Check if this is a phone number with a known LID mapping
+    //    → send to LID JID because WhatsApp migrated this conversation to LID
+    const lidFromPhone = this.phoneToLid.get(cleaned);
+    if (lidFromPhone) {
+      logger.info(`[RESOLVE] Phone ${cleaned} has LID mapping ${lidFromPhone}, sending to LID JID to preserve Signal session`);
+      return `${lidFromPhone}@lid`;
     }
     
     // 3. Try sock.onWhatsApp() to verify the number and get JID + LID
@@ -609,8 +584,11 @@ class WhatsAppManager {
           // Register the mapping for future use
           if (result.lid) {
             this.registerLidPhoneMapping(result.lid, result.jid);
+            // If WhatsApp tells us there's a LID, use it to preserve session
+            logger.info(`[RESOLVE] ${cleaned} verified → jid: ${result.jid}, lid: ${result.lid}, using LID JID`);
+            return result.lid;
           }
-          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${result.jid}`);
+          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${result.jid} (no LID)`);
           return result.jid;
         }
       } catch (err) {
@@ -1978,9 +1956,6 @@ class WhatsAppManager {
         messageId: msg.key.id,
         from: senderInfo.phone || senderInfo.lid,  // Best identifier: phone if resolved, else LID
         phone: senderInfo.phone || null,            // Resolved phone number (null if only LID available)
-        lid: senderInfo.lid || null,                // LID identifier (null if only phone available)
-        fromJid: remoteJid,                         // Raw JID from Baileys
-        isLidSender: isLidFormat,                   // Whether the original message used LID format
         message: messageText,
         messageType,
         isGroup,
@@ -1996,6 +1971,8 @@ class WhatsAppManager {
         const participantPnJid = msg.key.participantPn;
         const participantPnPhone = participantPnJid ? participantPnJid.split('@')[0] : null;
         webhookPayload.participantPhone = participantPnPhone || (msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null);
+        // For group replies, include group JID so n8n can send to the group
+        webhookPayload.replyTo = remoteJid;
       }
 
       // Add media data when available
