@@ -1783,6 +1783,11 @@ class WhatsAppManager {
           try {
             await sock.assertSessions([remoteJid], true);
             logger.info(`[MESSAGE] Signal session reset for ${remoteJid} — next message should decrypt OK`);
+            // Save session to DB immediately after Signal session reset.
+            // Without this, if the server restarts, the old corrupt session
+            // is restored from DB and CIPHERTEXT errors return.
+            await this.saveSession(accountId);
+            logger.debug(`[MESSAGE] Session saved to DB after Signal session reset for ${remoteJid}`);
           } catch (sessErr) {
             logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
           }
@@ -2066,8 +2071,16 @@ class WhatsAppManager {
       this.metrics.messagesSent++;
       
       // Save to conversation history
+      // Always resolve to phone number for consistent conversation tracking
       const contactId = this.getPhoneNumber(jid) || phone;
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+
+      // Save session to DB after sending — sock.sendMessage() updates Signal
+      // pre-keys and session state internally. If we don't persist these,
+      // a server restart restores stale pre-keys → Bad MAC on next message.
+      this.saveSession(accountId).catch(e => 
+        logger.debug(`Post-send session save failed: ${e.message}`)
+      );
 
       // Go unavailable after sending (like minimizing the window)
       setTimeout(() => {
@@ -2129,8 +2142,13 @@ class WhatsAppManager {
       this.metrics.messagesSent++;
       
       // Save to conversation history
-      const contactId = this.getPhoneNumber(resolvedJid);
+      const contactId = this.getPhoneNumber(resolvedJid) || jid.split('@')[0];
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+
+      // Save session to DB after sending — Signal pre-keys update on every send
+      this.saveSession(accountId).catch(e => 
+        logger.debug(`Post-send session save failed: ${e.message}`)
+      );
 
       // Go back to unavailable
       setTimeout(() => {
@@ -2232,6 +2250,11 @@ class WhatsAppManager {
 
       this.metrics.messagesSent++;
       logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
+
+      // Save session to DB after sending — Signal pre-keys update on every send
+      this.saveSession(accountId).catch(e => 
+        logger.debug(`Post-send session save failed: ${e.message}`)
+      );
 
       // Go back to unavailable after media send
       setTimeout(() => {
