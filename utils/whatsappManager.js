@@ -1675,26 +1675,64 @@ class WhatsAppManager {
       
       const isLidFormat = remoteJid?.includes('@lid');
       const senderInfo = this.extractSenderInfo(msg, sock);
+
+      // If sender is a LID and we don't have a phone mapping, actively try to resolve it
+      // BEFORE building the webhook payload so the current message gets the phone number.
+      if (isLidFormat && !senderInfo.phone && sock) {
+        const lidNumber = senderInfo.lid;
+        logger.info(`[LID-MAP] No phone mapping for LID ${lidNumber} (pushName: ${msg.pushName || 'Unknown'}), attempting resolution...`);
+
+        // Strategy 1: Try onWhatsApp() with the LID number (sometimes returns phone JID)
+        try {
+          const onWhatsAppPromise = sock.onWhatsApp(lidNumber);
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('onWhatsApp timeout')), 5000)
+          );
+          const [result] = await Promise.race([onWhatsAppPromise, timeoutPromise]) || [];
+          if (result?.exists && result.jid && result.jid.includes('@s.whatsapp.net')) {
+            const resolvedPhone = result.jid.split('@')[0];
+            this.registerLidPhoneMapping(lidNumber, resolvedPhone);
+            senderInfo.phone = resolvedPhone;
+            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via onWhatsApp()`);
+          }
+        } catch (err) {
+          logger.debug(`[LID-MAP] onWhatsApp() resolution failed for ${lidNumber}: ${err.message}`);
+        }
+
+        // Strategy 2: Check Baileys store contacts for this LID
+        if (!senderInfo.phone && sock.store?.contacts) {
+          const lidJid = `${lidNumber}@lid`;
+          const contact = sock.store.contacts[lidJid];
+          if (contact?.id && contact.id.includes('@s.whatsapp.net')) {
+            const resolvedPhone = contact.id.split('@')[0];
+            this.registerLidPhoneMapping(lidNumber, resolvedPhone);
+            senderInfo.phone = resolvedPhone;
+            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via store contacts`);
+          }
+        }
+
+        // Strategy 3: Check if the message proto itself has a verifiedBizName or number field
+        if (!senderInfo.phone) {
+          // Check if participant in a non-group message key leaks phone number
+          const keyParticipant = msg.key?.participant;
+          if (keyParticipant && keyParticipant.includes('@s.whatsapp.net')) {
+            const resolvedPhone = keyParticipant.split('@')[0];
+            if (/^\d{7,15}$/.test(resolvedPhone)) {
+              this.registerLidPhoneMapping(lidNumber, resolvedPhone);
+              senderInfo.phone = resolvedPhone;
+              logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via message key participant`);
+            }
+          }
+        }
+
+        if (!senderInfo.phone) {
+          logger.warn(`[LID-MAP] Could not resolve phone for LID ${lidNumber} — phone will be null in webhook payload`);
+        }
+      }
+
       const senderPhone = senderInfo.phone || senderInfo.lid || null;
       const replyJid = remoteJid;
       const contactId = senderPhone;
-
-      // If sender is a LID and we don't have a phone mapping, try onWhatsApp in background.
-      // This won't help THIS message (it's async), but will populate the map for future messages.
-      if (isLidFormat && !senderInfo.phone && sock) {
-        // Don't await — let it resolve in the background
-        (async () => {
-          try {
-            // Try to resolve via contacts or other means
-            // onWhatsApp takes a phone number, not a LID, so we can't use it here.
-            // But we can check if there's a mapping from contacts sync that we missed.
-            // This is primarily handled by the contacts.upsert event listener.
-            logger.info(`[LID-MAP] No phone mapping for LID ${senderInfo.lid} (pushName: ${msg.pushName || 'Unknown'})`);
-          } catch (e) {
-            // Ignore
-          }
-        })();
-      }
       
       // ====== EXTRACT MESSAGE CONTENT + MEDIA ======
 
