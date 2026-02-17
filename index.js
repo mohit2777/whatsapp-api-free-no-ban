@@ -693,6 +693,28 @@ async function start() {
     server.listen(PORT, () => {
       logger.info(`🚀 WhatsApp Multi-Automation API running on port ${PORT}`);
       logger.info(`📊 Dashboard: http://localhost:${PORT}/dashboard`);
+
+      // Self-ping keep-alive: prevents Render free tier from spinning down
+      // after 15 minutes of inactivity (which kills WhatsApp connections).
+      // Pings every 13 minutes so the service stays warm continuously.
+      const KEEP_ALIVE_INTERVAL = 13 * 60 * 1000; // 13 minutes
+      setInterval(async () => {
+        try {
+          const url = process.env.RENDER_EXTERNAL_URL
+            ? `${process.env.RENDER_EXTERNAL_URL}/keepalive`
+            : `http://localhost:${PORT}/keepalive`;
+          const http = require(url.startsWith('https') ? 'https' : 'http');
+          http.get(url, (res) => {
+            res.resume(); // consume response to free memory
+            logger.debug(`Keep-alive ping OK (status ${res.statusCode})`);
+          }).on('error', (err) => {
+            logger.debug(`Keep-alive ping failed: ${err.message}`);
+          });
+        } catch (e) {
+          logger.debug(`Keep-alive error: ${e.message}`);
+        }
+      }, KEEP_ALIVE_INTERVAL).unref();
+      logger.info(`🔄 Keep-alive self-ping enabled (every ${KEEP_ALIVE_INTERVAL / 60000} min)`);
     });
   } catch (error) {
     logger.error('Failed to start server:', error);

@@ -19,6 +19,44 @@ const webhookDeliveryService = require('./webhookDeliveryService');
 const aiAutoReply = require('./aiAutoReply');
 
 // ============================================================================
+// SUPPRESS LIBSIGNAL CONSOLE SPAM
+// ============================================================================
+// libsignal's session_record.js and session_cipher.js use raw console.info/
+// console.error to dump full session objects (including crypto keys) and
+// decryption errors. This is a security risk (leaks key material to logs)
+// and creates excessive noise. Intercept and redirect to our logger.
+// ============================================================================
+
+const _origConsoleInfo = console.info;
+const _origConsoleError = console.error;
+
+console.info = function (...args) {
+  // Suppress libsignal session dumps: "Closing session:", "Opening session:"
+  if (typeof args[0] === 'string' && /^(Closing|Opening) session/i.test(args[0])) {
+    return; // silently drop — contains raw crypto keys
+  }
+  _origConsoleInfo.apply(console, args);
+};
+
+console.error = function (...args) {
+  // Suppress libsignal decrypt failures: "Failed to decrypt message...", "Session error:"
+  if (typeof args[0] === 'string' && /^(Failed to decrypt message|Session error)/i.test(args[0])) {
+    logger.debug(`[SIGNAL] ${args[0]}`);
+    return;
+  }
+  _origConsoleError.apply(console, args);
+};
+
+console.warn = (function (origWarn) {
+  return function (...args) {
+    if (typeof args[0] === 'string' && /^Session already (closed|open)/i.test(args[0])) {
+      return;
+    }
+    origWarn.apply(console, args);
+  };
+})(console.warn);
+
+// ============================================================================
 // CONFIGURATION
 // ============================================================================
 
@@ -400,15 +438,39 @@ class WhatsAppManager {
     
     // Already has a JID suffix
     if (trimmed.includes('@')) {
-      // If it's a @lid JID and we know the phone number, prefer phone JID
+      // If it's a @lid JID, try to resolve to phone JID
       // (both work in Baileys, but phone JID is more universally compatible)
       if (trimmed.includes('@lid')) {
         const lidNumber = trimmed.split('@')[0];
+        
+        // 1. Check in-memory mapping first
         const phoneFromLid = this.lidToPhone.get(lidNumber);
         if (phoneFromLid) {
           logger.info(`[RESOLVE] Resolved ${trimmed} → ${phoneFromLid}@s.whatsapp.net via LID mapping`);
           return `${phoneFromLid}@s.whatsapp.net`;
         }
+        
+        // 2. If no mapping, try onWhatsApp with the LID number
+        //    (sometimes returns phone JID even when input is a LID number)
+        const sock = this.connections.get(accountId);
+        if (sock) {
+          try {
+            const [result] = await sock.onWhatsApp(lidNumber) || [];
+            if (result?.exists && result.jid) {
+              // Got a phone JID back — register mapping for future use
+              if (result.lid) {
+                this.registerLidPhoneMapping(result.lid, result.jid);
+              }
+              logger.info(`[RESOLVE] Resolved ${trimmed} → ${result.jid} via onWhatsApp lookup`);
+              return result.jid;
+            }
+          } catch (err) {
+            logger.debug(`[RESOLVE] onWhatsApp lookup failed for LID ${lidNumber}: ${err.message}`);
+          }
+        }
+        
+        // 3. Fall through — send to @lid JID as-is (Baileys supports it)
+        logger.info(`[RESOLVE] No phone mapping for ${trimmed}, sending to LID JID directly`);
       }
       return trimmed;
     }
