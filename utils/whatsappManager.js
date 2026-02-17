@@ -461,6 +461,26 @@ class WhatsAppManager {
   extractSenderInfo(msg, sock) {
     const remoteJid = msg.key.remoteJid;
     const isLidFormat = remoteJid?.includes('@lid');
+
+    // ── msg.key.senderPn / participantPn: WhatsApp sends the actual phone ──
+    // These fields are populated by the WhatsApp server on every message stanza
+    // and are the most reliable source of phone→LID mapping.
+    const senderPn = msg.key.senderPn;   // phone JID of sender (e.g. 919876543210@s.whatsapp.net)
+    const senderLid = msg.key.senderLid; // LID JID of sender
+    const participantPn = msg.key.participantPn; // phone JID of group participant
+    const participantLid = msg.key.participantLid; // LID JID of group participant
+
+    // Register any LID↔phone mapping we can extract from the message key
+    if (senderPn && senderLid) {
+      this.registerLidPhoneMapping(senderLid, senderPn);
+    }
+    if (participantPn && participantLid) {
+      this.registerLidPhoneMapping(participantLid, participantPn);
+    }
+    // Also cross-register senderPn with remoteJid if it's a LID
+    if (senderPn && isLidFormat) {
+      this.registerLidPhoneMapping(remoteJid, senderPn);
+    }
     
     // For group messages, participant contains the actual sender
     if (msg.key.participant) {
@@ -469,7 +489,9 @@ class WhatsAppManager {
       const number = participantJid.split('@')[0];
       
       if (isParticipantLid) {
-        const resolvedPhone = this.lidToPhone.get(number) || null;
+        // Try participantPn first (direct from WhatsApp), then cached mapping
+        const pnPhone = participantPn ? participantPn.split('@')[0] : null;
+        const resolvedPhone = pnPhone || this.lidToPhone.get(number) || null;
         return { phone: resolvedPhone, lid: number, fromJid: participantJid };
       } else {
         const decoded = jidDecode(participantJid);
@@ -481,8 +503,9 @@ class WhatsAppManager {
     
     if (isLidFormat) {
       const lidNumber = remoteJid.split('@')[0];
-      // Try to resolve via mapping
-      const resolvedPhone = this.lidToPhone.get(lidNumber) || null;
+      // Try senderPn first (direct from WhatsApp), then cached mapping
+      const pnPhone = senderPn ? senderPn.split('@')[0] : null;
+      const resolvedPhone = pnPhone || this.lidToPhone.get(lidNumber) || null;
       return { phone: resolvedPhone, lid: lidNumber, fromJid: remoteJid };
     }
     
@@ -1588,18 +1611,23 @@ class WhatsAppManager {
     // === LID ↔ Phone mapping from contact sync ===
     // Baileys emits contacts.upsert during app state sync with both
     // id (phone@s.whatsapp.net) and lid (lid@lid) fields.
+    // Contact objects also have a 'jid' field (phone format) separate from 'id'.
     sock.ev.on('contacts.upsert', (contacts) => {
       for (const contact of contacts) {
-        if (contact.id && contact.lid) {
-          this.registerLidPhoneMapping(contact.lid, contact.id);
+        const phoneJid = contact.jid || (contact.id?.includes('@s.whatsapp.net') ? contact.id : null);
+        const lidJid = contact.lid || (contact.id?.includes('@lid') ? contact.id : null);
+        if (phoneJid && lidJid) {
+          this.registerLidPhoneMapping(lidJid, phoneJid);
         }
       }
     });
 
     sock.ev.on('contacts.update', (contacts) => {
       for (const contact of contacts) {
-        if (contact.id && contact.lid) {
-          this.registerLidPhoneMapping(contact.lid, contact.id);
+        const phoneJid = contact.jid || (contact.id?.includes('@s.whatsapp.net') ? contact.id : null);
+        const lidJid = contact.lid || (contact.id?.includes('@lid') ? contact.id : null);
+        if (phoneJid && lidJid) {
+          this.registerLidPhoneMapping(lidJid, phoneJid);
         }
       }
     });
@@ -1617,30 +1645,54 @@ class WhatsAppManager {
     // On first connection (or reconnect), Baileys syncs history including
     // contacts with both phone JID and LID. This is the primary source
     // of LID→phone mappings. Without this, most LIDs stay unresolved.
-    sock.ev.on('messaging-history.set', ({ contacts, messages }) => {
+    sock.ev.on('messaging-history.set', ({ contacts, messages, chats }) => {
       let mappedCount = 0;
 
       // Extract LID mappings from synced contacts
       if (contacts?.length) {
         for (const contact of contacts) {
-          if (contact.id && contact.lid) {
+          // Contact objects have: id, lid, jid fields
+          // 'jid' is the phone format, 'lid' is the anonymous format
+          if (contact.lid && contact.jid) {
+            this.registerLidPhoneMapping(contact.lid, contact.jid);
+            mappedCount++;
+          } else if (contact.id && contact.lid) {
             this.registerLidPhoneMapping(contact.lid, contact.id);
             mappedCount++;
           }
         }
       }
 
+      // Extract LID↔phone mappings from synced chats
+      // Chat objects (proto.IConversation) have pnJid (phone) and lidJid (LID)
+      if (chats?.length) {
+        for (const chat of chats) {
+          if (chat.pnJid && chat.lidJid) {
+            this.registerLidPhoneMapping(chat.lidJid, chat.pnJid);
+            mappedCount++;
+          } else if (chat.lid && chat.id && chat.id.includes('@s.whatsapp.net')) {
+            this.registerLidPhoneMapping(chat.lid, chat.id);
+            mappedCount++;
+          }
+        }
+      }
+
       // Store synced messages in the message store for retry system
+      // Also extract LID mappings from message keys (senderPn/senderLid)
       if (messages?.length) {
         for (const msg of messages) {
           if (msg.key && msg.message) {
             storeMessage(msg.key, msg.message);
           }
+          // Extract LID↔phone from message key metadata
+          if (msg.key?.senderPn && msg.key?.senderLid) {
+            this.registerLidPhoneMapping(msg.key.senderLid, msg.key.senderPn);
+          }
         }
       }
 
       if (mappedCount > 0) {
-        logger.info(`[HISTORY-SYNC] Registered ${mappedCount} LID→phone mappings from history sync`);
+        logger.info(`[HISTORY-SYNC] Registered ${mappedCount} LID→phone mappings from history sync (contacts + chats)`);
       }
       if (messages?.length) {
         logger.debug(`[HISTORY-SYNC] Stored ${messages.length} messages for retry cache`);
@@ -1676,52 +1728,45 @@ class WhatsAppManager {
       const isLidFormat = remoteJid?.includes('@lid');
       const senderInfo = this.extractSenderInfo(msg, sock);
 
-      // If sender is a LID and we don't have a phone mapping, actively try to resolve it
-      // BEFORE building the webhook payload so the current message gets the phone number.
+      // If sender is a LID and we still don't have a phone mapping after extractSenderInfo
+      // (which already checks msg.key.senderPn), try additional resolution strategies.
       if (isLidFormat && !senderInfo.phone && sock) {
         const lidNumber = senderInfo.lid;
-        logger.info(`[LID-MAP] No phone mapping for LID ${lidNumber} (pushName: ${msg.pushName || 'Unknown'}), attempting resolution...`);
+        logger.info(`[LID-MAP] No phone mapping for LID ${lidNumber} (pushName: ${msg.pushName || 'Unknown'}), attempting active resolution...`);
 
-        // Strategy 1: Try onWhatsApp() with the LID number (sometimes returns phone JID)
-        try {
-          const onWhatsAppPromise = sock.onWhatsApp(lidNumber);
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('onWhatsApp timeout')), 5000)
-          );
-          const [result] = await Promise.race([onWhatsAppPromise, timeoutPromise]) || [];
-          if (result?.exists && result.jid && result.jid.includes('@s.whatsapp.net')) {
-            const resolvedPhone = result.jid.split('@')[0];
-            this.registerLidPhoneMapping(lidNumber, resolvedPhone);
-            senderInfo.phone = resolvedPhone;
-            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via onWhatsApp()`);
-          }
-        } catch (err) {
-          logger.debug(`[LID-MAP] onWhatsApp() resolution failed for ${lidNumber}: ${err.message}`);
-        }
-
-        // Strategy 2: Check Baileys store contacts for this LID
-        if (!senderInfo.phone && sock.store?.contacts) {
+        // Strategy 1: Check Baileys store contacts for this LID
+        if (sock.store?.contacts) {
           const lidJid = `${lidNumber}@lid`;
           const contact = sock.store.contacts[lidJid];
-          if (contact?.id && contact.id.includes('@s.whatsapp.net')) {
+          if (contact?.jid && contact.jid.includes('@s.whatsapp.net')) {
+            const resolvedPhone = contact.jid.split('@')[0];
+            this.registerLidPhoneMapping(lidNumber, resolvedPhone);
+            senderInfo.phone = resolvedPhone;
+            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via store contacts (jid field)`);
+          } else if (contact?.id && contact.id.includes('@s.whatsapp.net')) {
             const resolvedPhone = contact.id.split('@')[0];
             this.registerLidPhoneMapping(lidNumber, resolvedPhone);
             senderInfo.phone = resolvedPhone;
-            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via store contacts`);
+            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via store contacts (id field)`);
           }
         }
 
-        // Strategy 3: Check if the message proto itself has a verifiedBizName or number field
+        // Strategy 2: Try onWhatsApp() API call as last resort (5s timeout)
         if (!senderInfo.phone) {
-          // Check if participant in a non-group message key leaks phone number
-          const keyParticipant = msg.key?.participant;
-          if (keyParticipant && keyParticipant.includes('@s.whatsapp.net')) {
-            const resolvedPhone = keyParticipant.split('@')[0];
-            if (/^\d{7,15}$/.test(resolvedPhone)) {
+          try {
+            const onWhatsAppPromise = sock.onWhatsApp(lidNumber);
+            const timeoutPromise = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('onWhatsApp timeout')), 5000)
+            );
+            const [result] = await Promise.race([onWhatsAppPromise, timeoutPromise]) || [];
+            if (result?.exists && result.jid && result.jid.includes('@s.whatsapp.net')) {
+              const resolvedPhone = result.jid.split('@')[0];
               this.registerLidPhoneMapping(lidNumber, resolvedPhone);
               senderInfo.phone = resolvedPhone;
-              logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via message key participant`);
+              logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via onWhatsApp()`);
             }
+          } catch (err) {
+            logger.debug(`[LID-MAP] onWhatsApp() resolution failed for ${lidNumber}: ${err.message}`);
           }
         }
 
@@ -1947,7 +1992,10 @@ class WhatsAppManager {
       if (isGroup) {
         webhookPayload.groupJid = remoteJid;
         webhookPayload.participant = msg.key.participant || null;
-        webhookPayload.participantPhone = msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null;
+        // Use participantPn from message key first (most reliable), then fallback to mapping
+        const participantPnJid = msg.key.participantPn;
+        const participantPnPhone = participantPnJid ? participantPnJid.split('@')[0] : null;
+        webhookPayload.participantPhone = participantPnPhone || (msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null);
       }
 
       // Add media data when available
