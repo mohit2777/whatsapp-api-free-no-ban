@@ -11,7 +11,6 @@ const { db } = require('../config/database');
 class WebhookDeliveryService {
   constructor() {
     this.queue = [];  // In-memory queue
-    this.isProcessing = false;
     this.processInterval = null;
     this.maxRetries = 5;
     this.retryDelays = [
@@ -23,7 +22,9 @@ class WebhookDeliveryService {
     ];
     this.maxQueueSize = 1000; // Prevent memory issues
     this.processingTimeout = 30000; // 30s max for an item to stay in 'processing'
-    this.concurrency = 10; // Deliver up to 10 webhooks in parallel
+    this.activeDeliveries = 0; // Track concurrent deliveries
+    this.maxConcurrent = 15;   // Max concurrent HTTP requests
+    this.deliveryStats = { sent: 0, failed: 0, retries: 0 }; // Lifetime stats
   }
 
   /**
@@ -32,12 +33,12 @@ class WebhookDeliveryService {
   start() {
     if (this.processInterval) return;
 
-    // Process queue every 2 seconds
+    // Process retries and cleanup every 3 seconds (new items are processed immediately)
     this.processInterval = setInterval(() => {
-      this.processQueue();
-    }, 2000);
+      this.processRetries();
+    }, 3000);
 
-    logger.info('[WEBHOOK] In-memory delivery service started');
+    logger.info('[WEBHOOK] Delivery service started (immediate mode)');
   }
 
   /**
@@ -63,19 +64,22 @@ class WebhookDeliveryService {
   getStats() {
     const pending = this.queue.filter(item => item.status === 'pending').length;
     const processing = this.queue.filter(item => item.status === 'processing').length;
-    const retrying = this.queue.filter(item => item.attemptCount > 0).length;
+    const failed = this.queue.filter(item => item.status === 'failed').length;
     
     return {
       total: this.queue.length,
       pending,
       processing,
-      retrying,
-      maxSize: this.maxQueueSize
+      failed,
+      retrying: this.queue.filter(item => item.attemptCount > 0 && item.status === 'pending').length,
+      activeDeliveries: this.activeDeliveries,
+      maxSize: this.maxQueueSize,
+      lifetime: { ...this.deliveryStats }
     };
   }
 
   /**
-   * Queue a webhook for delivery (in-memory)
+   * Queue a webhook for delivery and immediately attempt delivery
    */
   queueWebhook(accountId, webhook, payload) {
     // Check queue size limit
@@ -109,19 +113,34 @@ class WebhookDeliveryService {
     this.queue.push(item);
     logger.info(`[WEBHOOK] Queued for ${webhook.url} (queue size: ${this.queue.length})`);
     
-    // Try to process immediately if not already processing
-    if (!this.isProcessing) {
-      setImmediate(() => this.processQueue());
-    }
+    // IMMEDIATE DELIVERY — don't wait for the timer, fire delivery right now
+    // This ensures new webhooks are processed without any delay, regardless
+    // of what other items are doing in the queue.
+    this.deliverItem(item);
   }
 
   /**
-   * Process pending webhooks from in-memory queue
+   * Fire-and-forget delivery of a single item with concurrency limiting.
+   * This runs independently — no global lock, no blocking other items.
    */
-  async processQueue() {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
+  deliverItem(item) {
+    // Concurrency check: if too many HTTP requests in flight, let the timer handle it
+    if (this.activeDeliveries >= this.maxConcurrent) {
+      logger.debug(`[WEBHOOK] Concurrency limit reached (${this.activeDeliveries}/${this.maxConcurrent}), deferring ${item.webhookUrl}`);
+      return;
+    }
 
+    // Fire-and-forget — errors are handled inside processQueueItem
+    this.processQueueItem(item).catch(err => {
+      logger.error(`[WEBHOOK] Unexpected delivery error: ${err.message}`);
+    });
+  }
+
+  /**
+   * Process retries, recover stuck items, and clean up failures.
+   * Runs on a timer as a safety net — primary delivery is immediate via deliverItem().
+   */
+  async processRetries() {
     try {
       const now = Date.now();
 
@@ -135,54 +154,51 @@ class WebhookDeliveryService {
           logger.warn(`[WEBHOOK] Recovering stuck item for ${item.webhookUrl} (was processing for ${Math.round((now - item.processingStartedAt) / 1000)}s)`);
           item.status = 'pending';
           item.processingStartedAt = null;
-          // Don't increment attemptCount here — it was already incremented when it entered processing
         }
       }
       
-      // Get items ready to process (pending and retry time has passed)
-      const readyItems = this.queue.filter(item => 
-        item.status === 'pending' && item.nextRetryAt <= now
+      // Pick up retry items that are ready (nextRetryAt has passed)
+      const retryItems = this.queue.filter(item => 
+        item.status === 'pending' && item.attemptCount > 0 && item.nextRetryAt <= now
       );
 
-      // Process up to `concurrency` items in parallel
-      const batch = readyItems.slice(0, this.concurrency);
+      // Also pick up any items still pending with attemptCount === 0 (missed by immediate delivery)
+      const missedItems = this.queue.filter(item =>
+        item.status === 'pending' && item.attemptCount === 0 && item.nextRetryAt <= now
+      );
 
-      if (batch.length > 0) {
-        // Deliver all webhooks in parallel so one slow endpoint doesn't block others
-        await Promise.allSettled(
-          batch.map(item => this.processQueueItem(item))
-        );
+      const readyItems = [...retryItems, ...missedItems];
+
+      for (const item of readyItems) {
+        this.deliverItem(item);
       }
 
-      // Clean up old failed items (older than 10 minutes) using splice to avoid array reassignment
+      // Clean up old failed items (older than 10 minutes)
       const cutoff = now - 600000;
-      let removed = 0;
       for (let i = this.queue.length - 1; i >= 0; i--) {
         if (this.queue[i].status === 'failed' && this.queue[i].createdAt <= cutoff) {
           this.queue.splice(i, 1);
-          removed++;
         }
-      }
-      
-      if (removed > 0) {
-        logger.debug(`[WEBHOOK] Cleaned up ${removed} old failed items from queue`);
       }
 
     } catch (error) {
-      logger.error(`[WEBHOOK] Error processing queue: ${error.message}`);
-    } finally {
-      this.isProcessing = false;
+      logger.error(`[WEBHOOK] Error in retry processor: ${error.message}`);
     }
   }
 
   /**
-   * Process a single queue item
+   * Process a single queue item.
+   * Guarded: if another call already started processing this item, this is a no-op.
    */
   async processQueueItem(item) {
-    // Mark as processing
+    // Guard: prevent double processing — only process items that are still pending
+    if (item.status !== 'pending') return;
+
+    // Mark as processing (atomic in single-threaded Node.js — no race between check & set)
     item.status = 'processing';
     item.processingStartedAt = Date.now();
     item.attemptCount++;
+    this.activeDeliveries++;
 
     const startTime = Date.now();
     
@@ -196,7 +212,8 @@ class WebhookDeliveryService {
         // Success - remove from queue using splice (safe, no array reassignment)
         const idx = this.queue.indexOf(item);
         if (idx !== -1) this.queue.splice(idx, 1);
-        logger.info(`[WEBHOOK] Delivered successfully to ${item.webhookUrl} (${Date.now() - startTime}ms)`);
+        this.deliveryStats.sent++;
+        logger.info(`[WEBHOOK] ✓ Delivered to ${item.webhookUrl} (${Date.now() - startTime}ms, attempt ${item.attemptCount})`);
       } else {
         // Failed - handle retry
         this.handleDeliveryFailure(item, result.error);
@@ -206,6 +223,7 @@ class WebhookDeliveryService {
       this.handleDeliveryFailure(item, error.message || 'Unknown processing error');
     } finally {
       item.processingStartedAt = null;
+      this.activeDeliveries = Math.max(0, this.activeDeliveries - 1);
     }
   }
 
@@ -218,20 +236,22 @@ class WebhookDeliveryService {
     if (item.attemptCount >= this.maxRetries) {
       // Max retries reached - mark as failed (will be cleaned up later)
       item.status = 'failed';
-      logger.warn(`[WEBHOOK] Failed after ${item.attemptCount} attempts: ${item.webhookUrl} - ${errorMessage}`);
+      this.deliveryStats.failed++;
+      logger.warn(`[WEBHOOK] ✗ Failed after ${item.attemptCount} attempts: ${item.webhookUrl} - ${errorMessage}`);
     } else {
       // Schedule retry with exponential backoff
       const delayIndex = Math.min(item.attemptCount - 1, this.retryDelays.length - 1);
       const delay = this.retryDelays[delayIndex];
       item.nextRetryAt = Date.now() + delay;
       item.status = 'pending';
+      this.deliveryStats.retries++;
       
-      logger.info(`[WEBHOOK] Retry ${item.attemptCount}/${this.maxRetries} scheduled in ${delay/1000}s for ${item.webhookUrl}`);
+      logger.info(`[WEBHOOK] Retry ${item.attemptCount}/${this.maxRetries} in ${delay/1000}s for ${item.webhookUrl} (${errorMessage})`);
     }
   }
 
   /**
-   * Deliver webhook immediately
+   * Deliver webhook immediately via HTTP POST
    */
   async deliverWebhook(webhook, payload) {
     try {
@@ -249,7 +269,7 @@ class WebhookDeliveryService {
 
       const response = await axios.post(webhook.url, payload, {
         headers,
-        timeout: 15000, // 15 second timeout
+        timeout: 10000, // 10 second timeout (reduced from 15 to prevent queue backup)
         validateStatus: () => true // Don't throw on any status — we handle all codes
       });
 
@@ -267,7 +287,11 @@ class WebhookDeliveryService {
         };
       }
     } catch (error) {
-      const errorMsg = error.code === 'ECONNABORTED' ? 'Timeout' : error.message;
+      const errorMsg = error.code === 'ECONNABORTED' ? 'Timeout (10s)' 
+        : error.code === 'ECONNREFUSED' ? 'Connection refused'
+        : error.code === 'ENOTFOUND' ? 'DNS lookup failed'
+        : error.code === 'ETIMEDOUT' ? 'Connection timed out'
+        : error.message;
       return { 
         success: false, 
         error: errorMsg
@@ -337,7 +361,8 @@ class WebhookDeliveryService {
         const events = this.normalizeEvents(webhook.events);
 
         if (!events.includes(event) && !events.includes('*')) {
-          logger.debug(`[WEBHOOK] ${webhook.url} not subscribed to '${event}' (subscribed: ${events.join(',')})`);
+          // Log at INFO so users can actually see why a webhook was skipped
+          logger.info(`[WEBHOOK] Skipped ${webhook.url} — not subscribed to '${event}' (subscribed: [${events.join(', ')}])`);
           continue;
         }
 
@@ -356,7 +381,11 @@ class WebhookDeliveryService {
       }
     }
 
-    logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);
+    if (queued > 0) {
+      logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);
+    } else if (webhooks.length > 0) {
+      logger.warn(`[WEBHOOK] No webhooks matched event '${event}' — check event subscriptions in dashboard`);
+    }
   }
 }
 
