@@ -452,6 +452,14 @@ body {
 .status-badge.error { background: rgba(255, 71, 87, 0.12); color: var(--error); }
 .status-badge.error::before { background: var(--error); }
 
+.status-badge.reconnecting { background: rgba(255, 193, 7, 0.12); color: var(--warning); }
+.status-badge.reconnecting::before { background: var(--warning); animation: pulse 1.5s ease-in-out infinite; }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
 /* ============================================================================
    Forms
    ============================================================================ */
@@ -538,6 +546,27 @@ body {
     outline: none;
     border-color: var(--primary);
     width: 280px;
+}
+
+.search-clear-btn {
+    position: absolute;
+    right: 8px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    padding: 4px;
+    border-radius: 4px;
+    transition: color 0.2s, background 0.2s;
+}
+
+.search-clear-btn:hover {
+    color: var(--text);
+    background: var(--bg-hover);
 }
 
 .checkbox-label {
@@ -686,6 +715,29 @@ body {
     max-width: 280px;
     border-radius: 12px;
     border: 2px solid var(--border);
+}
+
+.qr-timer-bar {
+    width: 100%;
+    max-width: 280px;
+    height: 4px;
+    background: var(--bg-dark);
+    border-radius: 2px;
+    margin-top: 12px;
+    overflow: hidden;
+}
+
+.qr-timer-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary), var(--primary-dark));
+    border-radius: 2px;
+    transition: width 1s linear;
+}
+
+.qr-timer-text {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 8px;
 }
 
 .qr-instructions {
@@ -1153,6 +1205,56 @@ body {
 @keyframes slideIn {
     from { transform: translateX(100%); opacity: 0; }
     to { transform: translateX(0); opacity: 1; }
+}
+
+/* ============================================================================
+   Skeleton Loading
+   ============================================================================ */
+.skeleton-group {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px 0;
+    width: 100%;
+}
+
+.skeleton {
+    background: linear-gradient(90deg, var(--bg-hover) 25%, var(--bg-elevated) 50%, var(--bg-hover) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: var(--radius-sm);
+}
+
+.skeleton-line {
+    height: 14px;
+    width: 100%;
+}
+
+.skeleton-line.short {
+    width: 60%;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* ============================================================================
+   Sidebar Backdrop (Mobile)
+   ============================================================================ */
+.sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 99;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.sidebar-backdrop.show {
+    display: block;
+    opacity: 1;
 }
 
 /* ============================================================================

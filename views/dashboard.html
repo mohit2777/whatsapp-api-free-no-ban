@@ -12,6 +12,8 @@
 </head>
 <body>
     <div class="app-container">
+        <!-- Sidebar Backdrop (mobile) -->
+        <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
         <!-- Sidebar -->
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header">
@@ -133,7 +135,7 @@
                                     </tr>
                                 </thead>
                                 <tbody id="accountsTable">
-                                    <tr><td colspan="4" class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p>Loading accounts...</p></td></tr>
+                                    <tr><td colspan="4" class="empty-state"><div class="skeleton-group"><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line short"></div><div class="skeleton skeleton-line"></div></div></td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -151,6 +153,9 @@
                                 <div class="search-box">
                                     <i class="fas fa-search"></i>
                                     <input type="text" id="accountSearchInput" placeholder="Search accounts..." oninput="filterAccounts(this.value)">
+                                    <button class="search-clear-btn" id="searchClearBtn" style="display:none;" title="Clear search">
+                                        <i class="fas fa-times"></i>
+                                    </button>
                                 </div>
                                 <button class="btn btn-primary" id="newAccountBtn2">
                                     <i class="fas fa-plus"></i> <span>Add Account</span>
@@ -170,7 +175,7 @@
                                     </tr>
                                 </thead>
                                 <tbody id="accountsTableFull">
-                                    <tr><td colspan="6" class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p>Loading...</p></td></tr>
+                                    <tr><td colspan="6" class="empty-state"><div class="skeleton-group"><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line short"></div><div class="skeleton skeleton-line"></div></div></td></tr>
                                 </tbody>
                             </table>
                         </div>

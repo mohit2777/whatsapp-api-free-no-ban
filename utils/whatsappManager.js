@@ -19,46 +19,7 @@ const webhookDeliveryService = require('./webhookDeliveryService');
 const aiAutoReply = require('./aiAutoReply');
 
 // ============================================================================
-// SUPPRESS LIBSIGNAL CONSOLE SPAM
-// ============================================================================
-// libsignal's session_record.js and session_cipher.js use raw console.info/
-// console.error to dump full session objects (including crypto keys) and
-// decryption errors. This is a security risk (leaks key material to logs)
-// and creates excessive noise. Intercept and redirect to our logger.
-// ============================================================================
-
-const _origConsoleInfo = console.info;
-const _origConsoleError = console.error;
-
-console.info = function (...args) {
-  // Suppress libsignal session dumps: "Closing session:", "Opening session:"
-  if (typeof args[0] === 'string' && /^(Closing|Opening) session/i.test(args[0])) {
-    return; // silently drop — contains raw crypto keys
-  }
-  _origConsoleInfo.apply(console, args);
-};
-
-console.error = function (...args) {
-  // Suppress libsignal decrypt failures: "Failed to decrypt message...", "Session error:"
-  if (typeof args[0] === 'string' && /^(Failed to decrypt message|Session error)/i.test(args[0])) {
-    logger.debug(`[SIGNAL] ${args[0]}`);
-    return;
-  }
-  _origConsoleError.apply(console, args);
-};
-
-console.warn = (function (origWarn) {
-  return function (...args) {
-    if (typeof args[0] === 'string' && /^Session already (closed|open)/i.test(args[0])) {
-      return;
-    }
-    origWarn.apply(console, args);
-  };
-})(console.warn);
-
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
+// ============================================================================\n// CONFIGURATION (libsignal noise handled by silent pino logger)\n// ============================================================================
 
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
@@ -128,17 +89,18 @@ function readReceiptDelay() {
 }
 
 /**
- * Pick a random browser fingerprint per account (stored in memory)
- * This prevents all accounts from having identical fingerprints
+ * Pick a browser fingerprint per account (stored in memory)
+ * CRITICAL: Only use Baileys' built-in Browsers helpers.
+ * Custom browser strings (e.g. ['Windows', 'Chrome', ...]) produce device
+ * fingerprints that don't match any real WhatsApp Web client — WhatsApp's
+ * server-side detection flags these as unofficial clients, leading to bans.
+ * The Browsers.* helpers generate the exact platform/app/version tuples
+ * that real WhatsApp Web sends.
  */
 const BROWSER_PROFILES = [
   () => Browsers.windows('Desktop'),
   () => Browsers.macOS('Desktop'),
   () => Browsers.appropriate('Desktop'),
-  () => ['Windows', 'Chrome', '10.0.22631'],
-  () => ['Windows', 'Edge', '10.0.22631'],
-  () => ['Mac OS', 'Safari', '14.6.1'],
-  () => ['Mac OS', 'Chrome', '14.4.1'],
 ];
 const accountBrowserCache = new Map();
 
@@ -171,10 +133,12 @@ class WhatsAppManager {
     this.lastReconnectRequest = new Map(); // Track manual reconnect requests for debounce
     this.connectionWatchdogs = new Map(); // Watchdog timers for stuck connections
     this.isShuttingDown = false; // Prevent reconnection during shutdown
-    this.maxReconnectAttempts = 5;
+    this.maxReconnectAttempts = 3; // Reduced from 5 — fewer retry cycles = less ban risk
     this.maxSessionConflicts = 3; // Max 440 errors before requiring manual reconnect
-    this.minReconnectInterval = 60000; // Minimum 60 seconds between any reconnection
+    this.minReconnectInterval = 120000; // Minimum 120s between reconnections (doubled for safety)
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
+    this.sessionSaveTimers = new Map(); // Debounced session save timers per account
+    this.SESSION_SAVE_DEBOUNCE_MS = 30000; // Save session to DB at most once per 30s
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -293,8 +257,11 @@ class WhatsAppManager {
       return;
     }
 
-    // Exponential backoff for 440: 60s, 120s, 240s with jitter
-    const baseDelay = 60000 * Math.pow(2, conflictCount - 1);
+    // Exponential backoff for 440: 120s, 240s, 480s with jitter
+    // Starts at 120s (not 60s) to match the safer general reconnect timing.
+    // Session conflicts are especially dangerous — rapid retry after 440 is a
+    // strong ban signal because it looks like two clients fighting for control.
+    const baseDelay = 120000 * Math.pow(2, conflictCount - 1);
     const jitter = Math.floor(Math.random() * 15000);
     const delay = baseDelay + jitter;
 
@@ -653,8 +620,10 @@ class WhatsAppManager {
           logger.error(`Failed to initialize account ${account.id}: ${e.message}`);
         }
         // Stagger connections to avoid hitting WhatsApp servers all at once
+        // Increased delay — multiple accounts connecting rapidly from the same IP
+        // is a strong ban signal in WhatsApp's detection systems.
         if (i < toConnect.length - 1) {
-          const staggerDelay = humanDelay(3000, 6000);
+          const staggerDelay = humanDelay(8000, 15000);
           logger.debug(`Waiting ${staggerDelay}ms before next account initialization`);
           await new Promise(resolve => setTimeout(resolve, staggerDelay));
         }
@@ -675,10 +644,11 @@ class WhatsAppManager {
   // appears dead, forces a fresh reconnection.
   // ============================================================================
   _startHealthMonitor() {
-    // Run every 5 minutes
-    const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000;
+    // Run every 10 minutes (reduced aggressiveness — too-frequent health checks
+    // that trigger reconnects create abnormal connection patterns)
+    const HEALTH_CHECK_INTERVAL = 10 * 60 * 1000;
     // Max time an account can be in 'reconnecting' state before forced action
-    const MAX_RECONNECTING_MS = 10 * 60 * 1000;
+    const MAX_RECONNECTING_MS = 15 * 60 * 1000;
 
     this._healthMonitorInterval = setInterval(async () => {
       if (this.isShuttingDown) return;
@@ -703,7 +673,7 @@ class WhatsAppManager {
             const stateStatus = state?.status;
             if (stateStatus !== 'qr_ready' && stateStatus !== 'initializing') {
               logger.warn(`[HEALTH] Account ${account.id} has no active connection, triggering reconnect`);
-              this.scheduleReconnect(account.id, humanDelay(5000, 15000));
+              this.scheduleReconnect(account.id, humanDelay(30000, 60000));
             }
           }
 
@@ -742,7 +712,7 @@ class WhatsAppManager {
 
     // Don't prevent process exit
     this._healthMonitorInterval.unref?.();
-    logger.info('[HEALTH] Connection health monitor started (5 min interval)');
+    logger.info('[HEALTH] Connection health monitor started (10 min interval)');
   }
 
   /**
@@ -804,6 +774,13 @@ class WhatsAppManager {
       this.lastConnectionAttempt.delete(accountId);
       this.lastReconnectRequest?.delete(accountId);
       this.connectionStates.delete(accountId);
+
+      // Cancel any pending debounced session save
+      const saveTimer = this.sessionSaveTimers.get(accountId);
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        this.sessionSaveTimers.delete(accountId);
+      }
 
       // Disconnect if connected - end the socket properly
       const sock = this.connections.get(accountId);
@@ -1047,7 +1024,7 @@ class WhatsAppManager {
 
         msgRetryCounterCache,
         linkPreviewImageThumbnailWidth: 0,
-        qrTimeout: 40000,
+        qrTimeout: 55000, // Aligned closer to watchdog timeout (60s) to prevent mismatch
         defaultQueryTimeoutMs: 60000,
         connectTimeoutMs: 60000,
         // Patch-based presence to reduce detection surface
@@ -1059,8 +1036,9 @@ class WhatsAppManager {
         // Firewall / keep-alive tuning
         keepAliveIntervalMs: 25000, // 25s keep-alive like real WA Web
         retryRequestDelayMs: 250,
-        // Allow more retry attempts for failed decryptions (default is 5)
-        maxMsgRetryCount: 10,
+        // Keep message retry count conservative — excessive retries generate
+        // abnormal traffic patterns that WhatsApp's detection systems flag.
+        maxMsgRetryCount: 5,
       });
 
       // Store connection
@@ -1238,8 +1216,16 @@ class WhatsAppManager {
         // credentials in the background.  We must NOT delete the auth files
         // or treat this as a failure — just reconnect quickly.
         if (justPaired) {
-          logger.info(`Post-QR-scan restart for ${accountId} (status ${statusCode}), reconnecting in 3s`);
+          logger.info(`Post-QR-scan restart for ${accountId} (status ${statusCode}), saving session then reconnecting`);
           this.connectionStates.set(accountId, { status: 'reconnecting' });
+
+          // CRITICAL: Save session to DB immediately after QR scan (don't debounce).
+          // This is a first-time auth — if the server crashes between QR scan and
+          // reconnect, an unsaved session forces the user to scan QR again.
+          await this.saveSession(accountId).catch(e =>
+            logger.warn(`Post-pair session save failed: ${e.message}`)
+          );
+
           await db.updateAccount(accountId, {
             status: 'initializing',
             qr_code: null,
@@ -1247,8 +1233,10 @@ class WhatsAppManager {
           }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
           this.emit('account-status', { accountId, status: 'reconnecting', message: 'QR scanned, reconnecting...' });
           
-          // Give saveCreds/saveSession a moment to finish writing, then reconnect
-          this.scheduleReconnect(accountId, 3000);
+          // Wait 6 seconds (not 3) to give WhatsApp servers time to fully
+          // process the new session. Reconnecting too fast after pairing
+          // triggers 440 (session conflict) errors which can lead to bans.
+          this.scheduleReconnect(accountId, 6000);
           return;
         }
 
@@ -1431,8 +1419,10 @@ class WhatsAppManager {
           this.reconnectAttempts.set(accountId, attempts + 1);
           this.metrics.reconnections++;
           
-          // Exponential backoff with jitter: 60s, 120s, 240s, 480s, 960s + random 0-30s
-          const baseDelay = Math.min(60000 * Math.pow(2, attempts), 960000);
+          // Exponential backoff with jitter: 120s, 240s, 480s + random 0-30s
+          // Doubled from original 60s base — rapid reconnection attempts are a
+          // major ban signal. WhatsApp flags IPs/accounts that reconnect too often.
+          const baseDelay = Math.min(120000 * Math.pow(2, attempts), 960000);
           const jitter = Math.floor(Math.random() * 30000);
           const delay = baseDelay + jitter;
           
@@ -1495,40 +1485,18 @@ class WhatsAppManager {
       }
     });
 
-    // Credentials update
+    // Credentials update — write to disk immediately, debounce DB persistence.
+    // creds.update fires 10+ times during key exchange / session setup.
+    // The old approach of reading creds.json back and writing to DB on EACH
+    // event caused massive write storms, race conditions, and DB contention.
+    // Disk files are the primary source of truth; DB is only for persistence
+    // across deploys/restarts. Debouncing coalesces rapid updates into a
+    // single DB write ~30s after the last event.
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        
-        // Brief delay to ensure creds.json is fully flushed to disk
-        // before we try to read it back. Without this, rapid creds.update
-        // events cause "Unexpected end of JSON input" from partial reads.
-        await new Promise(r => setTimeout(r, 100));
-        
-        // Only persist to database when creds represent a fully authenticated
-        // session (i.e. QR was scanned and pair-success completed).
-        const authPath = path.join(AUTH_STATES_DIR, `session_${accountId}`);
-        try {
-          const credsRaw = await fs.readFile(path.join(authPath, 'creds.json'), 'utf8');
-          const creds = JSON.parse(credsRaw);
-          if (creds.me && creds.registered !== false) {
-            await this.saveSession(accountId);
-          } else {
-            logger.debug(`Skipping DB session save for ${accountId} (not yet authenticated)`);
-          }
-        } catch (readErr) {
-          // File might still be partially written — wait and retry once
-          await new Promise(r => setTimeout(r, 250));
-          try {
-            const credsRaw = await fs.readFile(path.join(authPath, 'creds.json'), 'utf8');
-            const creds = JSON.parse(credsRaw);
-            if (creds.me && creds.registered !== false) {
-              await this.saveSession(accountId);
-            }
-          } catch (retryErr) {
-            logger.debug(`Skipping session save for ${accountId} — creds.json not ready yet: ${retryErr.message}`);
-          }
-        }
+        // Schedule a debounced DB save — coalesces rapid creds.update bursts
+        this._scheduleSessionSave(accountId);
       } catch (error) {
         logger.error(`Error saving creds for ${accountId}: ${error.message}`);
       }
@@ -2075,12 +2043,10 @@ class WhatsAppManager {
       const contactId = this.getPhoneNumber(jid) || phone;
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      // Save session to DB after sending — sock.sendMessage() updates Signal
-      // pre-keys and session state internally. If we don't persist these,
-      // a server restart restores stale pre-keys → Bad MAC on next message.
-      this.saveSession(accountId).catch(e => 
-        logger.debug(`Post-send session save failed: ${e.message}`)
-      );
+      // Schedule debounced session save — Signal pre-keys update on sends but
+      // saving to DB on every single message causes write storms and DB contention.
+      // Disk files are always up-to-date; debounce ensures at most one DB write per 30s.
+      this._scheduleSessionSave(accountId);
 
       // Go unavailable after sending (like minimizing the window)
       setTimeout(() => {
@@ -2145,10 +2111,8 @@ class WhatsAppManager {
       const contactId = this.getPhoneNumber(resolvedJid) || jid.split('@')[0];
       await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      // Save session to DB after sending — Signal pre-keys update on every send
-      this.saveSession(accountId).catch(e => 
-        logger.debug(`Post-send session save failed: ${e.message}`)
-      );
+      // Schedule debounced session save (at most once per 30s, not on every send)
+      this._scheduleSessionSave(accountId);
 
       // Go back to unavailable
       setTimeout(() => {
@@ -2251,10 +2215,8 @@ class WhatsAppManager {
       this.metrics.messagesSent++;
       logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
 
-      // Save session to DB after sending — Signal pre-keys update on every send
-      this.saveSession(accountId).catch(e => 
-        logger.debug(`Post-send session save failed: ${e.message}`)
-      );
+      // Schedule debounced session save (at most once per 30s, not on every send)
+      this._scheduleSessionSave(accountId);
 
       // Go back to unavailable after media send
       setTimeout(() => {
@@ -2355,7 +2317,11 @@ class WhatsAppManager {
               sessionData[file] = content;
 
               if (file === 'creds.json') {
-                credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey);
+                // Validate ALL critical Signal protocol keys.
+                // Missing any of these means the session can't complete a
+                // valid handshake, causing auth failures or Bad MAC errors
+                // that trigger rapid reconnection cycles → ban risk.
+                credsValid = !!(parsed.noiseKey && parsed.signedIdentityKey && parsed.signedPreKey && parsed.registrationId);
               }
               break; // success
             } catch (readError) {
@@ -2400,6 +2366,51 @@ class WhatsAppManager {
         logger.debug(`Processing queued session save for ${accountId}`);
         // Use setImmediate to avoid deep recursion
         setImmediate(() => this.saveSession(accountId));
+      }
+    }
+  }
+
+  /**
+   * Schedule a debounced session save to DB.
+   * Coalesces rapid save requests (e.g. from creds.update bursts during
+   * key exchange) into a single DB write, preventing write storms.
+   * The session is always up-to-date on disk (via saveCreds); this only
+   * affects DB persistence for cross-deploy/restart recovery.
+   */
+  _scheduleSessionSave(accountId) {
+    if (this.isShuttingDown || this.deletedAccounts.has(accountId)) return;
+
+    // Clear existing timer for this account (resets the debounce window)
+    const existing = this.sessionSaveTimers.get(accountId);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      this.sessionSaveTimers.delete(accountId);
+      this.saveSession(accountId).catch(e =>
+        logger.debug(`Debounced session save failed for ${accountId}: ${e.message}`)
+      );
+    }, this.SESSION_SAVE_DEBOUNCE_MS);
+
+    this.sessionSaveTimers.set(accountId, timer);
+  }
+
+  /**
+   * Flush all pending debounced session saves immediately.
+   * Called during graceful shutdown to ensure no session data is lost.
+   */
+  async _flushPendingSessionSaves() {
+    const accountIds = Array.from(this.sessionSaveTimers.keys());
+    for (const [, timer] of this.sessionSaveTimers) {
+      clearTimeout(timer);
+    }
+    this.sessionSaveTimers.clear();
+
+    for (const accountId of accountIds) {
+      try {
+        await this.saveSession(accountId);
+        logger.debug(`Flushed pending session save for ${accountId}`);
+      } catch (e) {
+        logger.warn(`Failed to flush session save for ${accountId}: ${e.message}`);
       }
     }
   }
@@ -2451,9 +2462,13 @@ class WhatsAppManager {
             logger.debug(`Session platform: ${creds.platform} — acceptable`);
           }
 
-          // If creds have no signalIdentities or account info, session is corrupt
-          if (!creds.signedIdentityKey || !creds.noiseKey) {
-            logger.warn(`Session for ${accountId} missing critical identity keys, discarding`);
+          // Validate ALL critical identity keys — missing ANY of these means
+          // the session can't establish a valid Signal encryption channel.
+          // Restoring an incomplete session causes auth failures (401/440)
+          // which trigger rapid reconnect cycles that WhatsApp detects as
+          // suspicious activity, leading to account bans.
+          if (!creds.signedIdentityKey || !creds.noiseKey || !creds.signedPreKey || !creds.registrationId) {
+            logger.warn(`Session for ${accountId} missing critical identity keys (signedIdentityKey: ${!!creds.signedIdentityKey}, noiseKey: ${!!creds.noiseKey}, signedPreKey: ${!!creds.signedPreKey}, registrationId: ${!!creds.registrationId}), discarding`);
             await db.updateAccount(accountId, { session_data: null });
             return;
           }
@@ -2621,6 +2636,9 @@ class WhatsAppManager {
 
     // Persist LID mappings one last time
     await this._persistLidMappings();
+
+    // Flush any pending debounced session saves to DB before disconnecting
+    await this._flushPendingSessionSaves();
     
     // Disconnect all accounts gracefully
     for (const [accountId, sock] of this.connections) {
@@ -2638,6 +2656,7 @@ class WhatsAppManager {
     this.sessionConflictCounts.clear();
     this.reconnectAttempts.clear();
     this.lastReconnectRequest?.clear();
+    this.sessionSaveTimers.clear();
     
     logger.info('WhatsApp manager shutdown complete');
   }

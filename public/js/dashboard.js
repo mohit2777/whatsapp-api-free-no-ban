@@ -92,6 +92,7 @@ function initializeNavigation() {
 
     document.getElementById('menuToggle')?.addEventListener('click', () => {
         document.getElementById('sidebar').classList.toggle('open');
+        document.getElementById('sidebarBackdrop')?.classList.toggle('show');
     });
 }
 
@@ -172,6 +173,37 @@ function initializeEventListeners() {
     document.getElementById('aiActive')?.addEventListener('change', (e) => updateToggleStatus(e.target));
     document.getElementById('webhookAccountSelect')?.addEventListener('change', loadWebhooksForAccount);
     document.getElementById('addWebhookForm')?.addEventListener('submit', submitWebhookForm);
+
+    // Webhook "All Events" checkbox mutual exclusion
+    document.querySelectorAll('input[name="webhookEvents"]').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            if (e.target.value === '*' && e.target.checked) {
+                document.querySelectorAll('input[name="webhookEvents"]').forEach(other => {
+                    if (other.value !== '*') other.checked = false;
+                });
+            } else if (e.target.value !== '*' && e.target.checked) {
+                const allBox = document.querySelector('input[name="webhookEvents"][value="*"]');
+                if (allBox) allBox.checked = false;
+            }
+        });
+    });
+
+    // Search clear button
+    document.getElementById('searchClearBtn')?.addEventListener('click', () => {
+        const input = document.getElementById('accountSearchInput');
+        if (input) { input.value = ''; filterAccounts(''); input.focus(); }
+        document.getElementById('searchClearBtn').style.display = 'none';
+    });
+    document.getElementById('accountSearchInput')?.addEventListener('input', (e) => {
+        const clearBtn = document.getElementById('searchClearBtn');
+        if (clearBtn) clearBtn.style.display = e.target.value ? 'flex' : 'none';
+    });
+
+    // Mobile sidebar backdrop
+    document.getElementById('sidebarBackdrop')?.addEventListener('click', () => {
+        document.getElementById('sidebar')?.classList.remove('open');
+        document.getElementById('sidebarBackdrop')?.classList.remove('show');
+    });
 }
 
 // ============================================================================
@@ -336,7 +368,7 @@ async function pollQrCode(accountId) {
                 qrContainer.innerHTML = `
                     <div class="qr-placeholder">
                         <i class="fas fa-exclamation-triangle" style="font-size: 32px; color: var(--warning);"></i>
-                        <p style="color: var(--warning);">${accountData.account.error_message}</p>
+                        <p style="color: var(--warning);">${escapeHtml(accountData.account.error_message)}</p>
                         <button class="btn btn-primary" onclick="reconnectAccount('${accountId}')">
                             <i class="fas fa-sync"></i> Try Again
                         </button>
@@ -573,6 +605,7 @@ async function deleteAiConfig() {
         await apiCall(`/api/accounts/${accountId}/ai-config`, { method: 'DELETE' });
         closeModal('aiConfigModal');
         showToast('AI configuration deleted', 'success');
+        loadAccounts();
     } catch (error) {
         console.error('Failed to delete AI config:', error);
     }
@@ -841,6 +874,7 @@ function renderStatusBadge(status) {
         'disconnected': 'Disconnected',
         'qr_ready': 'Scan QR',
         'initializing': 'Connecting...',
+        'reconnecting': 'Reconnecting...',
         'error': 'Error',
         'auth_failed': 'Auth Failed'
     };
@@ -867,11 +901,9 @@ function renderAccountActions(account, showAll = false) {
         <i class="fas fa-robot"></i>
     </button>`;
 
-    if (showAll) {
-        actions += `<button class="btn btn-sm btn-danger" onclick="deleteAccount('${account.id}')" title="Delete">
-            <i class="fas fa-trash"></i>
-        </button>`;
-    }
+    actions += `<button class="btn btn-sm btn-danger" onclick="deleteAccount('${account.id}')" title="Delete">
+        <i class="fas fa-trash"></i>
+    </button>`;
 
     return actions;
 }

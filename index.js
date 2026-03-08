@@ -39,9 +39,10 @@ process.on('unhandledRejection', (reason, promise) => {
 
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception:', error);
-  // For critical errors, we might want to exit
+  // For critical errors, trigger graceful shutdown (flushes sessions to DB)
+  // instead of raw process.exit() which loses pending Signal key updates.
   if (error.message?.includes('FATAL')) {
-    process.exit(1);
+    gracefulShutdown('uncaughtException').catch(() => process.exit(1));
   }
 });
 
