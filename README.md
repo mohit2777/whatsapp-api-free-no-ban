@@ -150,31 +150,80 @@ curl -X POST https://your-app.onrender.com/api/send \
 
 ---
 
+### Supported Media Types
+
+| `mediaType` | Caption | Common Formats | Notes |
+|-------------|---------|----------------|-------|
+| `image` | ✅ Yes | JPEG, PNG, WebP, GIF | Auto-detected mimetype. GIFs play inline. |
+| `video` | ✅ Yes | MP4, 3GP, MKV | WhatsApp may transcode large files. |
+| `audio` | ❌ No | MP3, OGG, AAC, M4A, WAV | Sent as voice/audio. Caption is ignored. |
+| `document` | ✅ Yes | PDF, DOCX, XLSX, ZIP, any file | Filename preserved. Falls back to `document` if `mediaType` is omitted. |
+
+> **Max file size: 25 MB** (both upload and URL/base64).  
+> **Caption** works on `image`, `video`, and `document`. For `audio`, any caption value is silently ignored.
+
+---
+
 ### Send Media (File Upload)
 
+Upload a file directly using `multipart/form-data`.
+
+**Send an image with caption:**
 ```bash
 curl -X POST https://your-app.onrender.com/api/send-media \
   -F "api_key=your-account-api-key" \
   -F "to=919876543210" \
   -F "mediaType=image" \
   -F "caption=Check this out!" \
-  -F "media=@image.jpg"
+  -F "media=@photo.jpg"
+```
+
+**Send a PDF document:**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media \
+  -F "api_key=your-account-api-key" \
+  -F "to=919876543210" \
+  -F "mediaType=document" \
+  -F "caption=Invoice for March" \
+  -F "media=@invoice.pdf"
+```
+
+**Send a video with caption:**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media \
+  -F "api_key=your-account-api-key" \
+  -F "to=919876543210" \
+  -F "mediaType=video" \
+  -F "caption=Watch this!" \
+  -F "media=@clip.mp4"
+```
+
+**Send an audio file (no caption):**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media \
+  -F "api_key=your-account-api-key" \
+  -F "to=919876543210" \
+  -F "mediaType=audio" \
+  -F "media=@voice.mp3"
 ```
 
 **Parameters:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `api_key` | string | Yes | 64-char API key |
-| `to` | string | Yes | Phone with country code or group JID |
-| `mediaType` | string | Yes | `image`, `video`, `audio`, or `document` |
-| `caption` | string | No | Caption text |
-| `media` | file | Yes | The media file to send |
+| `api_key` | string | Yes | 64-char API key from dashboard |
+| `to` | string | Yes | Phone with country code (e.g. `919876543210`) or group JID |
+| `mediaType` | string | No | `image`, `video`, `audio`, or `document`. Defaults to `document` if omitted. |
+| `caption` | string | No | Caption text (supported on image, video, document — ignored for audio) |
+| `media` | file | Yes | The media file to send (max 25 MB) |
 
 ---
 
 ### Send Media (URL or Base64)
 
+Send media from a public URL or base64-encoded string. Useful for automation (n8n, Make, Zapier).
+
+**Image from URL with caption:**
 ```bash
 curl -X POST https://your-app.onrender.com/api/send-media-url \
   -H "Content-Type: application/json" \
@@ -187,6 +236,33 @@ curl -X POST https://your-app.onrender.com/api/send-media-url \
   }'
 ```
 
+**Document from URL with caption and filename:**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "919876543210",
+    "mediaType": "document",
+    "mediaUrl": "https://example.com/report.pdf",
+    "caption": "Here is the report",
+    "filename": "report-march-2026.pdf"
+  }'
+```
+
+**Video from base64 with caption:**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "919876543210",
+    "mediaType": "video",
+    "mediaBase64": "data:video/mp4;base64,AAAAIGZ0eXBpc29t...",
+    "caption": "Check this video"
+  }'
+```
+
 **Parameters:**
 
 | Field | Type | Required | Description |
@@ -194,11 +270,23 @@ curl -X POST https://your-app.onrender.com/api/send-media-url \
 | `api_key` | string | Yes | 64-char API key |
 | `to` | string | Yes | Phone with country code or group JID |
 | `mediaType` | string | Yes | `image`, `video`, `audio`, or `document` |
-| `mediaUrl` | string | One of | Public URL to fetch media from |
-| `mediaBase64` | string | One of | Base64-encoded media data (with or without `data:` prefix) |
-| `caption` | string | No | Caption text |
-| `mimetype` | string | No | MIME type (auto-detected if omitted) |
-| `filename` | string | No | Filename for documents |
+| `mediaUrl` | string | One of | Public URL to fetch media from (max 25 MB) |
+| `mediaBase64` | string | One of | Base64-encoded data (with or without `data:` prefix) |
+| `caption` | string | No | Caption text (supported on image, video, document — ignored for audio) |
+| `mimetype` | string | No | MIME type override (auto-detected from URL/data prefix if omitted) |
+| `filename` | string | No | Filename for document type (e.g. `report.pdf`) |
+
+**Response (both endpoints):**
+
+```json
+{
+  "success": true,
+  "messageId": "ABCD1234567890",
+  "to": "919876543210@s.whatsapp.net",
+  "phone": "919876543210",
+  "timestamp": 1741521600000
+}
+```
 
 ---
 
