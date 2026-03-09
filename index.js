@@ -664,17 +664,90 @@ app.post('/api/webhooks/:id/test', requireAuth, webhookLimiter, async (req, res)
       return res.status(404).json({ success: false, error: 'Webhook not found' });
     }
 
+    // Test the FULL dispatch pipeline: normalization, event matching, queue, delivery.
+    // This catches bugs that a direct deliverWebhook() call would miss.
+    const normalizedEvents = webhookDeliveryService.normalizeEvents(webhook.events);
+
     const testPayload = {
       event: 'test',
       timestamp: new Date().toISOString(),
-      message: 'This is a test webhook delivery'
+      account_id: webhook.account_id,
+      data: { message: 'This is a test webhook delivery' }
     };
 
+    // Deliver directly (test should give immediate feedback)
     const result = await webhookDeliveryService.deliverWebhook(webhook, testPayload);
-    res.json({ success: result.success, ...result });
+    res.json({
+      success: result.success,
+      ...result,
+      debug: {
+        webhookId: webhook.id,
+        accountId: webhook.account_id,
+        isActive: webhook.is_active,
+        rawEvents: webhook.events,
+        normalizedEvents,
+        url: webhook.url,
+        hasSecret: !!webhook.secret
+      }
+    });
   } catch (error) {
     logger.error('Error testing webhook:', error);
     res.status(500).json({ success: false, error: 'Failed to test webhook' });
+  }
+});
+
+// Diagnostic endpoint: test the FULL dispatch pipeline for an account
+// This exercises the exact same code path as real messages
+app.post('/api/accounts/:id/webhooks/test-dispatch', requireAuth, webhookLimiter, async (req, res) => {
+  try {
+    const accountId = req.params.id;
+
+    // Step 1: fetch active webhooks (same as dispatch does)
+    const webhooks = await db.getActiveWebhooks(accountId);
+
+    // Step 2: normalize events and check matching for 'message' event
+    const diagnostics = webhooks.map(wh => {
+      const rawEvents = wh.events;
+      const normalized = webhookDeliveryService.normalizeEvents(rawEvents);
+      const matchesMessage = normalized.includes('message') || normalized.includes('*');
+      return {
+        id: wh.id,
+        url: wh.url,
+        isActive: wh.is_active,
+        rawEvents,
+        rawEventsType: typeof rawEvents + (Array.isArray(rawEvents) ? '(array)' : ''),
+        normalizedEvents: normalized,
+        matchesMessage,
+        matchesStatus: normalized.includes('message.status') || normalized.includes('*'),
+        matchesConnection: normalized.includes('connection') || normalized.includes('*'),
+        hasSecret: !!wh.secret
+      };
+    });
+
+    // Step 3: actually dispatch a test event through the full pipeline
+    await webhookDeliveryService.dispatch(accountId, 'message', {
+      messageId: 'test-dispatch-' + Date.now(),
+      from: 'system',
+      phone: null,
+      message: 'Dispatch pipeline test — if you receive this, webhooks are working!',
+      messageType: 'text',
+      isGroup: false,
+      timestamp: Math.floor(Date.now() / 1000),
+      pushName: 'System Test'
+    });
+
+    res.json({
+      success: true,
+      accountId,
+      totalWebhooks: webhooks.length,
+      activeWebhooks: webhooks.filter(w => w.is_active).length,
+      diagnostics,
+      queueStats: webhookDeliveryService.getStats(),
+      note: 'A test message event was dispatched through the full pipeline. Check your webhook endpoint for delivery.'
+    });
+  } catch (error) {
+    logger.error('Error in webhook dispatch test:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

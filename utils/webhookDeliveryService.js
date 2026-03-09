@@ -311,17 +311,30 @@ class WebhookDeliveryService {
 
   /**
    * Normalize the events field from the database.
-   * Handles TEXT[], JSON string, null/undefined, or already-an-array.
+   * Handles TEXT[], JSON string, PostgreSQL array literal, null/undefined, or already-an-array.
    */
   normalizeEvents(events) {
     if (!events) return ['message'];
-    if (Array.isArray(events)) return events;
+    if (Array.isArray(events)) {
+      // Empty array means "no events selected" — default to ['message'] so
+      // the webhook isn't silently dead.
+      return events.length > 0 ? events : ['message'];
+    }
     if (typeof events === 'string') {
+      // PostgreSQL TEXT[] literal format: {message,message.status}
+      // Supabase may return this as a raw string instead of a JS array
+      // depending on client version / connection pooler.
+      if (events.startsWith('{') && events.endsWith('}')) {
+        const inner = events.slice(1, -1);
+        if (!inner) return ['message']; // empty array literal '{}'
+        // Split on comma, strip optional quotes around each value
+        return inner.split(',').map(s => s.replace(/^"|"$/g, '').trim()).filter(Boolean);
+      }
       try {
         const parsed = JSON.parse(events);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) return parsed.length > 0 ? parsed : ['message'];
       } catch {
-        // Could be a single event name like 'message'
+        // Single event name like 'message'
         return [events];
       }
     }
@@ -350,7 +363,7 @@ class WebhookDeliveryService {
     }
 
     if (!webhooks || webhooks.length === 0) {
-      logger.info(`[WEBHOOK] No active webhooks for account ${accountId}`);
+      logger.debug(`[WEBHOOK] No active webhooks for account ${accountId} (event: ${event})`);
       return;
     }
 
@@ -359,12 +372,17 @@ class WebhookDeliveryService {
     let queued = 0;
     for (const webhook of webhooks) {
       try {
+        if (!webhook.url) {
+          logger.warn(`[WEBHOOK] Skipping webhook ${webhook.id} — missing URL`);
+          continue;
+        }
+
         // Check if webhook is subscribed to this event type
-        const events = this.normalizeEvents(webhook.events);
+        const rawEvents = webhook.events;
+        const events = this.normalizeEvents(rawEvents);
 
         if (!events.includes(event) && !events.includes('*')) {
-          // Log at INFO so users can actually see why a webhook was skipped
-          logger.info(`[WEBHOOK] Skipped ${webhook.url} — not subscribed to '${event}' (subscribed: [${events.join(', ')}])`);
+          logger.info(`[WEBHOOK] Skipped ${webhook.url} — not subscribed to '${event}' (subscribed: [${events.join(', ')}], raw: ${JSON.stringify(rawEvents)})`);
           continue;
         }
 
@@ -386,7 +404,7 @@ class WebhookDeliveryService {
     if (queued > 0) {
       logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);
     } else if (webhooks.length > 0) {
-      logger.warn(`[WEBHOOK] No webhooks matched event '${event}' — check event subscriptions in dashboard`);
+      logger.warn(`[WEBHOOK] No webhooks matched event '${event}' for account ${accountId} — check event subscriptions in dashboard`);
     }
   }
 }

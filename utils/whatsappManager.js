@@ -1712,7 +1712,7 @@ class WhatsAppManager {
         webhookDeliveryService.dispatch(accountId, 'connection', {
           status: 'connected',
           phoneNumber
-        });
+        }).catch(err => logger.error(`[WEBHOOK] Connection dispatch error: ${err.message}`));
       }
       } catch (error) {
         logger.error(`Error in connection.update handler for ${accountId}: ${error.message}`);
@@ -1796,7 +1796,7 @@ class WhatsAppManager {
             statusLabel: statusLabels[statusCode] || 'unknown',
             phone: resolvedPhone || null,
             timestamp: new Date().toISOString()
-          });
+          }).catch(err => logger.error(`[WEBHOOK] Status dispatch error: ${err.message}`));
         }
       }
     });
