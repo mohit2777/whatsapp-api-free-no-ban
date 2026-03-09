@@ -284,8 +284,17 @@ class WhatsAppManager {
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
     this.SESSION_SAVE_DEBOUNCE_MS = 5000; // Save session to DB at most once per 5s (critical for ephemeral filesystems)
+    this.periodicSessionSaveTimers = new Map(); // Periodic save timers per account
+    this.PERIODIC_SESSION_SAVE_MS = 60000; // Save session to DB every 60s as safety net
+    this.lastSessionHashes = new Map(); // Track last saved session hash to skip redundant writes
     this.ciphertextResetTimers = new Map(); // Track last assertSessions call per JID to debounce
     this.CIPHERTEXT_RESET_COOLDOWN_MS = 60000; // Only reset Signal session once per 60s per contact
+    // Outgoing message rate limiter — prevents burst-sending patterns
+    // that WhatsApp's detection systems flag as automation.
+    // Sliding window: max 30 messages per 60s per account.
+    this.messageSendTimestamps = new Map(); // accountId -> number[]
+    this.MAX_MESSAGES_PER_WINDOW = 30;
+    this.MESSAGE_WINDOW_MS = 60000;
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -785,6 +794,30 @@ class WhatsAppManager {
   }
 
   /**
+   * Check if account has exceeded outgoing message rate limit.
+   * Sliding window: MAX_MESSAGES_PER_WINDOW messages per MESSAGE_WINDOW_MS.
+   * Prevents burst-sending patterns that WhatsApp flags as automation.
+   */
+  _checkSendRateLimit(accountId) {
+    const now = Date.now();
+    let timestamps = this.messageSendTimestamps.get(accountId);
+    if (!timestamps) {
+      timestamps = [];
+      this.messageSendTimestamps.set(accountId, timestamps);
+    }
+    // Evict expired timestamps
+    const cutoff = now - this.MESSAGE_WINDOW_MS;
+    while (timestamps.length > 0 && timestamps[0] <= cutoff) {
+      timestamps.shift();
+    }
+    if (timestamps.length >= this.MAX_MESSAGES_PER_WINDOW) {
+      return false; // rate limited
+    }
+    timestamps.push(now);
+    return true; // allowed
+  }
+
+  /**
    * Initialize all accounts from database
    */
   async initializeAccounts() {
@@ -1144,6 +1177,22 @@ class WhatsAppManager {
 
       const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
+      // ── Wrap key store to detect Signal key changes ──
+      // CRITICAL: useMultiFileAuthState writes signal keys (sessions, pre-keys,
+      // sender-keys) to disk but does NOT trigger creds.update. Without this
+      // wrapper, signal key changes are NEVER persisted to the database.
+      // On ephemeral filesystems (Render), this means ALL signal sessions are
+      // lost on restart → CIPHERTEXT errors for every contact.
+      // This wrapper intercepts keys.set() to schedule a debounced DB save
+      // after each burst of signal key operations.
+      const originalKeysSet = state.keys.set.bind(state.keys);
+      state.keys.set = async (data) => {
+        await originalKeysSet(data);
+        // Schedule debounced session save — key operations come in bursts
+        // during session establishment, so we debounce to avoid write storms
+        this._scheduleSessionSave(accountId);
+      };
+
       // Get latest Baileys version (with fallback)
       let version;
       try {
@@ -1228,8 +1277,8 @@ class WhatsAppManager {
           // registered prevents Baileys from adding its own metadata
           return message;
         },
-        // Firewall / keep-alive tuning
-        keepAliveIntervalMs: 25000, // 25s keep-alive like real WA Web
+        // Firewall / keep-alive tuning — add jitter to avoid perfectly periodic pings
+        keepAliveIntervalMs: 20000 + Math.floor(Math.random() * 10000), // 20-30s like real WA Web
         retryRequestDelayMs: 250,
         // Keep message retry count conservative — excessive retries generate
         // abnormal traffic patterns that WhatsApp's detection systems flag.
@@ -1708,6 +1757,20 @@ class WhatsAppManager {
         // Save session to database
         await this.saveSession(accountId);
 
+        // Start periodic session saves (safety net for ephemeral filesystems)
+        this._startPeriodicSessionSave(accountId);
+
+        // Post-connect delayed save: capture any Signal key syncs that
+        // happen right after connection is established (history sync,
+        // pre-key replenishment, app-state-sync).
+        setTimeout(() => {
+          if (!this.isShuttingDown && !this.deletedAccounts.has(accountId)) {
+            this.saveSession(accountId).catch(e =>
+              logger.debug(`Post-connect delayed save failed for ${accountId}: ${e.message}`)
+            );
+          }
+        }, 15000);
+
         this.emit('account-status', { accountId, status: 'ready', phoneNumber });
         logger.info(`Account ${accountId} connected successfully (${phoneNumber})`);
 
@@ -1735,18 +1798,15 @@ class WhatsAppManager {
 
     // Credentials update — write to disk immediately, debounce DB persistence.
     // creds.update fires 10+ times during key exchange / session setup.
-    // The old approach of reading creds.json back and writing to DB on EACH
-    // event caused massive write storms, race conditions, and DB contention.
+    // The keys.set wrapper above also triggers debounced saves for Signal key
+    // changes, so we don't need to force-save on every creds.update anymore.
     // Disk files are the primary source of truth; DB is only for persistence
-    // across deploys/restarts. Debouncing coalesces rapid updates into a
-    // single DB write ~30s after the last event.
+    // across deploys/restarts.
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        // On ephemeral filesystems (Render, Railway), disk is wiped on restart.
-        // DB is the only persistent store → save immediately, not debounced.
-        // This prevents stale Signal pre-keys after crash/restart.
-        await this.saveSession(accountId);
+        // Debounced save to DB — coalesces rapid creds.update bursts
+        this._scheduleSessionSave(accountId);
       } catch (error) {
         logger.error(`Error saving creds for ${accountId}: ${error.message}`);
       }
@@ -2400,6 +2460,11 @@ class WhatsAppManager {
     // Resolve phone/LID/JID to the correct JID for sending
     const jid = await this.resolveRecipientJid(accountId, phone);
 
+    // Rate limit check — prevents burst sending that WhatsApp flags
+    if (!this._checkSendRateLimit(accountId)) {
+      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+    }
+
     // Check for duplicate
     if (this.isDuplicateMessage(accountId, jid, message)) {
       logger.warn(`Duplicate message blocked for ${phone}`);
@@ -2469,6 +2534,11 @@ class WhatsAppManager {
 
     // Resolve the JID (handles LID→phone mapping, bare numbers, etc.)
     const resolvedJid = await this.resolveRecipientJid(accountId, jid);
+
+    // Rate limit check
+    if (!this._checkSendRateLimit(accountId)) {
+      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+    }
 
     // Check for duplicate
     if (this.isDuplicateMessage(accountId, resolvedJid, message)) {
@@ -2550,6 +2620,11 @@ class WhatsAppManager {
 
     // Resolve recipient JID (handles phone, LID, JID formats)
     const jid = await this.resolveRecipientJid(accountId, phoneOrJid);
+
+    // Rate limit check
+    if (!this._checkSendRateLimit(accountId)) {
+      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+    }
 
     try {
       // Human-like media send behavior
@@ -2641,6 +2716,11 @@ class WhatsAppManager {
 
     const jid = await this.resolveRecipientJid(accountId, phoneOrJid);
 
+    // Rate limit check
+    if (!this._checkSendRateLimit(accountId)) {
+      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+    }
+
     try {
       await sock.sendPresenceUpdate('available').catch(() => {});
       await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
@@ -2684,6 +2764,9 @@ class WhatsAppManager {
    * Disconnect account
    */
   async disconnect(accountId, updateDb = true) {
+    // Stop periodic session saves
+    this._stopPeriodicSessionSave(accountId);
+
     const sock = this.connections.get(accountId);
     
     if (sock) {
@@ -2792,12 +2875,21 @@ class WhatsAppManager {
       }
 
       const encoded = Buffer.from(JSON.stringify(sessionData)).toString('base64');
+
+      // Hash-based change detection: skip DB write if session is unchanged
+      const hash = crypto.createHash('sha256').update(encoded).digest('hex');
+      const lastHash = this.lastSessionHashes.get(accountId);
+      if (hash === lastHash) {
+        logger.debug(`Session unchanged for account ${accountId}, skipping DB write`);
+        return;
+      }
       
       await db.updateAccount(accountId, { 
         session_data: encoded,
         last_session_saved: new Date().toISOString()
       });
 
+      this.lastSessionHashes.set(accountId, hash);
       logger.debug(`Session saved for account ${accountId} (${Object.keys(sessionData).length} files)`);
     } catch (error) {
       logger.error(`Failed to save session for account ${accountId}:`, error.message);
@@ -2839,6 +2931,39 @@ class WhatsAppManager {
   }
 
   /**
+   * Start periodic session save timer for an account.
+   * Acts as a safety net to ensure session state reaches the DB even if
+   * individual debounced saves are missed due to race conditions.
+   */
+  _startPeriodicSessionSave(accountId) {
+    this._stopPeriodicSessionSave(accountId);
+    const timer = setInterval(() => {
+      if (this.isShuttingDown || this.deletedAccounts.has(accountId)) {
+        this._stopPeriodicSessionSave(accountId);
+        return;
+      }
+      this.saveSession(accountId).catch(e =>
+        logger.debug(`Periodic session save failed for ${accountId}: ${e.message}`)
+      );
+    }, this.PERIODIC_SESSION_SAVE_MS);
+    // Allow Node to exit even if the timer is still running
+    timer.unref();
+    this.periodicSessionSaveTimers.set(accountId, timer);
+    logger.debug(`Started periodic session save for ${accountId} every ${this.PERIODIC_SESSION_SAVE_MS / 1000}s`);
+  }
+
+  /**
+   * Stop periodic session save timer for an account.
+   */
+  _stopPeriodicSessionSave(accountId) {
+    const timer = this.periodicSessionSaveTimers.get(accountId);
+    if (timer) {
+      clearInterval(timer);
+      this.periodicSessionSaveTimers.delete(accountId);
+    }
+  }
+
+  /**
    * Flush all pending debounced session saves immediately.
    * Called during graceful shutdown to ensure no session data is lost.
    */
@@ -2877,6 +3002,11 @@ class WhatsAppManager {
         await db.updateAccount(accountId, { session_data: null });
         return;
       }
+
+      // Seed the hash map so the first saveSession() after restore correctly
+      // detects whether keys have actually changed during initial sync.
+      const restoreHash = crypto.createHash('sha256').update(sessionData).digest('hex');
+      this.lastSessionHashes.set(accountId, restoreHash);
 
       if (!decoded || typeof decoded !== 'object') {
         logger.warn(`Invalid session data structure for account ${accountId}`);
@@ -3077,6 +3207,12 @@ class WhatsAppManager {
       clearTimeout(watchdog);
     }
     this.connectionWatchdogs.clear();
+
+    // Stop all periodic session save timers
+    for (const [accountId, timer] of this.periodicSessionSaveTimers) {
+      clearInterval(timer);
+    }
+    this.periodicSessionSaveTimers.clear();
 
     // Persist LID mappings one last time
     await this._persistLidMappings();
