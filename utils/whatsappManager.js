@@ -295,6 +295,17 @@ class WhatsAppManager {
     this.messageSendTimestamps = new Map(); // accountId -> number[]
     this.MAX_MESSAGES_PER_WINDOW = 30;
     this.MESSAGE_WINDOW_MS = 60000;
+    // onWhatsApp() rate limiter — Meta heavily monitors number-existence checks.
+    // Excessive calls trigger "number enumeration" detection → permanent ban.
+    this.onWhatsAppTimestamps = new Map(); // accountId -> number[]
+    this.MAX_ON_WHATSAPP_PER_WINDOW = 8; // max 8 checks per 60s per account
+    this.ON_WHATSAPP_WINDOW_MS = 60000;
+    this.onWhatsAppCache = new Map(); // "accountId:number" -> { jid, lid, exists, ts }
+    this.ON_WHATSAPP_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h cache for existence checks
+    // AI auto-reply loop breaker — prevents infinite exchange between AI-enabled accounts
+    this.aiReplyTracker = new Map(); // "accountId:contactId" -> { count, firstReplyTs }
+    this.AI_REPLY_MAX_PER_CONTACT = 3; // max consecutive AI replies to same contact
+    this.AI_REPLY_WINDOW_MS = 5 * 60 * 1000; // 5-minute window for counting replies
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -695,21 +706,13 @@ class WhatsAppManager {
           logger.info(`[RESOLVE] Converting @lid JID to phone JID: ${lidNumber}@lid → ${phoneFromLid}@s.whatsapp.net (LID sending broken on v6)`);
           return `${phoneFromLid}@s.whatsapp.net`;
         }
-        // No mapping — try onWhatsApp to find the phone number
-        const sock = this.connections.get(accountId);
-        if (sock) {
-          try {
-            // onWhatsApp can sometimes resolve LID to phone
-            const [result] = await sock.onWhatsApp(lidNumber) || [];
-            if (result?.exists && result?.jid) {
-              const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
-              if (result.lid) this.registerLidPhoneMapping(result.lid, phoneJid);
-              logger.info(`[RESOLVE] Resolved @lid via onWhatsApp: ${lidNumber}@lid → ${phoneJid}`);
-              return phoneJid;
-            }
-          } catch (err) {
-            logger.debug(`[RESOLVE] onWhatsApp failed for LID ${lidNumber}: ${err.message}`);
-          }
+        // No mapping — try rate-limited onWhatsApp to find the phone number
+        const result = await this._safeOnWhatsApp(accountId, lidNumber);
+        if (result?.exists && result?.jid) {
+          const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
+          if (result.lid) this.registerLidPhoneMapping(result.lid, phoneJid);
+          logger.info(`[RESOLVE] Resolved @lid via onWhatsApp: ${lidNumber}@lid → ${phoneJid}`);
+          return phoneJid;
         }
         // Last resort: send to @lid (may still fail but no other option)
         logger.warn(`[RESOLVE] No phone mapping for LID ${lidNumber}, sending to @lid as last resort (may cause "Waiting for message")`);
@@ -736,24 +739,17 @@ class WhatsAppManager {
     // 2. This is a phone number — ALWAYS send to @s.whatsapp.net
     //    (Do NOT redirect to LID even if mapping exists — LID sending is broken)
     
-    // 3. Try sock.onWhatsApp() to verify the number exists
-    const sock = this.connections.get(accountId);
-    if (sock) {
-      try {
-        const [result] = await sock.onWhatsApp(cleaned) || [];
-        if (result?.exists) {
-          // Register LID mapping for future reference (but don't USE the LID for sending)
-          if (result.lid) {
-            this.registerLidPhoneMapping(result.lid, result.jid);
-          }
-          // Always use the phone JID, never the LID
-          const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
-          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${phoneJid} (LID: ${result.lid || 'none'}, using phone JID)`);
-          return phoneJid;
-        }
-      } catch (err) {
-        logger.debug(`[RESOLVE] onWhatsApp failed for ${cleaned}: ${err.message}`);
+    // 3. Try rate-limited onWhatsApp() to verify the number exists
+    const result = await this._safeOnWhatsApp(accountId, cleaned);
+    if (result?.exists) {
+      // Register LID mapping for future reference (but don't USE the LID for sending)
+      if (result.lid) {
+        this.registerLidPhoneMapping(result.lid, result.jid);
       }
+      // Always use the phone JID, never the LID
+      const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
+      logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${phoneJid} (LID: ${result.lid || 'none'}, using phone JID)`);
+      return phoneJid;
     }
     
     // 4. Fallback: assume it's a phone number
@@ -818,6 +814,90 @@ class WhatsAppManager {
   }
 
   /**
+   * Rate-limited & cached onWhatsApp() call.
+   * Meta treats excessive onWhatsApp() as number enumeration → PERMANENT BAN.
+   * This wrapper enforces a sliding window (8 calls/60s) and caches results for 24h.
+   */
+  async _safeOnWhatsApp(accountId, number) {
+    const cacheKey = `${accountId}:${number}`;
+    const cached = this.onWhatsAppCache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts) < this.ON_WHATSAPP_CACHE_TTL_MS) {
+      return cached;
+    }
+
+    // Rate limit check
+    const now = Date.now();
+    let timestamps = this.onWhatsAppTimestamps.get(accountId);
+    if (!timestamps) {
+      timestamps = [];
+      this.onWhatsAppTimestamps.set(accountId, timestamps);
+    }
+    const cutoff = now - this.ON_WHATSAPP_WINDOW_MS;
+    while (timestamps.length > 0 && timestamps[0] <= cutoff) {
+      timestamps.shift();
+    }
+    if (timestamps.length >= this.MAX_ON_WHATSAPP_PER_WINDOW) {
+      logger.warn(`[RESOLVE] onWhatsApp rate limit hit for account ${accountId} (${timestamps.length}/${this.MAX_ON_WHATSAPP_PER_WINDOW} per ${this.ON_WHATSAPP_WINDOW_MS / 1000}s)`);
+      return null; // rate limited — return null, caller should use fallback
+    }
+
+    const sock = this.connections.get(accountId);
+    if (!sock) return null;
+
+    timestamps.push(now);
+    try {
+      const [result] = await sock.onWhatsApp(number) || [];
+      if (result) {
+        const entry = { jid: result.jid, lid: result.lid || null, exists: !!result.exists, ts: now };
+        this.onWhatsAppCache.set(cacheKey, entry);
+        // Evict old cache entries periodically
+        if (this.onWhatsAppCache.size > 5000) {
+          for (const [k, v] of this.onWhatsAppCache) {
+            if (now - v.ts > this.ON_WHATSAPP_CACHE_TTL_MS) this.onWhatsAppCache.delete(k);
+          }
+        }
+        return entry;
+      }
+    } catch (err) {
+      logger.debug(`[RESOLVE] onWhatsApp failed for ${number}: ${err.message}`);
+    }
+    return null;
+  }
+
+  /**
+   * Check if AI auto-reply is allowed for this contact (loop prevention).
+   * Returns true if reply is allowed, false if loop limit reached.
+   */
+  _checkAiReplyAllowed(accountId, contactId) {
+    const key = `${accountId}:${contactId}`;
+    const now = Date.now();
+    let tracker = this.aiReplyTracker.get(key);
+
+    if (!tracker || (now - tracker.firstReplyTs) > this.AI_REPLY_WINDOW_MS) {
+      // Window expired or first reply — start fresh
+      tracker = { count: 1, firstReplyTs: now };
+      this.aiReplyTracker.set(key, tracker);
+      return true;
+    }
+
+    if (tracker.count >= this.AI_REPLY_MAX_PER_CONTACT) {
+      logger.warn(`[AI] Loop guard: blocked AI reply to ${contactId} for account ${accountId} (${tracker.count} replies in ${Math.round((now - tracker.firstReplyTs) / 1000)}s)`);
+      return false;
+    }
+
+    tracker.count++;
+    return true;
+  }
+
+  /**
+   * Reset AI reply counter when a HUMAN message is received from a contact.
+   * (A human sending a new message breaks the AI-AI loop.)
+   */
+  _resetAiReplyCounter(accountId, contactId) {
+    this.aiReplyTracker.delete(`${accountId}:${contactId}`);
+  }
+
+  /**
    * Initialize all accounts from database
    */
   async initializeAccounts() {
@@ -843,9 +923,12 @@ class WhatsAppManager {
         // Stagger connections to avoid hitting WhatsApp servers all at once
         // Increased delay — multiple accounts connecting rapidly from the same IP
         // is a strong ban signal in WhatsApp's detection systems.
+        // Scale delay with account count: 10+ accounts need longer intervals.
         if (i < toConnect.length - 1) {
-          const staggerDelay = humanDelay(8000, 15000);
-          logger.debug(`Waiting ${staggerDelay}ms before next account initialization`);
+          const baseMin = toConnect.length >= 10 ? 25000 : 8000;
+          const baseMax = toConnect.length >= 10 ? 45000 : 15000;
+          const staggerDelay = humanDelay(baseMin, baseMax);
+          logger.debug(`Waiting ${staggerDelay}ms before next account initialization (${i + 1}/${toConnect.length})`);
           await new Promise(resolve => setTimeout(resolve, staggerDelay));
         }
       }
@@ -2035,22 +2118,14 @@ class WhatsAppManager {
           }
         }
 
-        // Strategy 2: Try onWhatsApp() API call as last resort (5s timeout)
+        // Strategy 2: Try rate-limited onWhatsApp() API call as last resort
         if (!senderInfo.phone) {
-          try {
-            const onWhatsAppPromise = sock.onWhatsApp(lidNumber);
-            const timeoutPromise = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('onWhatsApp timeout')), 5000)
-            );
-            const [result] = await Promise.race([onWhatsAppPromise, timeoutPromise]) || [];
-            if (result?.exists && result.jid && result.jid.includes('@s.whatsapp.net')) {
-              const resolvedPhone = result.jid.split('@')[0];
-              this.registerLidPhoneMapping(lidNumber, resolvedPhone);
-              senderInfo.phone = resolvedPhone;
-              logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via onWhatsApp()`);
-            }
-          } catch (err) {
-            logger.debug(`[LID-MAP] onWhatsApp() resolution failed for ${lidNumber}: ${err.message}`);
+          const result = await this._safeOnWhatsApp(accountId, lidNumber);
+          if (result?.exists && result.jid && result.jid.includes('@s.whatsapp.net')) {
+            const resolvedPhone = result.jid.split('@')[0];
+            this.registerLidPhoneMapping(lidNumber, resolvedPhone);
+            senderInfo.phone = resolvedPhone;
+            logger.info(`[LID-MAP] Resolved LID ${lidNumber} → phone ${resolvedPhone} via onWhatsApp()`);
           }
         }
 
@@ -2421,24 +2496,33 @@ class WhatsAppManager {
       }
 
       // AI Auto-reply (only for text messages, non-group)
-      if (messageType === 'text' && !isGroup) {
-        // Add human-like delay before AI responds
-        const aiDelay = humanDelay(2000, 6000);
-        setTimeout(() => {
-          aiAutoReply.generateReply({
-            accountId,
-            contactId,
-            message: messageText
-          }).then(aiReply => {
-            if (aiReply) {
-              this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
-                logger.error(`Failed to send AI reply: ${err.message}`);
-              });
-            }
-          }).catch(err => {
-            logger.error(`AI reply generation failed: ${err.message}`);
-          });
-        }, aiDelay);
+      // Incoming human message resets the AI reply counter for this contact
+      // (only count consecutive AI replies as a loop)
+      if (contactId) this._resetAiReplyCounter(accountId, contactId);
+
+      if (messageType === 'text' && !isGroup && contactId) {
+        // Loop guard: block if we've already sent MAX consecutive AI replies
+        if (!this._checkAiReplyAllowed(accountId, contactId)) {
+          logger.info(`[AI] Skipping auto-reply to ${contactId} for ${accountId} — loop guard active`);
+        } else {
+          // Add human-like delay before AI responds
+          const aiDelay = humanDelay(2000, 6000);
+          setTimeout(() => {
+            aiAutoReply.generateReply({
+              accountId,
+              contactId,
+              message: messageText
+            }).then(aiReply => {
+              if (aiReply) {
+                this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
+                  logger.error(`Failed to send AI reply: ${err.message}`);
+                });
+              }
+            }).catch(err => {
+              logger.error(`AI reply generation failed: ${err.message}`);
+            });
+          }, aiDelay);
+        }
       }
     } catch (error) {
       webhookDeliveryService.pipelineStats.handler_error++;
