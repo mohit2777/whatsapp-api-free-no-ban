@@ -40,6 +40,15 @@ const schemas = {
     mediaType: Joi.string().valid('image', 'document', 'audio', 'video').required()
   }),
 
+  // Send poll
+  sendPoll: Joi.object({
+    api_key: Joi.string().length(64).required(),
+    to: Joi.string().min(5).max(100).required(),
+    name: Joi.string().min(1).max(255).required(),
+    options: Joi.array().items(Joi.string().min(1).max(100)).min(2).max(12).required(),
+    selectableCount: Joi.number().integer().min(0).max(12).optional().default(0)
+  }),
+
   // Webhook
   webhook: Joi.object({
     url: Joi.string().uri().max(500).required(),

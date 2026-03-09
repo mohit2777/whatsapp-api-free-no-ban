@@ -290,6 +290,60 @@ curl -X POST https://your-app.onrender.com/api/send-media-url \
 
 ---
 
+### Send Poll
+
+Create a poll with 2–12 options. Set `selectableCount` to limit how many options a user can pick (`0` = unlimited).
+
+**Single-select poll:**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-poll \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "919876543210",
+    "name": "Where should we eat?",
+    "options": ["Pizza", "Sushi", "Tacos", "Burgers"],
+    "selectableCount": 1
+  }'
+```
+
+**Multi-select poll (unlimited selections):**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-poll \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "120363123456@g.us",
+    "name": "Which features do you want?",
+    "options": ["Dark mode", "Export PDF", "Notifications", "Multi-language"],
+    "selectableCount": 0
+  }'
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `api_key` | string | Yes | 64-char API key |
+| `to` | string | Yes | Phone with country code or group JID |
+| `name` | string | Yes | Poll question (max 255 chars) |
+| `options` | string[] | Yes | Array of 2–12 option strings (max 100 chars each) |
+| `selectableCount` | number | No | Max selections allowed. `0` = unlimited (default), `1` = single-select |
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "messageId": "ABCD1234567890",
+  "to": "919876543210@s.whatsapp.net",
+  "phone": "919876543210",
+  "timestamp": 1741521600000
+}
+```
+
+---
+
 ## 🤖 AI Auto-Reply Setup
 
 1. Go to Dashboard → Accounts
@@ -311,7 +365,7 @@ Webhooks send real-time events to your specified URL. Configure via dashboard or
 
 | Event | Description |
 |-------|-------------|
-| `message` | Incoming message (text, image, video, audio, document, sticker, location) |
+| `message` | Incoming message (text, image, video, audio, document, sticker, location, poll, poll vote) |
 | `message.status` | Message delivery status updates (sent, delivered, read) |
 | `connection` | Account connection/disconnection events |
 | `*` | Subscribe to all events |
@@ -388,9 +442,71 @@ Webhooks send real-time events to your specified URL. Configure via dashboard or
 | `from` | string | Sender phone number with country code |
 | `phone` | string | Resolved phone number (null if unavailable) |
 | `replyTo` | string | Use this value as `to` in `/api/send` to reply |
-| `messageType` | string | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, `ptt` |
+| `messageType` | string | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, `ptt`, `poll`, `poll_vote` |
 | `pushName` | string | Sender's WhatsApp display name |
 | `isGroup` | boolean | Whether the message is from a group chat |
+| `poll` | object | Poll data (only for `poll` and `poll_vote` message types) |
+
+---
+
+### Webhook: Incoming Poll (`message` with `messageType: "poll"`)
+
+When someone sends a poll, you receive the question and all options:
+
+```json
+{
+  "event": "message",
+  "timestamp": "2026-03-09T12:00:00.000Z",
+  "account_id": "uuid",
+  "data": {
+    "messageId": "ABC123",
+    "from": "919876543210",
+    "phone": "919876543210",
+    "message": "Where should we eat?",
+    "messageType": "poll",
+    "isGroup": false,
+    "timestamp": 1741521600,
+    "pushName": "John",
+    "replyTo": "919876543210",
+    "poll": {
+      "question": "Where should we eat?",
+      "options": ["Pizza", "Sushi", "Tacos", "Burgers"],
+      "selectableCount": 1
+    }
+  }
+}
+```
+
+### Webhook: Poll Vote (`message` with `messageType: "poll_vote"`)
+
+When someone votes on a poll, you receive their selected options:
+
+```json
+{
+  "event": "message",
+  "timestamp": "2026-03-09T12:00:00.000Z",
+  "account_id": "uuid",
+  "data": {
+    "messageId": "DEF456",
+    "from": "919876543210",
+    "phone": "919876543210",
+    "message": "[Poll Vote]",
+    "messageType": "poll_vote",
+    "isGroup": false,
+    "timestamp": 1741521700,
+    "pushName": "Jane",
+    "replyTo": "919876543210",
+    "poll": {
+      "pollMessageId": "ABC123",
+      "pollQuestion": "Where should we eat?",
+      "selectedOptions": ["Pizza"],
+      "voterTimestamp": 1741521700000
+    }
+  }
+}
+```
+
+> **Note:** Poll vote decryption requires the original poll creation message to still be in memory. If the server restarted since the poll was created, `selectedOptions` and `pollQuestion` may be unavailable.
 
 ---
 

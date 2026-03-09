@@ -476,6 +476,41 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
   }
 });
 
+// Send poll
+app.post('/api/send-poll', messageLimiter, validate(schemas.sendPoll), async (req, res) => {
+  try {
+    const { api_key, to, name, options, selectableCount } = req.body;
+
+    logger.info(`[API] /api/send-poll called - to: ${to}, question: ${name}`);
+
+    const account = await db.getAccountByApiKey(api_key);
+    if (!account) {
+      logger.warn('[API] Invalid API key');
+      return res.status(401).json({ success: false, error: 'Invalid API key' });
+    }
+
+    if (account.status !== 'ready') {
+      logger.warn(`[API] Account not ready: ${account.status}`);
+      return res.status(400).json({ success: false, error: 'Account not connected' });
+    }
+
+    logger.info(`[API] Sending poll via account ${account.id}`);
+    const result = await whatsappManager.sendPoll(
+      account.id,
+      to,
+      name,
+      options,
+      selectableCount || 0
+    );
+
+    logger.info(`[API] Poll sent successfully: ${result.messageId}`);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    logger.error('[API] Error sending poll:', error.message);
+    res.status(500).json({ success: false, error: error.message || 'Failed to send poll' });
+  }
+});
+
 // Send media via Base64 or URL
 app.post('/api/send-media-url', messageLimiter, async (req, res) => {
   try {

@@ -4,7 +4,7 @@
  * No browser/Chromium required - uses WebSocket protocol
  */
 
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, Browsers, downloadMediaMessage, getContentType, proto, isJidBroadcast, isJidNewsletter, isJidStatusBroadcast } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, jidDecode, jidNormalizedUser, Browsers, downloadMediaMessage, getContentType, proto, isJidBroadcast, isJidNewsletter, isJidStatusBroadcast } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
@@ -1896,6 +1896,7 @@ class WhatsAppManager {
       let mediaWidth = null;
       let mediaHeight = null;
       let thumbnailBase64 = null;
+      let pollData = null;
 
       const message = msg.message;
       if (!message) {
@@ -2010,10 +2011,76 @@ class WhatsAppManager {
       } else if (unwrapped.reactionMessage) {
         messageText = unwrapped.reactionMessage.text || '';
         messageType = 'reaction';
-      } else if (unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV3) {
-        const poll = unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV3;
+      } else if (unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV2 || unwrapped.pollCreationMessageV3) {
+        const poll = unwrapped.pollCreationMessage || unwrapped.pollCreationMessageV2 || unwrapped.pollCreationMessageV3;
         messageText = poll.name || '[Poll]';
         messageType = 'poll';
+        // Attach poll details for the webhook
+        pollData = {
+          question: poll.name || '',
+          options: (poll.options || []).map(o => o.optionName || ''),
+          selectableCount: poll.selectableOptionsCount || 0
+        };
+      } else if (unwrapped.pollUpdateMessage) {
+        // Poll vote received — extract voter and referenced poll
+        const pollUpdate = unwrapped.pollUpdateMessage;
+        const pollMsgKey = pollUpdate.pollCreationMessageKey;
+        messageType = 'poll_vote';
+        messageText = '[Poll Vote]';
+        pollData = {
+          pollMessageId: pollMsgKey?.id || null,
+          voterTimestamp: pollUpdate.senderTimestampMs
+            ? Number(pollUpdate.senderTimestampMs)
+            : null
+        };
+        // Try to decrypt the vote using the stored poll creation message
+        if (pollMsgKey?.id) {
+          try {
+            const pollCreationMsg = getMessage(pollMsgKey);
+            if (pollCreationMsg) {
+              const pollEncKey = pollCreationMsg.messageContextInfo?.messageSecret;
+              if (pollEncKey && pollUpdate.vote?.encPayload) {
+                const { decryptPollVote } = require('@whiskeysockets/baileys');
+                const meId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+                const pollCreatorJid = pollMsgKey.fromMe
+                  ? meId
+                  : (pollMsgKey.participant || pollMsgKey.remoteJid);
+                const voterJid = msg.key.fromMe
+                  ? meId
+                  : (msg.key.participant || msg.key.remoteJid);
+                const decrypted = decryptPollVote(
+                  pollUpdate.vote,
+                  {
+                    pollEncKey,
+                    pollCreatorJid,
+                    pollMsgId: pollMsgKey.id,
+                    voterJid
+                  }
+                );
+                // decrypted.selectedOptions is array of SHA256 hashes
+                // Map hashes back to option names using the poll creation message
+                const pollCreation = pollCreationMsg.pollCreationMessage
+                  || pollCreationMsg.pollCreationMessageV2
+                  || pollCreationMsg.pollCreationMessageV3;
+                if (pollCreation?.options) {
+                  const { createHash } = require('crypto');
+                  const hashToName = {};
+                  for (const opt of pollCreation.options) {
+                    const hash = createHash('sha256').update(Buffer.from(opt.optionName || '')).digest().toString();
+                    hashToName[hash] = opt.optionName;
+                  }
+                  pollData.selectedOptions = (decrypted.selectedOptions || []).map(h => {
+                    const hashStr = Buffer.from(h).toString();
+                    return hashToName[hashStr] || hashStr;
+                  });
+                  pollData.pollQuestion = pollCreation.name || null;
+                }
+              }
+            }
+          } catch (pollDecryptErr) {
+            logger.warn(`[MESSAGE] Failed to decrypt poll vote: ${pollDecryptErr.message}`);
+          }
+        }
       } else if (unwrapped.listMessage) {
         messageText = unwrapped.listMessage.description || unwrapped.listMessage.title || '[List]';
         messageType = 'list';
@@ -2109,6 +2176,11 @@ class WhatsAppManager {
         webhookPayload.participantPhone = participantPnPhone || (msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null);
         // For group replies, include group JID so n8n can send to the group
         webhookPayload.replyTo = remoteJid;
+      }
+
+      // Add poll data when available
+      if (pollData) {
+        webhookPayload.poll = pollData;
       }
 
       // Add media data when available
@@ -2395,6 +2467,60 @@ class WhatsAppManager {
       };
     } catch (error) {
       logger.error(`Failed to send media to ${phoneOrJid}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Send a poll message
+   * @param {string} phoneOrJid - Phone number, LID, or full JID
+   * @param {string} name - Poll question
+   * @param {string[]} values - Array of poll options (2-12)
+   * @param {number} selectableCount - How many options can be selected (0 = unlimited)
+   */
+  async sendPoll(accountId, phoneOrJid, name, values, selectableCount = 0) {
+    const sock = this.connections.get(accountId);
+    if (!sock) {
+      throw new Error('Account not connected');
+    }
+
+    const jid = await this.resolveRecipientJid(accountId, phoneOrJid);
+
+    try {
+      await sock.sendPresenceUpdate('available').catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
+      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(1000, 2500)));
+      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 500)));
+
+      const result = await sock.sendMessage(jid, {
+        poll: {
+          name,
+          values,
+          selectableCount: selectableCount || 0
+        }
+      });
+
+      if (result?.key && result?.message) storeMessage(result.key, result.message);
+
+      this.metrics.messagesSent++;
+      logger.info(`Poll sent to ${phoneOrJid} from account ${accountId}`);
+      this._scheduleSessionSave(accountId);
+
+      setTimeout(() => {
+        sock.sendPresenceUpdate('unavailable').catch(() => {});
+      }, humanDelay(3000, 10000));
+
+      return {
+        success: true,
+        messageId: result.key.id,
+        to: jid,
+        phone: this.getPhoneNumber(jid) || phoneOrJid,
+        timestamp: Date.now()
+      };
+    } catch (error) {
+      logger.error(`Failed to send poll to ${phoneOrJid}:`, error.message);
       throw error;
     }
   }
