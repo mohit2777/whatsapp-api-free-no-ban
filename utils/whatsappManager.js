@@ -1753,6 +1753,7 @@ class WhatsAppManager {
     // Incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       logger.debug(`messages.upsert event: type=${type}, count=${messages.length}`);
+      webhookDeliveryService.pipelineStats.upsert_events++;
 
       // Store messages in cache for retry system.
       // This is critical: when WA server asks us to re-send a message for
@@ -1772,22 +1773,32 @@ class WhatsAppManager {
 
       // Only process 'notify' type for webhook dispatch (not history sync)
       if (type !== 'notify') {
+        webhookDeliveryService.pipelineStats.upsert_not_notify++;
+        webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'upsert_filter', reason: `type=${type}`, count: messages.length, accountId });
         logger.info(`[MESSAGE] Ignoring messages.upsert batch (type=${type}, count=${messages.length}) — only 'notify' triggers webhooks`);
         return;
       }
 
+      webhookDeliveryService.pipelineStats.upsert_notify++;
+
       for (const msg of messages) {
+        webhookDeliveryService.pipelineStats.messages_total++;
+
         // Log incoming (non-fromMe) messages at INFO, own messages at DEBUG
         // to avoid log spam from history sync of sent messages
         if (msg.key.fromMe) {
+          webhookDeliveryService.pipelineStats.messages_from_me++;
           logger.debug(`[MESSAGE] messages.upsert: fromMe=true, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}`);
           continue;
         }
 
         logger.info(`[MESSAGE] messages.upsert: fromMe=false, remoteJid=${msg.key.remoteJid}, hasContent=${!!msg.message}, pushName=${msg.pushName || 'N/A'}`);
+        webhookDeliveryService.pipelineStats.messages_to_handler++;
 
         // Handle message in background to not block event loop
         this.handleIncomingMessage(accountId, msg).catch(err => {
+          webhookDeliveryService.pipelineStats.handler_error++;
+          webhookDeliveryService._logActivity({ type: 'pipeline_error', stage: 'handler_catch', error: err.message, accountId, remoteJid: msg.key.remoteJid });
           logger.error(`Error in message handler for account ${accountId}:`, err.message);
         });
       }
@@ -1915,9 +1926,12 @@ class WhatsAppManager {
   async handleIncomingMessage(accountId, msg) {
     try {
       this.metrics.messagesReceived++;
+      webhookDeliveryService.pipelineStats.handler_started++;
 
       const sock = this.connections.get(accountId);
       if (!sock) {
+        webhookDeliveryService.pipelineStats.handler_no_socket++;
+        webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_no_socket', accountId, remoteJid: msg.key.remoteJid });
         logger.warn(`Socket not found for account ${accountId}`);
         return;
       }
@@ -2003,8 +2017,11 @@ class WhatsAppManager {
 
       const message = msg.message;
       if (!message) {
+        webhookDeliveryService.pipelineStats.handler_null_message++;
         // Distinguish stub notifications (group events) from decryption failures
         if (msg.messageStubType === 2) {
+          webhookDeliveryService.pipelineStats.handler_ciphertext++;
+          webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: 'CIPHERTEXT_decryption_failure', accountId, remoteJid: remoteJid, pushName: msg.pushName || 'Unknown' });
           // StubType 2 = CIPHERTEXT: Baileys received the message but FAILED to
           // decrypt it. The Signal session with this contact is corrupted.
           // Baileys auto-sends up to 5 retry receipts, but if those also fail
@@ -2023,8 +2040,11 @@ class WhatsAppManager {
             logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
           }
         } else if (msg.messageStubType) {
+          webhookDeliveryService.pipelineStats.handler_stub_notification++;
+          webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: `stub_type_${msg.messageStubType}`, accountId, remoteJid: remoteJid });
           logger.info(`[MESSAGE] Notification stub from ${contactId} (stubType: ${msg.messageStubType}, pushName: ${msg.pushName || 'N/A'}) — no webhook sent.`);
         } else {
+          webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: 'null_message_no_stub', accountId, remoteJid: remoteJid, pushName: msg.pushName || 'Unknown' });
           logger.warn(`[MESSAGE] Received message from ${contactId} (pushName: ${msg.pushName || 'Unknown'}) but msg.message is null — likely decryption failure or empty notification. No webhook sent. msgId=${msg.key.id}`);
         }
         return;
@@ -2195,6 +2215,8 @@ class WhatsAppManager {
         messageType = 'order';
       } else if (unwrapped.protocolMessage) {
         // Skip protocol messages (message edits, deletes, etc.)
+        webhookDeliveryService.pipelineStats.handler_protocol_msg++;
+        webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_protocol_msg', protocolType: unwrapped.protocolMessage.type, accountId });
         logger.info(`[MESSAGE] Protocol message from ${contactId} (type: ${unwrapped.protocolMessage.type || 'unknown'}), skipping webhook`);
         return;
       } else {
@@ -2205,6 +2227,8 @@ class WhatsAppManager {
       }
 
       if (!messageText && messageType === 'text') {
+        webhookDeliveryService.pipelineStats.handler_empty_text++;
+        webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_empty_text', accountId, remoteJid: remoteJid });
         logger.warn(`[MESSAGE] Empty text message from ${contactId}, skipping webhook`);
         return;
       }
@@ -2301,6 +2325,7 @@ class WhatsAppManager {
 
       // Dispatch webhook
       logger.info(`[MESSAGE] Dispatching ${messageType} to webhooks for account ${accountId}...`);
+      webhookDeliveryService.pipelineStats.handler_dispatch_reached++;
       webhookDeliveryService.messageHandlerCalls++;
       webhookDeliveryService._logActivity({ type: 'message_received', accountId, messageType, from: senderInfo.phone || senderInfo.lid || 'unknown', pushName: msg.pushName || 'Unknown' });
       
@@ -2333,6 +2358,8 @@ class WhatsAppManager {
         }, aiDelay);
       }
     } catch (error) {
+      webhookDeliveryService.pipelineStats.handler_error++;
+      webhookDeliveryService._logActivity({ type: 'pipeline_error', stage: 'handler_exception', error: error.message, accountId, stack: error.stack?.split('\n').slice(0, 3).join(' | ') });
       logger.error(`Error handling message for account ${accountId}: ${error.message}`);
     }
   }

@@ -968,6 +968,25 @@ body {
 .activity-text em { color: var(--text-muted); font-style: italic; }
 .activity-account { color: var(--text-muted); font-size: 10px; min-width: 58px; text-align: right; flex-shrink: 0; }
 
+/* Pipeline Stats */
+.pipeline-stats { font-size: 13px; }
+.pipeline-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.pipeline-title { font-weight: 600; color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.pipeline-flow { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+.pipeline-stage { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 14px; background: var(--bg-dark); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 100px; flex: 1; position: relative; }
+.pipeline-stage.pipeline-success { border-color: var(--success); background: rgba(34, 197, 94, 0.06); }
+.pipeline-icon { font-size: 16px; }
+.pipeline-value { font-size: 22px; font-weight: 700; color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+.pipeline-label { font-size: 10px; color: var(--text-muted); text-align: center; text-transform: uppercase; letter-spacing: 0.3px; }
+.pipeline-drop { font-size: 9px; color: #f59e0b; margin-top: 2px; }
+.pipeline-drops, .pipeline-dispatch { margin-bottom: 12px; }
+.pipeline-drops-title { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.pipeline-drop-item { display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-radius: var(--radius-sm); font-size: 12px; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg-dark); margin-bottom: 3px; }
+.pipeline-drop-item.pipeline-success { background: rgba(34, 197, 94, 0.08); border-left: 3px solid var(--success); }
+.pipeline-drop-item.pipeline-warn { background: rgba(245, 158, 11, 0.08); border-left: 3px solid #f59e0b; }
+.pipeline-drop-value { font-weight: 700; min-width: 30px; color: var(--text); }
+.btn-xs { padding: 3px 8px; font-size: 10px; }
+
 /* Config Grid */
 .config-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
 

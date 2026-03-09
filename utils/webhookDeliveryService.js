@@ -32,6 +32,32 @@ class WebhookDeliveryService {
     this.activityLog = [];          // Recent entries
     this.activityLogMax = 100;      // Keep last 100 entries
     this.messageHandlerCalls = 0;   // How many times dispatch was called from message handler
+
+    // ── Pipeline diagnostic stats ──
+    // Tracks counts at every stage of the message→webhook pipeline so we can
+    // identify exactly WHERE messages are dropping.
+    this.pipelineStats = {
+      upsert_events: 0,          // messages.upsert event handler fired
+      upsert_notify: 0,          // type was 'notify' (real-time)
+      upsert_not_notify: 0,      // type was not 'notify' (history sync, skipped)
+      messages_total: 0,         // total messages in 'notify' batches
+      messages_from_me: 0,       // skipped: fromMe=true
+      messages_to_handler: 0,    // passed to handleIncomingMessage()
+      handler_started: 0,        // handleIncomingMessage() entered try block
+      handler_no_socket: 0,      // early return: socket not found
+      handler_null_message: 0,   // early return: msg.message is null
+      handler_ciphertext: 0,     // msg.message null + CIPHERTEXT stub
+      handler_stub_notification: 0, // msg.message null + other stub type
+      handler_protocol_msg: 0,   // skipped: protocol message
+      handler_empty_text: 0,     // skipped: empty text
+      handler_error: 0,          // exception in handler catch block
+      handler_dispatch_reached: 0, // successfully reached dispatch call
+      dispatch_called: 0,        // dispatch() method entered
+      dispatch_no_webhooks: 0,   // no active webhooks found in DB
+      dispatch_queued: 0,        // at least one webhook queued
+      dispatch_event_mismatch: 0, // webhooks found but none subscribed to event
+    };
+    this.pipelineStatsResetAt = new Date().toISOString();
   }
 
   /**
@@ -50,6 +76,28 @@ class WebhookDeliveryService {
    */
   getRecentActivity(limit = 50) {
     return this.activityLog.slice(-limit);
+  }
+
+  /**
+   * Get pipeline diagnostic stats
+   */
+  getPipelineStats() {
+    return {
+      ...this.pipelineStats,
+      resetAt: this.pipelineStatsResetAt,
+      messageHandlerCalls: this.messageHandlerCalls,
+    };
+  }
+
+  /**
+   * Reset pipeline diagnostic stats
+   */
+  resetPipelineStats() {
+    for (const key of Object.keys(this.pipelineStats)) {
+      this.pipelineStats[key] = 0;
+    }
+    this.pipelineStatsResetAt = new Date().toISOString();
+    this.messageHandlerCalls = 0;
   }
 
   /**
@@ -377,6 +425,7 @@ class WebhookDeliveryService {
    * Dispatch webhook to all active webhooks for an account
    */
   async dispatch(accountId, event, data) {
+    this.pipelineStats.dispatch_called++;
     let webhooks;
 
     // Retry fetching webhooks from DB up to 3 times
@@ -395,6 +444,7 @@ class WebhookDeliveryService {
     }
 
     if (!webhooks || webhooks.length === 0) {
+      this.pipelineStats.dispatch_no_webhooks++;
       logger.debug(`[WEBHOOK] No active webhooks for account ${accountId} (event: ${event})`);
       this._logActivity({ type: 'dispatch', accountId, event, webhookCount: 0, status: 'no_webhooks' });
       return;
@@ -437,8 +487,10 @@ class WebhookDeliveryService {
     this._logActivity({ type: 'dispatch', accountId, event, webhookCount: webhooks.length, queued, status: queued > 0 ? 'queued' : 'no_match' });
 
     if (queued > 0) {
+      this.pipelineStats.dispatch_queued++;
       logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);
     } else if (webhooks.length > 0) {
+      this.pipelineStats.dispatch_event_mismatch++;
       logger.warn(`[WEBHOOK] No webhooks matched event '${event}' for account ${accountId} — check event subscriptions in dashboard`);
     }
   }

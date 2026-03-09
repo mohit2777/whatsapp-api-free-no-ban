@@ -29,11 +29,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setInterval(loadAccounts, 30000);
     setInterval(loadHealth, 60000);
-    // Auto-refresh activity log every 10s when webhook tab is visible
+    // Auto-refresh activity log + pipeline stats every 10s when webhook tab is visible
     setInterval(() => {
         const webhooksView = document.getElementById('webhooksView');
         if (webhooksView && webhooksView.style.display !== 'none') {
             loadActivityLog();
+            loadPipelineStats();
         }
     }, 10000);
 });
@@ -126,7 +127,7 @@ function switchView(viewName) {
     document.getElementById('pageSubtitle').textContent = meta.subtitle || '';
 
     if (viewName === 'system') { loadHealth(); renderActiveConnections(); }
-    else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); loadActivityLog(); }
+    else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); loadActivityLog(); loadPipelineStats(); }
 
     document.getElementById('sidebar')?.classList.remove('open');
 }
@@ -317,6 +318,105 @@ async function loadActivityLog() {
     }
 }
 
+async function loadPipelineStats() {
+    try {
+        const data = await apiCall('/api/webhooks/pipeline-stats');
+        if (!data.success) return;
+        renderPipelineStats(data.pipeline || {});
+    } catch (error) {
+        console.error('Failed to load pipeline stats:', error);
+    }
+}
+
+function renderPipelineStats(p) {
+    const container = document.getElementById('pipelineStats');
+    if (!container) return;
+
+    const resetTime = p.resetAt ? new Date(p.resetAt).toLocaleTimeString() : 'N/A';
+
+    // Calculate drop-off at each stage
+    const stages = [
+        { label: 'Baileys events fired', value: p.upsert_events, icon: '📡', cls: '' },
+        { label: 'Events type=notify', value: p.upsert_notify, icon: '🔔', cls: '', drop: p.upsert_not_notify > 0 ? `${p.upsert_not_notify} history sync skipped` : null },
+        { label: 'Messages received', value: p.messages_total, icon: '📨', cls: '' },
+        { label: 'Passed to handler', value: p.messages_to_handler, icon: '➡️', cls: '', drop: p.messages_from_me > 0 ? `${p.messages_from_me} fromMe skipped` : null },
+        { label: 'Handler started', value: p.handler_started, icon: '⚙️', cls: '' },
+        { label: 'Dispatch reached', value: p.handler_dispatch_reached, icon: '🎯', cls: 'pipeline-success' },
+    ];
+
+    const drops = [
+        { label: 'No socket', value: p.handler_no_socket, icon: '🔌' },
+        { label: 'Null message (decrypt fail)', value: p.handler_null_message, icon: '🔐' },
+        { label: 'CIPHERTEXT errors', value: p.handler_ciphertext, icon: '💔' },
+        { label: 'Stub notifications', value: p.handler_stub_notification, icon: '📋' },
+        { label: 'Protocol messages', value: p.handler_protocol_msg, icon: '⏭️' },
+        { label: 'Empty text', value: p.handler_empty_text, icon: '📝' },
+        { label: 'Handler errors', value: p.handler_error, icon: '💥' },
+    ].filter(d => d.value > 0);
+
+    const dispatchStats = [
+        { label: 'dispatch() called', value: p.dispatch_called, icon: '📤' },
+        { label: 'No webhooks in DB', value: p.dispatch_no_webhooks, icon: '⚠️' },
+        { label: 'Event mismatch', value: p.dispatch_event_mismatch, icon: '🔀' },
+        { label: 'Successfully queued', value: p.dispatch_queued, icon: '✅' },
+    ];
+
+    let html = `<div class="pipeline-header">
+        <span class="pipeline-title">Message Pipeline (since ${resetTime})</span>
+        <button class="btn btn-xs btn-outline" onclick="resetPipelineStats()">Reset Counters</button>
+    </div>`;
+
+    // Flow stages
+    html += '<div class="pipeline-flow">';
+    for (const s of stages) {
+        html += `<div class="pipeline-stage ${s.cls}">
+            <span class="pipeline-icon">${s.icon}</span>
+            <span class="pipeline-value">${s.value}</span>
+            <span class="pipeline-label">${s.label}</span>
+            ${s.drop ? `<span class="pipeline-drop">${s.drop}</span>` : ''}
+        </div>`;
+    }
+    html += '</div>';
+
+    // Drop-off reasons
+    if (drops.length > 0) {
+        html += '<div class="pipeline-drops"><div class="pipeline-drops-title">Drop-off reasons:</div>';
+        for (const d of drops) {
+            html += `<div class="pipeline-drop-item">
+                <span class="pipeline-icon">${d.icon}</span>
+                <span class="pipeline-drop-value">${d.value}</span>
+                <span class="pipeline-label">${d.label}</span>
+            </div>`;
+        }
+        html += '</div>';
+    }
+
+    // Dispatch stats
+    html += '<div class="pipeline-dispatch"><div class="pipeline-drops-title">Webhook dispatch:</div>';
+    for (const d of dispatchStats) {
+        const highlight = d.value > 0 && d.label === 'Successfully queued' ? ' pipeline-success' : '';
+        const warn = d.value > 0 && (d.label === 'No webhooks in DB' || d.label === 'Event mismatch') ? ' pipeline-warn' : '';
+        html += `<div class="pipeline-drop-item${highlight}${warn}">
+            <span class="pipeline-icon">${d.icon}</span>
+            <span class="pipeline-drop-value">${d.value}</span>
+            <span class="pipeline-label">${d.label}</span>
+        </div>`;
+    }
+    html += '</div>';
+
+    container.innerHTML = html;
+}
+
+async function resetPipelineStats() {
+    try {
+        await apiCall('/api/webhooks/pipeline-stats/reset', { method: 'POST' });
+        showToast('Pipeline stats reset', 'info');
+        loadPipelineStats();
+    } catch (error) {
+        console.error('Failed to reset pipeline stats:', error);
+    }
+}
+
 function renderActivityLog(entries) {
     const container = document.getElementById('activityLog');
     if (!container) return;
@@ -362,6 +462,22 @@ function renderActivityLog(entries) {
                 <span class="activity-time">${time}</span>
                 <span class="activity-icon">💥</span>
                 <span class="activity-text">Dispatch error: ${e.error}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        if (e.type === 'pipeline_skip') {
+            return `<div class="activity-entry activity-warn">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">⏭️</span>
+                <span class="activity-text">Pipeline skip at <strong>${e.stage}</strong>: ${e.reason || 'unknown'}${e.pushName ? ` (${e.pushName})` : ''}${e.remoteJid ? ` [${e.remoteJid.substring(0, 15)}...]` : ''}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        if (e.type === 'pipeline_error') {
+            return `<div class="activity-entry activity-fail">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">💥</span>
+                <span class="activity-text">Pipeline error at <strong>${e.stage}</strong>: ${e.error || 'unknown'}</span>
                 <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
             </div>`;
         }

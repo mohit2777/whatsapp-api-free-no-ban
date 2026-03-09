@@ -776,6 +776,30 @@ app.get('/api/webhooks/activity-log', requireAuth, apiLimiter, async (req, res) 
   }
 });
 
+// Pipeline diagnostic stats — shows exactly where messages drop in the pipeline
+app.get('/api/webhooks/pipeline-stats', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      pipeline: webhookDeliveryService.getPipelineStats()
+    });
+  } catch (error) {
+    logger.error('Error fetching pipeline stats:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Reset pipeline stats counters
+app.post('/api/webhooks/pipeline-stats/reset', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    webhookDeliveryService.resetPipelineStats();
+    res.json({ success: true, message: 'Pipeline stats reset' });
+  } catch (error) {
+    logger.error('Error resetting pipeline stats:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================================================
 // AI CONFIG API
 // ============================================================================
