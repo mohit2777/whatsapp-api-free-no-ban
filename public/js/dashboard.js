@@ -13,6 +13,7 @@ let socket = null;
 let activePollingAccountId = null;
 let qrGeneratedAt = null;
 let qrTimerInterval = null;
+let lastQr = null;
 
 // ============================================================================
 // Initialization
@@ -151,6 +152,7 @@ function closeModal(modalId) {
         activePollingAccountId = null;
         if (qrTimerInterval) { clearInterval(qrTimerInterval); qrTimerInterval = null; }
         qrGeneratedAt = null;
+        lastQr = null;
         const qrContainer = document.getElementById('qrContainer');
         if (qrContainer) {
             qrContainer.innerHTML = '<div class="qr-placeholder"><div class="qr-spinner"></div><p>Initializing connection...</p></div>';
@@ -352,7 +354,7 @@ async function pollQrCode(accountId) {
 
     let attempts = 0;
     const maxAttempts = 90;
-    let lastQr = null;
+    lastQr = null;
     let qrDisplayed = false;
 
     const poll = async () => {
@@ -429,7 +431,12 @@ function displayQrCode(qrDataUrl) {
     qrGeneratedAt = Date.now();
 
     qrContainer.innerHTML = `
-        <img src="${qrDataUrl}" alt="QR Code">
+        <img src="${qrDataUrl}" alt="QR Code" id="qrImage">
+        <div class="qr-actions">
+            <button class="btn btn-sm btn-outline" onclick="shareQrCode()" title="Share / Download QR">
+                <i class="fas fa-share-alt"></i> Share QR
+            </button>
+        </div>
         <div class="qr-timer-bar">
             <div class="qr-timer-fill" id="qrTimerFill"></div>
         </div>
@@ -459,11 +466,45 @@ function displayQrCode(qrDataUrl) {
                 timer.textContent = `Hurry! ${remaining}s left`;
                 timer.style.color = 'var(--warning)';
             } else {
-                timer.textContent = 'Refreshing QR code...';
-                timer.style.color = 'var(--info)';
+                clearInterval(qrTimerInterval);
+                qrTimerInterval = null;
+                qrGeneratedAt = null;
+                lastQr = null;
+                const qrContainer = document.getElementById('qrContainer');
+                if (qrContainer) {
+                    qrContainer.innerHTML = '<div class="qr-placeholder"><div class="qr-spinner"></div><p>Refreshing QR code...</p></div>';
+                }
+                return;
             }
         }
     }, 1000);
+}
+
+async function shareQrCode() {
+    const img = document.getElementById('qrImage');
+    if (!img) return;
+    try {
+        const res = await fetch(img.src);
+        const blob = await res.blob();
+        const file = new File([blob], 'whatsapp-qr.png', { type: 'image/png' });
+        if (navigator.share && navigator.canShare?.({ files: [file] })) {
+            await navigator.share({ files: [file], title: 'WhatsApp QR Code' });
+        } else {
+            const a = document.createElement('a');
+            a.href = img.src;
+            a.download = 'whatsapp-qr.png';
+            a.click();
+            showToast('QR code downloaded', 'success');
+        }
+    } catch (e) {
+        if (e.name !== 'AbortError') {
+            const a = document.createElement('a');
+            a.href = img.src;
+            a.download = 'whatsapp-qr.png';
+            a.click();
+            showToast('QR code downloaded', 'success');
+        }
+    }
 }
 
 async function logout() {

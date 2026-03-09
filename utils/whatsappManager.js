@@ -19,12 +19,58 @@ const webhookDeliveryService = require('./webhookDeliveryService');
 const aiAutoReply = require('./aiAutoReply');
 
 // ============================================================================
-// ============================================================================\n// CONFIGURATION (libsignal noise handled by silent pino logger)\n// ============================================================================
+// PLATFORM FIX: WhatsApp rejects Platform.WEB (value 14) since Feb 2026.
+// Baileys hardcodes Platform.WEB in validate-connection.ts, but WA servers now
+// require Platform.MACOS (value 24). PR #2365 fixes this in Baileys source but
+// hasn't been merged yet. Monkey-patch the proto enum so Baileys sends MACOS.
+// CAVEAT: Newsletters may not work with MACOS platform, but we already skip
+// newsletters via shouldIgnoreJid, so this is acceptable.
+// TODO: Remove this patch once Baileys merges PR #2365.
+// ============================================================================
+if (proto?.ClientPayload?.UserAgent?.Platform && proto.ClientPayload.UserAgent.Platform.WEB === 14) {
+  proto.ClientPayload.UserAgent.Platform.WEB = 24; // Remap WEB → MACOS value
+  // Update reverse mapping so protobuf serialization works correctly
+  proto.ClientPayload.UserAgent.Platform[24] = 'WEB';
+}
+
+// ============================================================================
+// CONFIGURATION (libsignal noise handled by silent pino logger)
+// ============================================================================
 
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
 // Message retry counter cache
 const msgRetryCounterCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
+
+// ============================================================================
+// WA VERSION CACHE
+// ============================================================================
+// fetchLatestBaileysVersion() makes an HTTP request to WhatsApp's endpoint.
+// Calling it on every connect() creates unnecessary traffic and latency.
+// Cache the result for 6 hours — versions change infrequently.
+// ============================================================================
+let _cachedWaVersion = null;
+let _cachedWaVersionTime = 0;
+const WA_VERSION_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
+
+async function getCachedWaVersion() {
+  const now = Date.now();
+  if (_cachedWaVersion && (now - _cachedWaVersionTime) < WA_VERSION_CACHE_TTL) {
+    return _cachedWaVersion;
+  }
+  try {
+    const result = await fetchLatestBaileysVersion();
+    _cachedWaVersion = result.version;
+    _cachedWaVersionTime = now;
+    return _cachedWaVersion;
+  } catch (err) {
+    // If fetch fails but we have a stale cache, use it
+    if (_cachedWaVersion) {
+      return _cachedWaVersion;
+    }
+    throw err;
+  }
+}
 
 // ============================================================================
 // MESSAGE STORE FOR RETRY SYSTEM
@@ -925,9 +971,15 @@ class WhatsAppManager {
 
       // Restore session from database if exists
       // restoreSession validates creds before writing — if invalid, it clears session_data
-      // and we fall through to a fresh QR code flow
-      if (account.session_data) {
+      // and we fall through to a fresh QR code flow.
+      // SKIP restore if auth files already exist on disk (same-process reconnect,
+      // e.g. after QR scan). Disk files are more up-to-date than DB because
+      // creds.update events may have fired after the last DB save.
+      const authFilesExist = await fs.access(path.join(authPath, 'creds.json')).then(() => true).catch(() => false);
+      if (account.session_data && !authFilesExist) {
         await this.restoreSession(accountId, account.session_data, authPath);
+      } else if (authFilesExist) {
+        logger.debug(`Auth files already on disk for ${accountId}, skipping DB restore`);
       }
 
       // Clean up any stale/partial auth files before Baileys reads them
@@ -953,11 +1005,10 @@ class WhatsAppManager {
       // Get latest Baileys version (with fallback)
       let version;
       try {
-        const versionResult = await fetchLatestBaileysVersion();
-        version = versionResult.version;
+        version = await getCachedWaVersion();
       } catch (versionErr) {
         logger.warn(`Failed to fetch Baileys version, using fallback: ${versionErr.message}`);
-        version = [2, 3000, 1015901307];
+        version = [2, 3000, 1034740716];
       }
 
       // Create silent logger for Baileys
@@ -992,8 +1043,8 @@ class WhatsAppManager {
             logger.debug(`[RETRY] Found stored message for retry: ${key.id}`);
             return stored;
           }
-          logger.debug(`[RETRY] No stored message found for ${key.id}, returning empty`);
-          return { conversation: '' };
+          logger.debug(`[RETRY] No stored message found for ${key.id}, skipping retry`);
+          return undefined;
         },
 
         // ── shouldIgnoreJid: reduces Bad MAC / session noise ──
@@ -1232,11 +1283,18 @@ class WhatsAppManager {
             error_message: null
           }).catch(e => logger.warn(`Failed to update account status: ${e.message}`));
           this.emit('account-status', { accountId, status: 'reconnecting', message: 'QR scanned, reconnecting...' });
+
+          // CRITICAL: Clear rate limiter so the post-pair reconnect isn't
+          // blocked by the 120s minReconnectInterval. The initial connect()
+          // set lastConnectionAttempt just 20-60s ago (while QR was showing),
+          // and now isNewAccount=false (session was saved). Without this clear,
+          // the reconnect would be delayed 60-100s, causing WA server to
+          // abandon the pairing and show an error on the phone.
+          this.lastConnectionAttempt.delete(accountId);
           
-          // Wait 6 seconds (not 3) to give WhatsApp servers time to fully
-          // process the new session. Reconnecting too fast after pairing
-          // triggers 440 (session conflict) errors which can lead to bans.
-          this.scheduleReconnect(accountId, 6000);
+          // Wait 3 seconds for WA servers to process the new session.
+          // 6s was too conservative — WA expects the client back within ~5s.
+          this.scheduleReconnect(accountId, 3000);
           return;
         }
 
@@ -1273,6 +1331,40 @@ class WhatsAppManager {
         // Status 440 = Session conflict - CRITICAL: handle carefully to prevent ban
         if (statusCode === 440) {
           await this.handleSessionConflict(accountId);
+          return;
+        }
+
+        // Status 405 = Method Not Allowed — WhatsApp rejected the client payload
+        // (platform/version mismatch). Don't auto-reconnect with the same config;
+        // the session needs a fresh start with correct platform identification.
+        if (statusCode === 405) {
+          logger.error(`Platform/version rejected (405) for ${accountId} — WhatsApp rejected client payload`);
+          this.connectionStates.set(accountId, { status: 'error', error: 'Platform rejected by WhatsApp' });
+          await db.updateAccount(accountId, {
+            status: 'error',
+            error_message: 'WhatsApp rejected the connection (405). Please try reconnecting — the app will use updated platform settings.'
+          }).catch(e => logger.warn(`Failed to update account: ${e.message}`));
+          this.emit('account-status', { accountId, status: 'error', message: 'Platform rejected — click Reconnect' });
+          return;
+        }
+
+        // Status 409 = Conflict — another instance is using this session.
+        // Treat like 440 (session conflict) but don't count toward conflict limit
+        // since 409 is a one-off server-side arbitration, not a persistent problem.
+        if (statusCode === 409) {
+          logger.warn(`Session conflict (409) for ${accountId} — another instance may be active`);
+          this.connectionStates.set(accountId, { status: 'reconnecting' });
+          this.emit('account-status', { accountId, status: 'reconnecting', message: 'Resolving session conflict...' });
+          // Wait 2 minutes before retry to let the other instance release
+          this.scheduleReconnect(accountId, 120000 + Math.floor(Math.random() * 15000));
+          return;
+        }
+
+        // Status 412 = Precondition Failed — session pre-keys are outdated or invalid.
+        // Clear session and force re-authentication to regenerate all keys.
+        if (statusCode === 412) {
+          logger.warn(`Precondition failed (412) for ${accountId} — pre-keys outdated, clearing session`);
+          await this.clearCorruptedSession(accountId);
           return;
         }
 

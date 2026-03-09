@@ -717,6 +717,32 @@ body {
     border: 2px solid var(--border);
 }
 
+.qr-actions {
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+}
+
+.qr-actions .btn {
+    font-size: 12px;
+    padding: 6px 14px;
+    border-radius: 20px;
+}
+
+.btn-outline {
+    background: transparent;
+    border: 1px solid var(--border-light);
+    color: var(--text-secondary);
+    transition: all 0.2s;
+}
+
+.btn-outline:hover {
+    border-color: var(--primary);
+    color: var(--primary);
+    background: var(--primary-glow);
+}
+
 .qr-timer-bar {
     width: 100%;
     max-width: 280px;
