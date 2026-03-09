@@ -49,11 +49,19 @@ const schemas = {
     selectableCount: Joi.number().integer().min(0).max(12).optional().default(0)
   }),
 
-  // Webhook
+  // Webhook (create)
   webhook: Joi.object({
     url: Joi.string().uri().max(500).required(),
     secret: Joi.string().max(255).optional().allow(''),
-    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'presence', 'connection', 'connection.update', 'presence.update', '*')).optional(),
+    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'presence', 'connection', 'connection.update', 'presence.update', 'poll', 'poll_vote', '*')).optional(),
+    is_active: Joi.boolean().optional()
+  }),
+
+  // Webhook (update — url is optional so you can toggle is_active alone)
+  webhookUpdate: Joi.object({
+    url: Joi.string().uri().max(500).optional(),
+    secret: Joi.string().max(255).optional().allow(''),
+    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'presence', 'connection', 'connection.update', 'presence.update', 'poll', 'poll_vote', '*')).optional(),
     is_active: Joi.boolean().optional()
   }),
 

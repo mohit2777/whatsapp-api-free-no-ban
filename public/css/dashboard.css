@@ -1123,6 +1123,97 @@ body {
     transition: all 0.2s;
 }
 
+/* Account ID Badge */
+.account-id-badge {
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 11px;
+    color: var(--primary);
+    background: var(--primary-glow, rgba(37, 211, 102, 0.08));
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+    border: 1px solid transparent;
+    display: inline-block;
+}
+.account-id-badge:hover {
+    border-color: var(--primary);
+    background: rgba(37, 211, 102, 0.15);
+}
+
+/* Webhook ID Badge */
+.webhook-id-badge {
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 10px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.2s;
+}
+.webhook-id-badge:hover {
+    color: var(--primary);
+}
+
+/* Event Badges */
+.event-badges-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.event-badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.event-badge i { font-size: 9px; opacity: 0.7; }
+
+/* Toggle Switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    cursor: pointer;
+}
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+.toggle-slider {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg-hover);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    transition: all 0.3s;
+}
+.toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: all 0.3s;
+}
+.toggle-switch input:checked + .toggle-slider {
+    background: var(--primary);
+    border-color: var(--primary);
+}
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(18px);
+    background: white;
+}
+
 .copy-btn:hover { background: var(--primary); color: white; border-color: var(--primary); }
 
 .code-block pre {

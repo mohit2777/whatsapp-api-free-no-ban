@@ -664,7 +664,8 @@ function populateWebhookAccountSelect() {
     accounts.forEach(account => {
         const option = document.createElement('option');
         option.value = account.id;
-        option.textContent = `${account.name} (${account.phone_number || 'Not connected'})`;
+        const shortId = account.id.substring(0, 8);
+        option.textContent = `${account.name} (${account.phone_number || 'Not connected'}) [${shortId}…]`;
         if (account.id === currentValue) option.selected = true;
         select.appendChild(option);
     });
@@ -709,10 +710,19 @@ function renderWebhooks(webhooks, accountId) {
     }
 
     let html = `
+        <div style="margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-primary" onclick="showAddWebhookForm('${accountId}')">
+                <i class="fas fa-plus"></i> Add Webhook
+            </button>
+            <button class="btn btn-info" onclick="testDispatch('${accountId}')">
+                <i class="fas fa-paper-plane"></i> Test Full Dispatch
+            </button>
+        </div>
         <table class="table">
             <thead>
                 <tr>
                     <th>URL</th>
+                    <th>Events</th>
                     <th>Status</th>
                     <th>Actions</th>
                 </tr>
@@ -721,21 +731,34 @@ function renderWebhooks(webhooks, accountId) {
     `;
 
     webhooks.forEach(webhook => {
-        const urlShort = webhook.url.length > 50 ? webhook.url.substring(0, 50) + '...' : webhook.url;
+        const urlShort = webhook.url.length > 45 ? webhook.url.substring(0, 45) + '...' : webhook.url;
+        const events = Array.isArray(webhook.events) ? webhook.events : ['message'];
+        const eventBadges = events.map(e => {
+            const icons = { 'message': 'fa-envelope', 'message.status': 'fa-check-double', 'connection': 'fa-plug', '*': 'fa-asterisk', 'poll': 'fa-poll-h', 'poll_vote': 'fa-vote-yea' };
+            return `<span class="event-badge"><i class="fas ${icons[e] || 'fa-tag'}"></i> ${e}</span>`;
+        }).join(' ');
+
         html += `
             <tr>
                 <td>
-                    <code style="font-family: var(--font-mono, monospace); font-size: 12px; color: var(--text-secondary);" title="${escapeHtml(webhook.url)}">
-                        ${escapeHtml(urlShort)}
-                    </code>
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                        <code style="font-family: var(--font-mono, monospace); font-size: 12px; color: var(--text-secondary); word-break: break-all;" title="${escapeHtml(webhook.url)}">
+                            ${escapeHtml(urlShort)}
+                        </code>
+                        <code class="webhook-id-badge" onclick="copyToClipboard('${escapeHtml(webhook.id)}')" title="Click to copy webhook ID">ID: ${webhook.id.substring(0, 8)}…</code>
+                    </div>
                 </td>
                 <td>
-                    <span class="status-badge ${webhook.is_active ? 'ready' : 'disconnected'}">
-                        ${webhook.is_active ? 'Active' : 'Inactive'}
-                    </span>
+                    <div class="event-badges-wrap">${eventBadges}</div>
+                </td>
+                <td>
+                    <label class="toggle-switch" title="Toggle active/inactive">
+                        <input type="checkbox" ${webhook.is_active ? 'checked' : ''} onchange="toggleWebhook('${webhook.id}', this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
                 </td>
                 <td class="action-buttons">
-                    <button class="btn btn-sm btn-info" onclick="testWebhook('${webhook.id}')" title="Test">
+                    <button class="btn btn-sm btn-info" onclick="testWebhook('${webhook.id}')" title="Test Delivery">
                         <i class="fas fa-bolt"></i>
                     </button>
                     <button class="btn btn-sm btn-danger" onclick="deleteWebhook('${webhook.id}')" title="Delete">
@@ -745,12 +768,7 @@ function renderWebhooks(webhooks, accountId) {
             </tr>`;
     });
 
-    html += `</tbody></table>
-        <div style="margin-top: 16px;">
-            <button class="btn btn-primary" onclick="showAddWebhookForm('${accountId}')">
-                <i class="fas fa-plus"></i> Add Webhook
-            </button>
-        </div>`;
+    html += `</tbody></table>`;
 
     container.innerHTML = html;
 }
@@ -801,11 +819,63 @@ async function addWebhook(accountId) {
 async function testWebhook(webhookId) {
     try {
         const data = await apiCall(`/api/webhooks/${webhookId}/test`, { method: 'POST' });
-        if (data.success) showToast('Webhook test successful', 'success');
-        else showToast(`Webhook test failed: ${data.error}`, 'error');
+        if (data.success) {
+            let msg = 'Webhook test successful!';
+            if (data.debug) {
+                const evts = (data.debug.normalizedEvents || []).join(', ');
+                msg += ` Events: [${evts}]`;
+            }
+            showToast(msg, 'success');
+        } else {
+            showToast(`Webhook test failed: ${data.error}`, 'error');
+        }
     } catch (error) {
         console.error('Failed to test webhook:', error);
     }
+}
+
+async function toggleWebhook(webhookId, isActive) {
+    try {
+        await apiCall(`/api/webhooks/${webhookId}`, {
+            method: 'PUT',
+            body: JSON.stringify({ is_active: isActive })
+        });
+        showToast(`Webhook ${isActive ? 'activated' : 'deactivated'}`, 'success');
+    } catch (error) {
+        console.error('Failed to toggle webhook:', error);
+        loadWebhooksForAccount(); // Revert UI on failure
+    }
+}
+
+async function testDispatch(accountId) {
+    try {
+        showToast('Sending test dispatch through full pipeline...', 'info');
+        const data = await apiCall(`/api/accounts/${accountId}/webhooks/test-dispatch`, { method: 'POST' });
+        if (data.success) {
+            const matched = (data.diagnostics || []).filter(d => d.matchesMessage).length;
+            const total = data.totalWebhooks || 0;
+            let msg = `Dispatched to ${matched}/${total} webhook(s).`;
+            if (matched === 0 && total > 0) {
+                msg += ' None subscribed to "message" event — check event config!';
+                showToast(msg, 'error');
+            } else if (matched > 0) {
+                msg += ' Check your endpoint for delivery.';
+                showToast(msg, 'success');
+            } else {
+                showToast('No webhooks configured for this account.', 'error');
+            }
+            // Log diagnostics to console for debugging
+            console.log('[Webhook Dispatch Diagnostics]', data.diagnostics);
+        }
+    } catch (error) {
+        console.error('Failed to test dispatch:', error);
+    }
+}
+
+function copyToClipboard(text) {
+    navigator.clipboard.writeText(text).then(() => {
+        showToast('Copied to clipboard', 'success');
+    }).catch(() => showToast('Failed to copy', 'error'));
 }
 
 async function deleteWebhook(webhookId) {
@@ -828,7 +898,7 @@ function renderAccountsTable() {
     const tbodyFull = document.getElementById('accountsTableFull');
 
     if (accounts.length === 0) {
-        const emptyRow = `<tr><td colspan="6" class="empty-state">
+        const emptyRow = `<tr><td colspan="7" class="empty-state">
             <div class="empty-icon"><i class="fas fa-users"></i></div>
             <p>No accounts yet. Create one to get started!</p>
         </td></tr>`;
@@ -842,7 +912,9 @@ function renderAccountsTable() {
 
     // Dashboard table
     if (tbody) {
-        tbody.innerHTML = accounts.map(account => `
+        tbody.innerHTML = accounts.map(account => {
+            const shortId = account.id.substring(0, 8);
+            return `
             <tr>
                 <td>
                     <div style="display: flex; align-items: center; gap: 10px;">
@@ -852,18 +924,23 @@ function renderAccountsTable() {
                         <strong>${escapeHtml(account.name)}</strong>
                     </div>
                 </td>
+                <td>
+                    <code class="account-id-badge" onclick="copyToClipboard('${escapeHtml(account.id)}')" title="Click to copy full ID: ${escapeHtml(account.id)}">${shortId}…</code>
+                </td>
                 <td><span style="font-family: var(--font-mono, monospace); font-size: 13px; color: var(--text-secondary);">${account.phone_number || '-'}</span></td>
                 <td>${renderStatusBadge(account.runtimeStatus || account.status)}</td>
                 <td class="action-buttons">
                     ${renderAccountActions(account)}
                 </td>
-            </tr>
-        `).join('');
+            </tr>`;
+        }).join('');
     }
 
     // Full accounts table
     if (tbodyFull) {
-        tbodyFull.innerHTML = accounts.map(account => `
+        tbodyFull.innerHTML = accounts.map(account => {
+            const shortId = account.id.substring(0, 8);
+            return `
             <tr>
                 <td>
                     <div style="display: flex; align-items: center; gap: 10px;">
@@ -873,6 +950,9 @@ function renderAccountsTable() {
                         <strong>${escapeHtml(account.name)}</strong>
                     </div>
                 </td>
+                <td>
+                    <code class="account-id-badge" onclick="copyToClipboard('${escapeHtml(account.id)}')" title="Click to copy full ID: ${escapeHtml(account.id)}">${shortId}…</code>
+                </td>
                 <td><span style="font-family: var(--font-mono, monospace); font-size: 13px; color: var(--text-secondary);">${account.phone_number || '-'}</span></td>
                 <td>${renderStatusBadge(account.runtimeStatus || account.status)}</td>
                 <td>${renderApiKey(account.api_key)}</td>
@@ -880,8 +960,8 @@ function renderAccountsTable() {
                 <td class="action-buttons">
                     ${renderAccountActions(account, true)}
                 </td>
-            </tr>
-        `).join('');
+            </tr>`;
+        }).join('');
     }
 }
 

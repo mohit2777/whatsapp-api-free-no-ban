@@ -626,10 +626,15 @@ app.get('/api/accounts/:id/webhooks', requireAuth, apiLimiter, async (req, res) 
 
 app.post('/api/accounts/:id/webhooks', requireAuth, webhookLimiter, validate(schemas.webhook), async (req, res) => {
   try {
-    const webhook = await db.createWebhook({
+    const webhookData = {
       account_id: req.params.id,
-      ...req.body
-    });
+      url: req.body.url,
+      secret: req.body.secret || null,
+      events: req.body.events || ['message'],
+      is_active: true
+    };
+    const webhook = await db.createWebhook(webhookData);
+    logger.info(`[WEBHOOK] Created webhook ${webhook.id} for account ${req.params.id} → ${webhook.url} (events: ${JSON.stringify(webhook.events)})`);
     res.status(201).json({ success: true, webhook });
   } catch (error) {
     logger.error('Error creating webhook:', error);
@@ -637,9 +642,10 @@ app.post('/api/accounts/:id/webhooks', requireAuth, webhookLimiter, validate(sch
   }
 });
 
-app.put('/api/webhooks/:id', requireAuth, webhookLimiter, validate(schemas.webhook), async (req, res) => {
+app.put('/api/webhooks/:id', requireAuth, webhookLimiter, validate(schemas.webhookUpdate), async (req, res) => {
   try {
     const webhook = await db.updateWebhook(req.params.id, req.body);
+    logger.info(`[WEBHOOK] Updated webhook ${req.params.id} → ${JSON.stringify(req.body)}`);
     res.json({ success: true, webhook });
   } catch (error) {
     logger.error('Error updating webhook:', error);
