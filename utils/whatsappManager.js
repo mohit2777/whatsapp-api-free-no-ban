@@ -79,25 +79,49 @@ async function getCachedWaVersion() {
 // mechanism (when WA server requests a message re-send for decryption).
 // Without this, retries fail silently and messages can't be decrypted.
 // We keep a bounded LRU-style cache of recently sent/received messages.
+//
+// CRITICAL: getMessage() must return proto.IMessage (the .message property),
+// NOT the full WAMessage object. Returning the wrong type causes Baileys to
+// fail silently during Signal session renegotiation.
+// See: lettabot PR #358, Baileys #1767
 // ============================================================================
-const MESSAGE_STORE_MAX = 5000;
+const MESSAGE_STORE_MAX = 10000;
 const messageStore = new Map(); // key: `${remoteJid}|${msgId}` → proto.Message
+const messageIdIndex = new Map(); // key: msgId → storeKey (for fallback lookup)
 
 function storeMessage(key, message) {
   if (!key?.id || !message) return;
   const storeKey = `${key.remoteJid}|${key.id}`;
   messageStore.set(storeKey, message);
+  // Also index by just the message ID for fallback lookups
+  // (when remoteJid changes between @lid and @s.whatsapp.net)
+  messageIdIndex.set(key.id, storeKey);
   // Evict oldest entries when cache grows too large
   if (messageStore.size > MESSAGE_STORE_MAX) {
     const firstKey = messageStore.keys().next().value;
+    const firstMsgId = firstKey.split('|')[1];
     messageStore.delete(firstKey);
+    messageIdIndex.delete(firstMsgId);
   }
 }
 
 function getStoredMessage(key) {
   if (!key?.id) return undefined;
+  
+  // Primary lookup: exact remoteJid + msgId match
   const storeKey = `${key.remoteJid}|${key.id}`;
-  return messageStore.get(storeKey);
+  const exact = messageStore.get(storeKey);
+  if (exact) return exact;
+  
+  // Fallback: lookup by just message ID
+  // This handles LID/PN addressing inversion — message was stored with
+  // one JID format but retry request comes with a different format
+  const fallbackKey = messageIdIndex.get(key.id);
+  if (fallbackKey) {
+    return messageStore.get(fallbackKey);
+  }
+  
+  return undefined;
 }
 
 // Duplicate message prevention
@@ -547,9 +571,19 @@ class WhatsAppManager {
 
   /**
    * Resolve a 'to' value to the correct JID for sending.
-   * CRITICAL: Must send to the SAME JID format as the active conversation.
-   * If the conversation is on @lid, sending to @s.whatsapp.net will corrupt
-   * the Signal encryption session and cause CIPHERTEXT failures.
+   * CRITICAL FIX: Always send to @s.whatsapp.net (phone JID), NEVER to @lid.
+   *
+   * On Baileys v6.7.21, LID-based sending is broken because:
+   * 1. LID/PN transaction race conditions corrupt Signal session ratchets
+   *    (concurrent encrypt/decrypt ops on PN and LID for same contact use
+   *    different mutex keys → Bad MAC / Failed to decrypt)
+   * 2. migrateSession() aggressively deletes PN sessions when copying to LID,
+   *    causing in-flight PN messages to fail with "No matching session"
+   * 3. Signal sessions are established on @s.whatsapp.net but we were
+   *    encrypting for @lid → recipient can't decrypt → "Waiting for message"
+   *
+   * See: Baileys #1767, #1769, #1964, #2340, #2372
+   *
    * Supports: phone numbers, LIDs, phone@s.whatsapp.net, lid@lid, group@g.us
    */
   async resolveRecipientJid(accountId, to) {
@@ -559,8 +593,44 @@ class WhatsAppManager {
     
     const trimmed = to.trim();
     
-    // Already has a JID suffix — use as-is (user explicitly chose the format)
+    // Already has a JID suffix — handle each format
     if (trimmed.includes('@')) {
+      // Group JIDs — pass through unchanged
+      if (trimmed.endsWith('@g.us') || trimmed.endsWith('@broadcast') || trimmed.endsWith('@newsletter')) {
+        return trimmed;
+      }
+      
+      // If it's an @lid JID, convert to phone JID if we have the mapping
+      // LID-based sending causes "Waiting for message" on Baileys v6.7.21
+      if (trimmed.endsWith('@lid')) {
+        const lidNumber = trimmed.split('@')[0];
+        const phoneFromLid = this.lidToPhone.get(lidNumber);
+        if (phoneFromLid) {
+          logger.info(`[RESOLVE] Converting @lid JID to phone JID: ${lidNumber}@lid → ${phoneFromLid}@s.whatsapp.net (LID sending broken on v6)`);
+          return `${phoneFromLid}@s.whatsapp.net`;
+        }
+        // No mapping — try onWhatsApp to find the phone number
+        const sock = this.connections.get(accountId);
+        if (sock) {
+          try {
+            // onWhatsApp can sometimes resolve LID to phone
+            const [result] = await sock.onWhatsApp(lidNumber) || [];
+            if (result?.exists && result?.jid) {
+              const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
+              if (result.lid) this.registerLidPhoneMapping(result.lid, phoneJid);
+              logger.info(`[RESOLVE] Resolved @lid via onWhatsApp: ${lidNumber}@lid → ${phoneJid}`);
+              return phoneJid;
+            }
+          } catch (err) {
+            logger.debug(`[RESOLVE] onWhatsApp failed for LID ${lidNumber}: ${err.message}`);
+          }
+        }
+        // Last resort: send to @lid (may still fail but no other option)
+        logger.warn(`[RESOLVE] No phone mapping for LID ${lidNumber}, sending to @lid as last resort (may cause "Waiting for message")`);
+        return trimmed;
+      }
+      
+      // @s.whatsapp.net — pass through (already phone format)
       return trimmed;
     }
     
@@ -570,47 +640,38 @@ class WhatsAppManager {
       throw new Error('Invalid recipient: no digits found');
     }
     
-    // 1. Check if this number is a known LID number → send to LID JID
-    //    (the input IS a LID number, resolve to phone for sending)
+    // 1. Check if this number is a known LID number → resolve to PHONE JID
     const phoneFromLid = this.lidToPhone.get(cleaned);
     if (phoneFromLid) {
-      // This number is a LID. Check if the phone has an active LID conversation
-      // Send to LID JID to preserve Signal session integrity
-      logger.info(`[RESOLVE] ${cleaned} is a known LID → phone ${phoneFromLid}, sending to LID JID to preserve Signal session`);
-      return `${cleaned}@lid`;
+      logger.info(`[RESOLVE] ${cleaned} is a known LID → phone ${phoneFromLid}, sending to phone JID (LID sending disabled)`);
+      return `${phoneFromLid}@s.whatsapp.net`;
     }
     
-    // 2. Check if this is a phone number with a known LID mapping
-    //    → send to LID JID because WhatsApp migrated this conversation to LID
-    const lidFromPhone = this.phoneToLid.get(cleaned);
-    if (lidFromPhone) {
-      logger.info(`[RESOLVE] Phone ${cleaned} has LID mapping ${lidFromPhone}, sending to LID JID to preserve Signal session`);
-      return `${lidFromPhone}@lid`;
-    }
+    // 2. This is a phone number — ALWAYS send to @s.whatsapp.net
+    //    (Do NOT redirect to LID even if mapping exists — LID sending is broken)
     
-    // 3. Try sock.onWhatsApp() to verify the number and get JID + LID
+    // 3. Try sock.onWhatsApp() to verify the number exists
     const sock = this.connections.get(accountId);
     if (sock) {
       try {
         const [result] = await sock.onWhatsApp(cleaned) || [];
         if (result?.exists) {
-          // Register the mapping for future use
+          // Register LID mapping for future reference (but don't USE the LID for sending)
           if (result.lid) {
             this.registerLidPhoneMapping(result.lid, result.jid);
-            // If WhatsApp tells us there's a LID, use it to preserve session
-            logger.info(`[RESOLVE] ${cleaned} verified → jid: ${result.jid}, lid: ${result.lid}, using LID JID`);
-            return result.lid;
           }
-          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${result.jid} (no LID)`);
-          return result.jid;
+          // Always use the phone JID, never the LID
+          const phoneJid = result.jid.endsWith('@s.whatsapp.net') ? result.jid : `${result.jid.split('@')[0]}@s.whatsapp.net`;
+          logger.info(`[RESOLVE] ${cleaned} verified on WhatsApp → ${phoneJid} (LID: ${result.lid || 'none'}, using phone JID)`);
+          return phoneJid;
         }
       } catch (err) {
         logger.debug(`[RESOLVE] onWhatsApp failed for ${cleaned}: ${err.message}`);
       }
     }
     
-    // 4. Fallback: assume it's a phone number (most common case)
-    logger.info(`[RESOLVE] ${cleaned} not in mapping, assuming phone number`);
+    // 4. Fallback: assume it's a phone number
+    logger.info(`[RESOLVE] ${cleaned} not verified, assuming phone number → ${cleaned}@s.whatsapp.net`);
     return `${cleaned}@s.whatsapp.net`;
   }
 
@@ -1037,13 +1098,15 @@ class WhatsAppManager {
         // When WA server can't decrypt a message, it asks the client to
         // re-send the original message content. Without this, the retry
         // fails silently, causing Bad MAC errors and lost messages.
+        // MUST return proto.IMessage (not WAMessage), or undefined.
+        // See: Baileys #1767, lettabot PR #358
         getMessage: async (key) => {
           const stored = getStoredMessage(key);
           if (stored) {
-            logger.debug(`[RETRY] Found stored message for retry: ${key.id}`);
+            logger.info(`[RETRY] getMessage() found stored message for retry: msgId=${key.id}, remoteJid=${key.remoteJid}`);
             return stored;
           }
-          logger.debug(`[RETRY] No stored message found for ${key.id}, skipping retry`);
+          logger.warn(`[RETRY] getMessage() MISS — no stored message for msgId=${key.id}, remoteJid=${key.remoteJid}. Recipient will see "Waiting for message".`);
           return undefined;
         },
 
