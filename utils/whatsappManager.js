@@ -2245,28 +2245,27 @@ class WhatsAppManager {
       const webhookPayload = {
         messageId: msg.key.id,
         from: senderInfo.phone || senderInfo.lid,  // Best identifier: phone if resolved, else LID
-        phone: senderInfo.phone || null,            // Resolved phone number (null if only LID available)
         message: messageText,
         messageType,
         isGroup,
         timestamp: msg.messageTimestamp,
         pushName: msg.pushName || 'Unknown',
-        // replyTo: the identifier to use when sending a reply back via /api/send
-        // For 1:1 chats: the sender's phone number (with country code)
-        // For groups: the group JID
-        replyTo: isGroup ? remoteJid : (senderInfo.phone || senderInfo.lid || null),
       };
 
-      // Add group info
+      // Include LID only when available (useful for LID-based systems)
+      if (senderInfo.lid) {
+        webhookPayload.lid = senderInfo.lid;
+      }
+
+      // Add group info — replyTo only included for groups (carries group JID)
       if (isGroup) {
+        webhookPayload.replyTo = remoteJid;
         webhookPayload.groupJid = remoteJid;
         webhookPayload.participant = msg.key.participant || null;
         // Use participantPn from message key first (most reliable), then fallback to mapping
         const participantPnJid = msg.key.participantPn;
         const participantPnPhone = participantPnJid ? participantPnJid.split('@')[0] : null;
         webhookPayload.participantPhone = participantPnPhone || (msg.key.participant ? this.getPhoneNumber(msg.key.participant) : null);
-        // For group replies, include group JID so n8n can send to the group
-        webhookPayload.replyTo = remoteJid;
       }
 
       // Add poll data when available

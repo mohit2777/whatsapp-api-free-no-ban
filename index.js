@@ -734,7 +734,6 @@ app.post('/api/accounts/:id/webhooks/test-dispatch', requireAuth, webhookLimiter
     await webhookDeliveryService.dispatch(accountId, 'message', {
       messageId: 'test-dispatch-' + Date.now(),
       from: 'system',
-      phone: null,
       message: 'Dispatch pipeline test — if you receive this, webhooks are working!',
       messageType: 'text',
       isGroup: false,
