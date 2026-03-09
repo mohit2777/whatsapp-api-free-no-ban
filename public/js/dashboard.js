@@ -985,6 +985,13 @@ async function deleteWebhook(webhookId) {
 // Rendering
 // ============================================================================
 
+function renderProfileAvatar(account, size = 36) {
+    if (account.profilePicUrl) {
+        return `<img src="${escapeHtml(account.profilePicUrl)}" alt="" class="profile-avatar" style="width:${size}px;height:${size}px;" onerror="this.outerHTML='<div class=\\'profile-avatar-fallback\\' style=\\'width:${size}px;height:${size}px;font-size:${Math.round(size*0.4)}px\\'><i class=\\'fas fa-user\\'></i></div>'">`;
+    }
+    return `<div class="profile-avatar-fallback" style="width:${size}px;height:${size}px;font-size:${Math.round(size*0.4)}px"><i class="fas fa-user"></i></div>`;
+}
+
 function renderAccountsTable() {
     const tbody = document.getElementById('accountsTable');
     const tbodyFull = document.getElementById('accountsTableFull');
@@ -1006,14 +1013,14 @@ function renderAccountsTable() {
     if (tbody) {
         tbody.innerHTML = accounts.map(account => {
             const shortId = account.id.substring(0, 8);
+            const avatar = renderProfileAvatar(account, 36);
+            const displayName = account.pushName ? `${escapeHtml(account.name)} <span class="push-name-label">${escapeHtml(account.pushName)}</span>` : escapeHtml(account.name);
             return `
             <tr>
                 <td>
                     <div style="display: flex; align-items: center; gap: 10px;">
-                        <div style="width: 36px; height: 36px; background: var(--primary-glow); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--primary); font-size: 14px;">
-                            <i class="fas fa-user"></i>
-                        </div>
-                        <strong>${escapeHtml(account.name)}</strong>
+                        ${avatar}
+                        <strong>${displayName}</strong>
                     </div>
                 </td>
                 <td>
@@ -1032,14 +1039,14 @@ function renderAccountsTable() {
     if (tbodyFull) {
         tbodyFull.innerHTML = accounts.map(account => {
             const shortId = account.id.substring(0, 8);
+            const avatar = renderProfileAvatar(account, 32);
+            const displayName = account.pushName ? `${escapeHtml(account.name)} <span class="push-name-label">${escapeHtml(account.pushName)}</span>` : escapeHtml(account.name);
             return `
             <tr>
                 <td>
                     <div style="display: flex; align-items: center; gap: 10px;">
-                        <div style="width: 32px; height: 32px; background: var(--primary-glow); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: var(--primary); font-size: 12px;">
-                            <i class="fas fa-user"></i>
-                        </div>
-                        <strong>${escapeHtml(account.name)}</strong>
+                        ${avatar}
+                        <strong>${displayName}</strong>
                     </div>
                 </td>
                 <td>
@@ -1134,14 +1141,16 @@ function renderActiveConnections() {
         const status = account.runtimeStatus || account.status;
         const dotColor = status === 'ready' ? 'green' : (status === 'initializing' ? 'yellow' : 'red');
         const statusLabel = status === 'ready' ? 'Connected' : (status === 'initializing' ? 'Reconnecting' : 'Disconnected');
+        const avatar = renderProfileAvatar(account, 28);
 
         return `
             <div class="connection-item">
                 <div class="connection-left">
                     <div class="connection-dot ${dotColor}"></div>
+                    ${avatar}
                     <div>
                         <div class="connection-name">${escapeHtml(account.name)}</div>
-                        <div class="connection-status">${statusLabel}</div>
+                        <div class="connection-status">${statusLabel}${account.pushName ? ' · ' + escapeHtml(account.pushName) : ''}</div>
                     </div>
                 </div>
                 <div class="connection-meta">

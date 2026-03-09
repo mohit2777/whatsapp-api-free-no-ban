@@ -1677,8 +1677,20 @@ class WhatsAppManager {
         this.clearConnectionWatchdog(accountId);
         
         const phoneNumber = sock.user?.id ? this.getPhoneNumber(sock.user.id) : null;
+        const pushName = sock.user?.name || null;
         
-        this.connectionStates.set(accountId, { status: 'ready', phoneNumber });
+        // Fetch profile picture in background (don't block connection)
+        let profilePicUrl = null;
+        try {
+          const userJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+          if (userJid) {
+            profilePicUrl = await sock.profilePictureUrl(userJid, 'image').catch(() => null);
+          }
+        } catch (e) {
+          logger.debug(`Could not fetch profile picture for ${accountId}: ${e.message}`);
+        }
+
+        this.connectionStates.set(accountId, { status: 'ready', phoneNumber, pushName, profilePicUrl });
         this.reconnectAttempts.delete(accountId);
         this.sessionConflictCounts.delete(accountId); // Reset conflict counter on success
         this.connectionLocks.delete(accountId);

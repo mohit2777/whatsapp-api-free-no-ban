@@ -302,6 +302,8 @@ app.get('/api/accounts', requireAuth, apiLimiter, async (req, res) => {
       return {
         ...account,
         runtimeStatus: runtimeStatus.status,
+        pushName: runtimeStatus.pushName || null,
+        profilePicUrl: runtimeStatus.profilePicUrl || null,
         ai_active: aiActiveMap[account.id],
         session_data: undefined // Don't expose session data
       };
@@ -338,6 +340,8 @@ app.get('/api/accounts/:id', requireAuth, apiLimiter, async (req, res) => {
       account: {
         ...account,
         runtimeStatus: runtimeStatus.status,
+        pushName: runtimeStatus.pushName || null,
+        profilePicUrl: runtimeStatus.profilePicUrl || null,
         session_data: undefined
       }
     });
