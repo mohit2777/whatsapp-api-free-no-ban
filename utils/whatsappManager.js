@@ -86,22 +86,31 @@ async function getCachedWaVersion() {
 // See: lettabot PR #358, Baileys #1767
 // ============================================================================
 const MESSAGE_STORE_MAX = 10000;
+const MESSAGE_STORE_PERSIST_MAX = 1000; // Only persist the most recent N for disk
 const messageStore = new Map(); // key: `${remoteJid}|${msgId}` → proto.Message
 const messageIdIndex = new Map(); // key: msgId → storeKey (for fallback lookup)
+let messageStoreDirty = false;
+let messageStoreSaveTimer = null;
+const MESSAGE_STORE_SAVE_INTERVAL = 30000; // Persist to disk every 30s if dirty
 
 function storeMessage(key, message) {
   if (!key?.id || !message) return;
   const storeKey = `${key.remoteJid}|${key.id}`;
   messageStore.set(storeKey, message);
-  // Also index by just the message ID for fallback lookups
-  // (when remoteJid changes between @lid and @s.whatsapp.net)
   messageIdIndex.set(key.id, storeKey);
-  // Evict oldest entries when cache grows too large
+  messageStoreDirty = true;
+  // Evict oldest entries when either map grows too large
   if (messageStore.size > MESSAGE_STORE_MAX) {
     const firstKey = messageStore.keys().next().value;
     const firstMsgId = firstKey.split('|')[1];
     messageStore.delete(firstKey);
     messageIdIndex.delete(firstMsgId);
+  }
+  if (messageIdIndex.size > MESSAGE_STORE_MAX + 1000) {
+    // Safety cap — trim stale index entries not in messageStore
+    for (const [mid, sk] of messageIdIndex) {
+      if (!messageStore.has(sk)) messageIdIndex.delete(mid);
+    }
   }
 }
 
@@ -122,6 +131,72 @@ function getStoredMessage(key) {
   }
   
   return undefined;
+}
+
+// ── Persist message store to disk for retry survival across restarts ──
+// Only the most recent MESSAGE_STORE_PERSIST_MAX entries are saved.
+async function saveMessageStoreToDisk() {
+  if (!messageStoreDirty) return;
+  try {
+    const storePath = path.join(__dirname, '..', 'data', 'message-store.json');
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    // Take the last N entries from messageStore
+    const entries = Array.from(messageStore.entries());
+    const recent = entries.slice(-MESSAGE_STORE_PERSIST_MAX);
+    const serializable = recent.map(([k, v]) => {
+      try {
+        return [k, proto.Message.toObject(v, { defaults: false })];
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+    await fs.writeFile(storePath, JSON.stringify(serializable), 'utf8');
+    messageStoreDirty = false;
+    logger.debug(`[MSG-STORE] Persisted ${serializable.length} messages to disk`);
+  } catch (err) {
+    logger.warn(`[MSG-STORE] Failed to persist message store: ${err.message}`);
+  }
+}
+
+async function loadMessageStoreFromDisk() {
+  try {
+    const storePath = path.join(__dirname, '..', 'data', 'message-store.json');
+    const data = await fs.readFile(storePath, 'utf8');
+    const entries = JSON.parse(data);
+    let loaded = 0;
+    for (const [k, v] of entries) {
+      try {
+        const msg = proto.Message.fromObject(v);
+        messageStore.set(k, msg);
+        const msgId = k.split('|')[1];
+        if (msgId) messageIdIndex.set(msgId, k);
+        loaded++;
+      } catch {
+        // Skip entries that can't be deserialized
+      }
+    }
+    logger.info(`[MSG-STORE] Loaded ${loaded} messages from disk for retry support`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      logger.warn(`[MSG-STORE] Failed to load message store: ${err.message}`);
+    }
+  }
+}
+
+function startMessageStorePersistence() {
+  if (messageStoreSaveTimer) return;
+  messageStoreSaveTimer = setInterval(() => {
+    saveMessageStoreToDisk().catch(() => {});
+  }, MESSAGE_STORE_SAVE_INTERVAL);
+  // Don't keep process alive just for this timer
+  if (messageStoreSaveTimer.unref) messageStoreSaveTimer.unref();
+}
+
+function stopMessageStorePersistence() {
+  if (messageStoreSaveTimer) {
+    clearInterval(messageStoreSaveTimer);
+    messageStoreSaveTimer = null;
+  }
 }
 
 // Duplicate message prevention
@@ -208,7 +283,7 @@ class WhatsAppManager {
     this.minReconnectInterval = 120000; // Minimum 120s between reconnections (doubled for safety)
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
-    this.SESSION_SAVE_DEBOUNCE_MS = 30000; // Save session to DB at most once per 30s
+    this.SESSION_SAVE_DEBOUNCE_MS = 5000; // Save session to DB at most once per 5s (critical for ephemeral filesystems)
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -712,6 +787,10 @@ class WhatsAppManager {
    */
   async initializeAccounts() {
     try {
+      // Load persisted message store for retry survival across restarts
+      await loadMessageStoreFromDisk();
+      startMessageStorePersistence();
+
       // Load persisted LID mappings before connecting accounts
       await this._loadLidMappings();
 
@@ -1072,8 +1151,8 @@ class WhatsAppManager {
         version = [2, 3000, 1034740716];
       }
 
-      // Create silent logger for Baileys
-      const baileysLogger = pino({ level: 'silent' });
+      // Logger for Baileys — warn level so Signal key store errors are visible
+      const baileysLogger = pino({ level: 'warn' });
 
       // Pick a consistent browser fingerprint for this account
       const browserProfile = getBrowserForAccount(accountId);
@@ -1650,8 +1729,10 @@ class WhatsAppManager {
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        // Schedule a debounced DB save — coalesces rapid creds.update bursts
-        this._scheduleSessionSave(accountId);
+        // On ephemeral filesystems (Render, Railway), disk is wiped on restart.
+        // DB is the only persistent store → save immediately, not debounced.
+        // This prevents stale Signal pre-keys after crash/restart.
+        await this.saveSession(accountId);
       } catch (error) {
         logger.error(`Error saving creds for ${accountId}: ${error.message}`);
       }
@@ -1661,12 +1742,19 @@ class WhatsAppManager {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       logger.debug(`messages.upsert event: type=${type}, count=${messages.length}`);
 
-      // Store ALL messages (including history) in cache for retry system.
+      // Store messages in cache for retry system.
       // This is critical: when WA server asks us to re-send a message for
       // decryption, getMessage() looks up the stored content.
+      // For 'notify' (real-time) messages, store all. For history sync,
+      // limit to avoid flooding the cache and evicting recent messages.
+      const isRealtime = type === 'notify';
+      let stored = 0;
       for (const msg of messages) {
         if (msg.key && msg.message) {
-          storeMessage(msg.key, msg.message);
+          if (isRealtime || stored < 500) {
+            storeMessage(msg.key, msg.message);
+            stored++;
+          }
         }
       }
 
@@ -1783,11 +1871,14 @@ class WhatsAppManager {
       }
 
       // Store synced messages in the message store for retry system
+      // Cap at 500 to avoid flooding the cache and evicting recent messages
       // Also extract LID mappings from message keys (senderPn/senderLid)
       if (messages?.length) {
+        let historyStored = 0;
         for (const msg of messages) {
-          if (msg.key && msg.message) {
+          if (msg.key && msg.message && historyStored < 500) {
             storeMessage(msg.key, msg.message);
+            historyStored++;
           }
           // Extract LID↔phone from message key metadata
           if (msg.key?.senderPn && msg.key?.senderLid) {
@@ -2925,6 +3016,10 @@ class WhatsAppManager {
 
     // Persist LID mappings one last time
     await this._persistLidMappings();
+
+    // Persist message store for retry survival across restarts
+    stopMessageStorePersistence();
+    await saveMessageStoreToDisk();
 
     // Flush any pending debounced session saves to DB before disconnecting
     await this._flushPendingSessionSaves();
