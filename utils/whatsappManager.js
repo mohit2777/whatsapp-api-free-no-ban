@@ -284,6 +284,8 @@ class WhatsAppManager {
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
     this.SESSION_SAVE_DEBOUNCE_MS = 5000; // Save session to DB at most once per 5s (critical for ephemeral filesystems)
+    this.ciphertextResetTimers = new Map(); // Track last assertSessions call per JID to debounce
+    this.CIPHERTEXT_RESET_COOLDOWN_MS = 60000; // Only reset Signal session once per 60s per contact
     this.metrics = {
       messagesReceived: 0,
       messagesSent: 0,
@@ -2024,20 +2026,41 @@ class WhatsAppManager {
           webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: 'CIPHERTEXT_decryption_failure', accountId, remoteJid: remoteJid, pushName: msg.pushName || 'Unknown' });
           // StubType 2 = CIPHERTEXT: Baileys received the message but FAILED to
           // decrypt it. The Signal session with this contact is corrupted.
-          // Baileys auto-sends up to 5 retry receipts, but if those also fail
-          // the session stays broken. Force-reset the Signal session so the
-          // NEXT message from this contact can be decrypted successfully.
-          logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}). Forcing Signal session reset...`);
-          try {
-            await sock.assertSessions([remoteJid], true);
-            logger.info(`[MESSAGE] Signal session reset for ${remoteJid} — next message should decrypt OK`);
-            // Save session to DB immediately after Signal session reset.
-            // Without this, if the server restarts, the old corrupt session
-            // is restored from DB and CIPHERTEXT errors return.
-            await this.saveSession(accountId);
-            logger.debug(`[MESSAGE] Session saved to DB after Signal session reset for ${remoteJid}`);
-          } catch (sessErr) {
-            logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
+          logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}).`);
+
+          // Dispatch a decryption_failure webhook so the user's automation system
+          // knows a message was received even though content couldn't be read.
+          const senderPhone = senderInfo.phone || senderInfo.lid || null;
+          webhookDeliveryService.dispatch(accountId, 'message', {
+            messageId: msg.key.id,
+            from: senderPhone,
+            message: '[Decryption failed — message could not be read]',
+            messageType: 'decryption_failure',
+            isGroup,
+            timestamp: msg.messageTimestamp,
+            pushName: msg.pushName || 'Unknown',
+            ...(senderInfo.lid ? { lid: senderInfo.lid } : {}),
+            ...(isGroup ? { replyTo: remoteJid, groupJid: remoteJid, participant: msg.key.participant || null } : {}),
+          }).catch(err => logger.error(`[WEBHOOK] CIPHERTEXT dispatch error: ${err.message}`));
+
+          // Debounce Signal session resets — don't call assertSessions 11+ times
+          // for the same contact in rapid succession. Once per 60s is enough;
+          // repeated resets thrash the Signal ratchet and make recovery harder.
+          const resetKey = `${accountId}:${remoteJid}`;
+          const lastReset = this.ciphertextResetTimers.get(resetKey);
+          const now = Date.now();
+          if (!lastReset || now - lastReset > this.CIPHERTEXT_RESET_COOLDOWN_MS) {
+            this.ciphertextResetTimers.set(resetKey, now);
+            try {
+              await sock.assertSessions([remoteJid], true);
+              logger.info(`[MESSAGE] Signal session reset for ${remoteJid} — next message should decrypt OK`);
+              await this.saveSession(accountId);
+              logger.debug(`[MESSAGE] Session saved to DB after Signal session reset for ${remoteJid}`);
+            } catch (sessErr) {
+              logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
+            }
+          } else {
+            logger.debug(`[MESSAGE] CIPHERTEXT reset cooldown active for ${remoteJid} — skipping assertSessions (last reset ${Math.round((now - lastReset) / 1000)}s ago)`);
           }
         } else if (msg.messageStubType) {
           webhookDeliveryService.pipelineStats.handler_stub_notification++;
