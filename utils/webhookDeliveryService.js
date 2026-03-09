@@ -25,6 +25,31 @@ class WebhookDeliveryService {
     this.activeDeliveries = 0; // Track concurrent deliveries
     this.maxConcurrent = 15;   // Max concurrent HTTP requests
     this.deliveryStats = { sent: 0, failed: 0, retries: 0 }; // Lifetime stats
+
+    // ── Live activity log (ring buffer) ──
+    // Tracks recent dispatches + delivery outcomes so the dashboard can show
+    // exactly what's happening without needing server log access.
+    this.activityLog = [];          // Recent entries
+    this.activityLogMax = 100;      // Keep last 100 entries
+    this.messageHandlerCalls = 0;   // How many times dispatch was called from message handler
+  }
+
+  /**
+   * Record an activity log entry (ring buffer)
+   */
+  _logActivity(entry) {
+    entry.timestamp = new Date().toISOString();
+    this.activityLog.push(entry);
+    if (this.activityLog.length > this.activityLogMax) {
+      this.activityLog.shift();
+    }
+  }
+
+  /**
+   * Get recent activity log entries
+   */
+  getRecentActivity(limit = 50) {
+    return this.activityLog.slice(-limit);
   }
 
   /**
@@ -74,7 +99,9 @@ class WebhookDeliveryService {
       retrying: this.queue.filter(item => item.attemptCount > 0 && item.status === 'pending').length,
       activeDeliveries: this.activeDeliveries,
       maxSize: this.maxQueueSize,
-      lifetime: { ...this.deliveryStats }
+      lifetime: { ...this.deliveryStats },
+      messageHandlerCalls: this.messageHandlerCalls,
+      recentActivityCount: this.activityLog.length
     };
   }
 
@@ -213,13 +240,18 @@ class WebhookDeliveryService {
         const idx = this.queue.indexOf(item);
         if (idx !== -1) this.queue.splice(idx, 1);
         this.deliveryStats.sent++;
-        logger.info(`[WEBHOOK] ✓ Delivered to ${item.webhookUrl} (${Date.now() - startTime}ms, attempt ${item.attemptCount})`);
+        const duration = Date.now() - startTime;
+        logger.info(`[WEBHOOK] ✓ Delivered to ${item.webhookUrl} (${duration}ms, attempt ${item.attemptCount})`);
+        this._logActivity({ type: 'delivery', accountId: item.accountId, url: item.webhookUrl, status: 'success', statusCode: result.statusCode, duration, attempt: item.attemptCount, event: item.payload?.event });
       } else {
         // Failed - handle retry
+        const duration = Date.now() - startTime;
+        this._logActivity({ type: 'delivery', accountId: item.accountId, url: item.webhookUrl, status: 'failed', error: result.error, statusCode: result.statusCode, duration, attempt: item.attemptCount, event: item.payload?.event });
         this.handleDeliveryFailure(item, result.error);
       }
     } catch (error) {
       // Always reset status on unexpected error so item isn't stuck in 'processing'
+      this._logActivity({ type: 'delivery', accountId: item.accountId, url: item.webhookUrl, status: 'error', error: error.message, attempt: item.attemptCount, event: item.payload?.event });
       this.handleDeliveryFailure(item, error.message || 'Unknown processing error');
     } finally {
       item.processingStartedAt = null;
@@ -364,6 +396,7 @@ class WebhookDeliveryService {
 
     if (!webhooks || webhooks.length === 0) {
       logger.debug(`[WEBHOOK] No active webhooks for account ${accountId} (event: ${event})`);
+      this._logActivity({ type: 'dispatch', accountId, event, webhookCount: 0, status: 'no_webhooks' });
       return;
     }
 
@@ -400,6 +433,8 @@ class WebhookDeliveryService {
         logger.error(`[WEBHOOK] Error queuing webhook ${webhook.url}: ${webhookError.message}`);
       }
     }
+
+    this._logActivity({ type: 'dispatch', accountId, event, webhookCount: webhooks.length, queued, status: queued > 0 ? 'queued' : 'no_match' });
 
     if (queued > 0) {
       logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);

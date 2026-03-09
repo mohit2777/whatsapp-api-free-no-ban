@@ -954,6 +954,20 @@ body {
 .queue-stat-value.green { color: var(--success); }
 .queue-stat-value.red { color: var(--error); }
 
+/* Live Activity Log */
+.activity-log { max-height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+.activity-entry { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-sm); font-size: 12px; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; border-left: 3px solid var(--border); background: var(--bg-dark); }
+.activity-entry.activity-ok { border-left-color: var(--success); }
+.activity-entry.activity-fail { border-left-color: var(--error); background: rgba(239, 68, 68, 0.05); }
+.activity-entry.activity-warn { border-left-color: #f59e0b; }
+.activity-entry.activity-message { border-left-color: var(--primary); background: rgba(99, 102, 241, 0.05); }
+.activity-time { color: var(--text-muted); min-width: 70px; flex-shrink: 0; }
+.activity-icon { flex-shrink: 0; }
+.activity-text { flex: 1; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity-text strong { color: var(--text-primary); }
+.activity-text em { color: var(--text-muted); font-style: italic; }
+.activity-account { color: var(--text-muted); font-size: 10px; min-width: 58px; text-align: right; flex-shrink: 0; }
+
 /* Config Grid */
 .config-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
 

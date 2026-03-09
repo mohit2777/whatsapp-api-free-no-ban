@@ -29,6 +29,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setInterval(loadAccounts, 30000);
     setInterval(loadHealth, 60000);
+    // Auto-refresh activity log every 10s when webhook tab is visible
+    setInterval(() => {
+        const webhooksView = document.getElementById('webhooksView');
+        if (webhooksView && webhooksView.style.display !== 'none') {
+            loadActivityLog();
+        }
+    }, 10000);
 });
 
 // ============================================================================
@@ -119,7 +126,7 @@ function switchView(viewName) {
     document.getElementById('pageSubtitle').textContent = meta.subtitle || '';
 
     if (viewName === 'system') { loadHealth(); renderActiveConnections(); }
-    else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); }
+    else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); loadActivityLog(); }
 
     document.getElementById('sidebar')?.classList.remove('open');
 }
@@ -287,6 +294,91 @@ async function loadWebhookStats() {
         }
     } catch (error) {
         console.error('Failed to load webhook stats:', error);
+    }
+}
+
+async function loadActivityLog() {
+    try {
+        const data = await apiCall('/api/webhooks/activity-log?limit=50');
+        if (!data.success) return;
+
+        // Update queue stats from the activity log response
+        const s = data.stats || {};
+        const el = (id) => document.getElementById(id);
+        if (el('queueSize')) el('queueSize').textContent = `${s.total || 0} / ${s.maxSize || 1000}`;
+        if (el('queueProcessing')) el('queueProcessing').textContent = s.processing > 0 ? `${s.processing} active` : 'Idle';
+        if (el('queueDelivered')) el('queueDelivered').textContent = s.lifetime?.sent || 0;
+        if (el('queueFailedCount')) el('queueFailedCount').textContent = s.lifetime?.failed || 0;
+        if (el('queueMsgHandlerCalls')) el('queueMsgHandlerCalls').textContent = s.messageHandlerCalls || 0;
+
+        renderActivityLog(data.recentActivity || []);
+    } catch (error) {
+        console.error('Failed to load activity log:', error);
+    }
+}
+
+function renderActivityLog(entries) {
+    const container = document.getElementById('activityLog');
+    if (!container) return;
+
+    if (entries.length === 0) {
+        container.innerHTML = '<p class="text-muted">No recent activity. Send a message or click Test Dispatch to see entries here.</p>';
+        return;
+    }
+
+    // Show most recent first
+    const reversed = [...entries].reverse();
+    const html = reversed.map(e => {
+        const time = e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : '--';
+        if (e.type === 'message_received') {
+            return `<div class="activity-entry activity-message">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">📩</span>
+                <span class="activity-text">Message from <strong>${e.from || '?'}</strong> (${e.pushName || '?'}) — type: ${e.messageType || 'text'}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        if (e.type === 'dispatch') {
+            const statusClass = e.status === 'queued' ? 'activity-ok' : (e.status === 'no_webhooks' ? 'activity-warn' : 'activity-warn');
+            const icon = e.status === 'queued' ? '🚀' : '⚠️';
+            return `<div class="activity-entry ${statusClass}">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">${icon}</span>
+                <span class="activity-text">Dispatch <strong>${e.event}</strong> → ${e.queued || 0}/${e.webhookCount || 0} webhook(s) ${e.status === 'no_webhooks' ? '<em>(no active webhooks!)</em>' : e.status === 'no_match' ? '<em>(no event match)</em>' : ''}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        if (e.type === 'delivery') {
+            const ok = e.status === 'success';
+            return `<div class="activity-entry ${ok ? 'activity-ok' : 'activity-fail'}">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">${ok ? '✅' : '❌'}</span>
+                <span class="activity-text">${ok ? 'Delivered' : 'Failed'} → ${truncateUrl(e.url)} ${ok ? `(${e.duration}ms)` : `— ${e.error || 'unknown error'}`} ${e.attempt > 1 ? `(attempt ${e.attempt})` : ''}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        if (e.type === 'dispatch_error') {
+            return `<div class="activity-entry activity-fail">
+                <span class="activity-time">${time}</span>
+                <span class="activity-icon">💥</span>
+                <span class="activity-text">Dispatch error: ${e.error}</span>
+                <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
+            </div>`;
+        }
+        return '';
+    }).join('');
+
+    container.innerHTML = html;
+}
+
+function truncateUrl(url) {
+    if (!url) return '?';
+    try {
+        const u = new URL(url);
+        const path = u.pathname.length > 30 ? u.pathname.substring(0, 27) + '...' : u.pathname;
+        return u.hostname + path;
+    } catch {
+        return url.length > 50 ? url.substring(0, 47) + '...' : url;
     }
 }
 

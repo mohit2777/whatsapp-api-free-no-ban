@@ -2289,12 +2289,15 @@ class WhatsAppManager {
 
       // Dispatch webhook
       logger.info(`[MESSAGE] Dispatching ${messageType} to webhooks for account ${accountId}...`);
+      webhookDeliveryService.messageHandlerCalls++;
+      webhookDeliveryService._logActivity({ type: 'message_received', accountId, messageType, from: senderInfo.phone || senderInfo.lid || 'unknown', pushName: msg.pushName || 'Unknown' });
       
       try {
         await webhookDeliveryService.dispatch(accountId, 'message', webhookPayload);
         logger.info(`[MESSAGE] Webhook dispatch completed for account ${accountId}`);
       } catch (webhookErr) {
         logger.error(`[MESSAGE] Webhook dispatch error: ${webhookErr.message}`);
+        webhookDeliveryService._logActivity({ type: 'dispatch_error', accountId, error: webhookErr.message });
       }
 
       // AI Auto-reply (only for text messages, non-group)

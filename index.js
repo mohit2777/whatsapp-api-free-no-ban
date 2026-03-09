@@ -756,6 +756,22 @@ app.post('/api/accounts/:id/webhooks/test-dispatch', requireAuth, webhookLimiter
   }
 });
 
+// Webhook delivery activity log — shows recent dispatches + delivery outcomes
+// Visible in the dashboard so you can see exactly what's happening without server logs
+app.get('/api/webhooks/activity-log', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    res.json({
+      success: true,
+      stats: webhookDeliveryService.getStats(),
+      recentActivity: webhookDeliveryService.getRecentActivity(limit)
+    });
+  } catch (error) {
+    logger.error('Error fetching webhook activity log:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================================================
 // AI CONFIG API
 // ============================================================================

@@ -14,7 +14,7 @@
     <div class="app-container">
         <!-- Sidebar Backdrop (mobile) -->
         <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
-        <!-- Sidebar -->
+        <!-- Sidebar -->    
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 <div class="logo">
@@ -364,6 +364,23 @@
                                         <span class="queue-stat-label">Failed</span>
                                         <span class="queue-stat-value red" id="queueFailedCount">0</span>
                                     </div>
+                                    <div class="queue-stat">
+                                        <span class="queue-stat-label">Messages Handled</span>
+                                        <span class="queue-stat-value" id="queueMsgHandlerCalls">0</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Live Activity Log -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h2>Live Activity Log</h2>
+                                <button class="btn btn-sm" onclick="loadActivityLog()" title="Refresh">Refresh</button>
+                            </div>
+                            <div class="card-body">
+                                <div id="activityLog" class="activity-log">
+                                    <p class="text-muted">No recent activity. Send a message or click Test Dispatch to see entries here.</p>
                                 </div>
                             </div>
                         </div>
