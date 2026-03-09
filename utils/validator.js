@@ -24,17 +24,18 @@ const schemas = {
     description: Joi.string().max(1000).optional().allow('')
   }),
 
-  // Send message - 'to' accepts either phone number or JID (LID format)
+  // Send message - 'to' accepts phone number with country code (e.g. "919876543210"),
+  // or full JID (e.g. "919876543210@s.whatsapp.net", "120363123456@g.us")
   sendMessage: Joi.object({
     api_key: Joi.string().length(64).required(),
     to: Joi.string().min(5).max(100).required(),
     message: Joi.string().min(1).max(4096).required()
   }),
 
-  // Send media
+  // Send media (via file upload or /api/send-media)
   sendMedia: Joi.object({
     api_key: Joi.string().length(64).required(),
-    phone: Joi.string().pattern(/^[0-9]+$/).min(10).max(15).required(),
+    to: Joi.string().min(5).max(100).required(),
     caption: Joi.string().max(1024).optional().allow(''),
     mediaType: Joi.string().valid('image', 'document', 'audio', 'video').required()
   }),

@@ -109,6 +109,13 @@ KEEPALIVE_URL=https://your-app.onrender.com/ping
 
 ## 📡 API Usage
 
+> **Authentication:** Every API call requires an `api_key` — found on the dashboard for each connected account.
+
+> **Phone Number Format:** Use the **full phone number with country code**, no `+` prefix, no dashes/spaces.  
+> Example: India `+91 98765 43210` → `919876543210` | US `+1 (555) 123-4567` → `15551234567`
+
+---
+
 ### Send Text Message
 
 ```bash
@@ -116,31 +123,82 @@ curl -X POST https://your-app.onrender.com/api/send \
   -H "Content-Type: application/json" \
   -d '{
     "api_key": "your-account-api-key",
-    "phone": "918005780278",
+    "to": "919876543210",
     "message": "Hello from the API!"
   }'
 ```
 
-### Send Media
+**Parameters:**
 
-```bash
-curl -X POST https://your-app.onrender.com/api/send-media \
-  -F "api_key=your-account-api-key" \
-  -F "phone=918005780278" \
-  -F "mediaType=image" \
-  -F "caption=Check this out!" \
-  -F "media=@image.jpg"
-```
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `api_key` | string | Yes | 64-char API key from dashboard |
+| `to` | string | Yes | Phone number with country code (e.g. `919876543210`) or group JID (e.g. `120363123456@g.us`) |
+| `message` | string | Yes | Message text (max 4096 chars) |
 
-### Response
+**Response:**
 
 ```json
 {
   "success": true,
   "messageId": "ABCD1234567890",
+  "to": "919876543210@s.whatsapp.net",
+  "phone": "919876543210",
   "timestamp": 1706889600000
 }
 ```
+
+---
+
+### Send Media (File Upload)
+
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media \
+  -F "api_key=your-account-api-key" \
+  -F "to=919876543210" \
+  -F "mediaType=image" \
+  -F "caption=Check this out!" \
+  -F "media=@image.jpg"
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `api_key` | string | Yes | 64-char API key |
+| `to` | string | Yes | Phone with country code or group JID |
+| `mediaType` | string | Yes | `image`, `video`, `audio`, or `document` |
+| `caption` | string | No | Caption text |
+| `media` | file | Yes | The media file to send |
+
+---
+
+### Send Media (URL or Base64)
+
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "919876543210",
+    "mediaType": "image",
+    "mediaUrl": "https://example.com/photo.jpg",
+    "caption": "Sent via URL!"
+  }'
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `api_key` | string | Yes | 64-char API key |
+| `to` | string | Yes | Phone with country code or group JID |
+| `mediaType` | string | Yes | `image`, `video`, `audio`, or `document` |
+| `mediaUrl` | string | One of | Public URL to fetch media from |
+| `mediaBase64` | string | One of | Base64-encoded media data (with or without `data:` prefix) |
+| `caption` | string | No | Caption text |
+| `mimetype` | string | No | MIME type (auto-detected if omitted) |
+| `filename` | string | No | Filename for documents |
 
 ---
 
@@ -159,25 +217,148 @@ curl -X POST https://your-app.onrender.com/api/send-media \
 
 ## 🔗 Webhook Configuration
 
-Webhooks send incoming messages to your specified URL.
+Webhooks send real-time events to your specified URL. Configure via dashboard or API.
 
-### Webhook Payload
+### Supported Events
+
+| Event | Description |
+|-------|-------------|
+| `message` | Incoming message (text, image, video, audio, document, sticker, location) |
+| `message.status` | Message delivery status updates (sent, delivered, read) |
+| `connection` | Account connection/disconnection events |
+| `*` | Subscribe to all events |
+
+---
+
+### Webhook: Incoming Message (`message`)
 
 ```json
 {
   "event": "message",
-  "timestamp": "2024-02-02T12:00:00.000Z",
+  "timestamp": "2026-03-09T12:00:00.000Z",
   "account_id": "uuid",
   "data": {
     "messageId": "ABC123",
-    "from": "918005780278",
+    "from": "919876543210",
+    "phone": "919876543210",
     "message": "Hello!",
     "messageType": "text",
     "isGroup": false,
-    "pushName": "John"
+    "timestamp": 1741521600,
+    "pushName": "John",
+    "replyTo": "919876543210"
   }
 }
 ```
+
+**For group messages**, additional fields are included:
+
+```json
+{
+  "event": "message",
+  "timestamp": "2026-03-09T12:00:00.000Z",
+  "account_id": "uuid",
+  "data": {
+    "messageId": "ABC123",
+    "from": "919876543210",
+    "phone": "919876543210",
+    "message": "Hello group!",
+    "messageType": "text",
+    "isGroup": true,
+    "timestamp": 1741521600,
+    "pushName": "John",
+    "replyTo": "120363123456@g.us",
+    "groupJid": "120363123456@g.us",
+    "participant": "919876543210@s.whatsapp.net",
+    "participantPhone": "919876543210"
+  }
+}
+```
+
+**For media messages**, a `media` object is included:
+
+```json
+{
+  "data": {
+    "messageType": "image",
+    "message": "Photo caption here",
+    "media": {
+      "mimetype": "image/jpeg",
+      "filename": null,
+      "fileSize": 54321,
+      "data": "<base64-encoded-data>",
+      "thumbnail": "<base64-thumbnail>"
+    }
+  }
+}
+```
+
+**Key fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `from` | string | Sender phone number with country code |
+| `phone` | string | Resolved phone number (null if unavailable) |
+| `replyTo` | string | Use this value as `to` in `/api/send` to reply |
+| `messageType` | string | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, `ptt` |
+| `pushName` | string | Sender's WhatsApp display name |
+| `isGroup` | boolean | Whether the message is from a group chat |
+
+---
+
+### Webhook: Message Status (`message.status`)
+
+```json
+{
+  "event": "message.status",
+  "timestamp": "2026-03-09T12:00:00.000Z",
+  "account_id": "uuid",
+  "data": {
+    "messageId": "ABC123",
+    "status": 3,
+    "statusLabel": "delivered",
+    "phone": "919876543210",
+    "timestamp": "2026-03-09T12:00:01.000Z"
+  }
+}
+```
+
+**Status codes:** `1` = pending, `2` = sent (server), `3` = delivered, `4` = read, `5` = played (audio/video)
+
+---
+
+### Webhook: Connection (`connection`)
+
+```json
+{
+  "event": "connection",
+  "timestamp": "2026-03-09T12:00:00.000Z",
+  "account_id": "uuid",
+  "data": {
+    "status": "connected",
+    "phoneNumber": "919876543210"
+  }
+}
+```
+
+---
+
+### Using `replyTo` for Auto-Replies (n8n / Make / Zapier)
+
+When you receive a webhook, use the `replyTo` field to send a reply:
+
+```bash
+# Reply to the sender
+curl -X POST https://your-app.onrender.com/api/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-api-key",
+    "to": "<replyTo from webhook>",
+    "message": "Thanks for your message!"
+  }'
+```
+
+---
 
 ### Webhook Signature
 

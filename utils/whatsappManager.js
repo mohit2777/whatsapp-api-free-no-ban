@@ -1698,12 +1698,16 @@ class WhatsAppManager {
       for (const update of updates) {
         if (update.update?.status) {
           const remoteJid = update.key.remoteJid;
-          const phone = this.getPhoneNumber(remoteJid);
+          const resolvedPhone = this.getPhoneNumber(remoteJid);
+          // Status codes: 1=pending, 2=sent(server), 3=delivered, 4=read, 5=played
+          const statusLabels = { 1: 'pending', 2: 'sent', 3: 'delivered', 4: 'read', 5: 'played' };
+          const statusCode = update.update.status;
           webhookDeliveryService.dispatch(accountId, 'message.status', {
             messageId: update.key.id,
-            status: update.update.status,
-            remoteJid,
-            phone: phone || null
+            status: statusCode,
+            statusLabel: statusLabels[statusCode] || 'unknown',
+            phone: resolvedPhone || null,
+            timestamp: new Date().toISOString()
           });
         }
       }
@@ -2089,6 +2093,10 @@ class WhatsAppManager {
         isGroup,
         timestamp: msg.messageTimestamp,
         pushName: msg.pushName || 'Unknown',
+        // replyTo: the identifier to use when sending a reply back via /api/send
+        // For 1:1 chats: the sender's phone number (with country code)
+        // For groups: the group JID
+        replyTo: isGroup ? remoteJid : (senderInfo.phone || senderInfo.lid || null),
       };
 
       // Add group info
