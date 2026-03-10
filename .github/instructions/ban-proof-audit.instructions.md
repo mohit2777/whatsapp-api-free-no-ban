@@ -83,8 +83,10 @@ These features are guaranteed ban triggers. Reject any PR or feature request for
 
 - **NEVER call `assertSessions()` on CIPHERTEXT errors.** Baileys has a built-in retry mechanism (`sendRetryRequest` in `messages-recv.js`) that handles decryption failures. It sends a retry request to the sender, who re-sends the message with fresh pre-keys. Calling `assertSessions(jid, true)` destroys the Signal session that Baileys needs for this retry negotiation, causing ALL subsequent messages to fail permanently.
 - **Let Baileys handle Signal session recovery.** The retry mechanism is: (1) decrypt fails → CIPHERTEXT, (2) Baileys sends retry request, (3) sender re-sends with keys, (4) Baileys re-decrypts. Manual session resets break step 4.
-- **Log CIPHERTEXT events but don't act on them.** Dispatch a `decryption_failure` webhook for user visibility, but never manipulate Signal sessions in the message handler.
+- **Skip PDO, use receipt-with-keys immediately.** Baileys' Phase 1 retry (retryCount=1) asks the linked phone to re-send via PDO — this takes 20+ seconds and fails if the phone is offline. Phase 2 (retryCount>1) sends our pre-keys directly to the sender for a fresh session. The `msgRetryCounterCache.get()` is patched to return at least 1, so retries always skip PDO and go straight to the reliable receipt-with-keys approach.
+- **Log CIPHERTEXT events with error detail but don't act on them.** Include `messageStubParameters[0]` (the actual libsignal error) in both server logs and the `decryption_failure` webhook payload for diagnostics.
 - **The `getMessage()` callback is critical for retries.** When WA server re-sends a message for decryption, it calls `getMessage(key)`. Always return `proto.IMessage` (the `.message` property), never the full `WAMessage` object. Store all sent/received messages in the message store for this purpose.
+- **Proactively check pre-key count after connection.** Call `sock.uploadPreKeysToServerIfRequired()` in the connection open handler to ensure pre-keys are always available on the server. Pre-key depletion (from heavy traffic or DB restore) causes "Key used already or never filled" errors.
 
 ## Error Handling
 

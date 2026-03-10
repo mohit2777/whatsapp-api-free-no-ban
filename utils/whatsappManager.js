@@ -40,7 +40,20 @@ if (proto?.ClientPayload?.UserAgent?.Platform && proto.ClientPayload.UserAgent.P
 const AUTH_STATES_DIR = path.join(__dirname, '..', 'auth_states');
 
 // Message retry counter cache
+// Baileys uses this to track CIPHERTEXT retry attempts per message.
+// Phase 1 (retryCount=1): Asks the phone to re-send via PDO — takes 20s,
+//   fails if phone is offline, and doesn't fix the underlying session issue.
+// Phase 2 (retryCount>1): Sends our pre-keys directly to the sender, who
+//   establishes a fresh session and re-sends — this is far more reliable.
+// We patch get() to return at least 1, so retries always start in Phase 2,
+// skipping the unreliable PDO approach entirely. This resolves CIPHERTEXT
+// errors much faster and doesn't depend on the phone being online.
 const msgRetryCounterCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
+const _origMsgRetryGet = msgRetryCounterCache.get.bind(msgRetryCounterCache);
+msgRetryCounterCache.get = (key) => {
+  const val = _origMsgRetryGet(key);
+  return typeof val === 'number' ? val : 1;
+};
 
 // ============================================================================
 // WA VERSION CACHE
@@ -1860,6 +1873,18 @@ class WhatsAppManager {
         this.emit('account-status', { accountId, status: 'ready', phoneNumber });
         logger.info(`Account ${accountId} connected successfully (${phoneNumber})`);
 
+        // Proactively ensure pre-keys are available on the server.
+        // If pre-keys are depleted (e.g., after restore from DB or heavy traffic),
+        // new contacts can't establish Signal sessions → CIPHERTEXT on first message.
+        // Baileys does this in CB:success, but by the time our handler runs the
+        // initial upload may have been skipped (count was OK then but got consumed).
+        try {
+          await sock.uploadPreKeysToServerIfRequired();
+          logger.debug(`Pre-key check completed for ${accountId}`);
+        } catch (e) {
+          logger.warn(`Pre-key upload check failed for ${accountId}: ${e.message}`);
+        }
+
         // Set presence to 'unavailable' after connection — mimics real WA Web
         // (real clients don't stay online 24/7; they go idle)
         setTimeout(async () => {
@@ -2161,10 +2186,11 @@ class WhatsAppManager {
         // Distinguish stub notifications (group events) from decryption failures
         if (msg.messageStubType === 2) {
           webhookDeliveryService.pipelineStats.handler_ciphertext++;
-          webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: 'CIPHERTEXT_decryption_failure', accountId, remoteJid: remoteJid, pushName: msg.pushName || 'Unknown' });
+          const decryptError = msg.messageStubParameters?.[0] || 'unknown';
+          webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: 'CIPHERTEXT_decryption_failure', accountId, remoteJid: remoteJid, pushName: msg.pushName || 'Unknown', error: decryptError });
           // StubType 2 = CIPHERTEXT: Baileys received the message but FAILED to
           // decrypt it. The Signal session with this contact is corrupted.
-          logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}).`);
+          logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}, error: ${decryptError}).`);
 
           // Dispatch a decryption_failure webhook so the user's automation system
           // knows a message was received even though content couldn't be read.
@@ -2174,6 +2200,7 @@ class WhatsAppManager {
             from: senderPhone,
             message: '[Decryption failed — message could not be read]',
             messageType: 'decryption_failure',
+            decryptError: decryptError,
             isGroup,
             timestamp: msg.messageTimestamp,
             pushName: msg.pushName || 'Unknown',
