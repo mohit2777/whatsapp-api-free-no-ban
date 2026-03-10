@@ -79,6 +79,13 @@ These features are guaranteed ban triggers. Reject any PR or feature request for
 9. **Message scheduling without rate limits** — bulk automation
 10. **Forwarding/chain messaging** — spam pattern detection
 
+## CIPHERTEXT / Decryption Failure Handling
+
+- **NEVER call `assertSessions()` on CIPHERTEXT errors.** Baileys has a built-in retry mechanism (`sendRetryRequest` in `messages-recv.js`) that handles decryption failures. It sends a retry request to the sender, who re-sends the message with fresh pre-keys. Calling `assertSessions(jid, true)` destroys the Signal session that Baileys needs for this retry negotiation, causing ALL subsequent messages to fail permanently.
+- **Let Baileys handle Signal session recovery.** The retry mechanism is: (1) decrypt fails → CIPHERTEXT, (2) Baileys sends retry request, (3) sender re-sends with keys, (4) Baileys re-decrypts. Manual session resets break step 4.
+- **Log CIPHERTEXT events but don't act on them.** Dispatch a `decryption_failure` webhook for user visibility, but never manipulate Signal sessions in the message handler.
+- **The `getMessage()` callback is critical for retries.** When WA server re-sends a message for decryption, it calls `getMessage(key)`. Always return `proto.IMessage` (the `.message` property), never the full `WAMessage` object. Store all sent/received messages in the message store for this purpose.
+
 ## Error Handling
 
 - **Never retry failed connections immediately.** Always use exponential backoff with jitter.

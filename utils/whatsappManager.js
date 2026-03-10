@@ -287,8 +287,11 @@ class WhatsAppManager {
     this.periodicSessionSaveTimers = new Map(); // Periodic save timers per account
     this.PERIODIC_SESSION_SAVE_MS = 60000; // Save session to DB every 60s as safety net
     this.lastSessionHashes = new Map(); // Track last saved session hash to skip redundant writes
-    this.ciphertextResetTimers = new Map(); // Track last assertSessions call per JID to debounce
-    this.CIPHERTEXT_RESET_COOLDOWN_MS = 60000; // Only reset Signal session once per 60s per contact
+    // NOTE: assertSessions was removed from the CIPHERTEXT handler — Baileys
+    // has its own retry mechanism (sendRetryRequest) that handles decryption
+    // failures internally. Calling assertSessions() force-resets the Signal
+    // session, destroying the ratchet state that Baileys needs for its retry
+    // negotiation — this was causing the "works once then fails" pattern.
     // Outgoing message rate limiter — prevents burst-sending patterns
     // that WhatsApp's detection systems flag as automation.
     // Sliding window: max 30 messages per 60s per account.
@@ -2178,25 +2181,18 @@ class WhatsAppManager {
             ...(isGroup ? { replyTo: remoteJid, groupJid: remoteJid, participant: msg.key.participant || null } : {}),
           }).catch(err => logger.error(`[WEBHOOK] CIPHERTEXT dispatch error: ${err.message}`));
 
-          // Debounce Signal session resets — don't call assertSessions 11+ times
-          // for the same contact in rapid succession. Once per 60s is enough;
-          // repeated resets thrash the Signal ratchet and make recovery harder.
-          const resetKey = `${accountId}:${remoteJid}`;
-          const lastReset = this.ciphertextResetTimers.get(resetKey);
-          const now = Date.now();
-          if (!lastReset || now - lastReset > this.CIPHERTEXT_RESET_COOLDOWN_MS) {
-            this.ciphertextResetTimers.set(resetKey, now);
-            try {
-              await sock.assertSessions([remoteJid], true);
-              logger.info(`[MESSAGE] Signal session reset for ${remoteJid} — next message should decrypt OK`);
-              await this.saveSession(accountId);
-              logger.debug(`[MESSAGE] Session saved to DB after Signal session reset for ${remoteJid}`);
-            } catch (sessErr) {
-              logger.error(`[MESSAGE] Failed to reset Signal session for ${remoteJid}: ${sessErr.message}`);
-            }
-          } else {
-            logger.debug(`[MESSAGE] CIPHERTEXT reset cooldown active for ${remoteJid} — skipping assertSessions (last reset ${Math.round((now - lastReset) / 1000)}s ago)`);
-          }
+          // DO NOT call assertSessions() here — Baileys has its own retry
+          // mechanism (sendRetryRequest in messages-recv.js) that handles
+          // decryption failures. When decryption fails, Baileys:
+          //   1. Sets messageStubType = CIPHERTEXT
+          //   2. Sends a retry request to the sender via retryMutex
+          //   3. On retry response, re-decrypts with fresh keys
+          // Calling assertSessions(jid, true) would destroy the Signal session
+          // that Baileys needs for step 3, causing ALL subsequent messages to
+          // fail with CIPHERTEXT. This was the root cause of the "works once
+          // then fails to decrypt" issue.
+          // The session will self-heal through Baileys' retry mechanism.
+          logger.info(`[MESSAGE] CIPHERTEXT from ${remoteJid} — Baileys retry mechanism will handle session recovery (no manual reset)`);
         } else if (msg.messageStubType) {
           webhookDeliveryService.pipelineStats.handler_stub_notification++;
           webhookDeliveryService._logActivity({ type: 'pipeline_skip', stage: 'handler_null_message', reason: `stub_type_${msg.messageStubType}`, accountId, remoteJid: remoteJid });
