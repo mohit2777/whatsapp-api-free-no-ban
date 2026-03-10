@@ -2192,21 +2192,10 @@ class WhatsAppManager {
           // decrypt it. The Signal session with this contact is corrupted.
           logger.warn(`[MESSAGE] CIPHERTEXT (decryption failure) from ${contactId} (pushName: ${msg.pushName || 'Unknown'}, jid: ${remoteJid}, msgId: ${msg.key.id}, error: ${decryptError}).`);
 
-          // Dispatch a decryption_failure webhook so the user's automation system
-          // knows a message was received even though content couldn't be read.
-          const senderPhone = senderInfo.phone || senderInfo.lid || null;
-          webhookDeliveryService.dispatch(accountId, 'message', {
-            messageId: msg.key.id,
-            from: senderPhone,
-            message: '[Decryption failed — message could not be read]',
-            messageType: 'decryption_failure',
-            decryptError: decryptError,
-            isGroup,
-            timestamp: msg.messageTimestamp,
-            pushName: msg.pushName || 'Unknown',
-            ...(senderInfo.lid ? { lid: senderInfo.lid } : {}),
-            ...(isGroup ? { replyTo: remoteJid, groupJid: remoteJid, participant: msg.key.participant || null } : {}),
-          }).catch(err => logger.error(`[WEBHOOK] CIPHERTEXT dispatch error: ${err.message}`));
+          // NOT dispatching a webhook for decryption failures — Baileys' retry
+          // mechanism will recover the session and re-deliver the message.
+          // Sending this to webhooks caused automation systems (e.g. n8n) to
+          // echo "[Decryption failed]" text back to contacts.
 
           // DO NOT call assertSessions() here — Baileys has its own retry
           // mechanism (sendRetryRequest in messages-recv.js) that handles
