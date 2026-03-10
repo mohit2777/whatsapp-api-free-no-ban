@@ -24,6 +24,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeNavigation();
     initializeModals();
     initializeEventListeners();
+    initApiDocs();
     loadAccounts();
     loadHealth();
 
@@ -128,6 +129,7 @@ function switchView(viewName) {
 
     if (viewName === 'system') { loadHealth(); renderActiveConnections(); }
     else if (viewName === 'webhooks') { populateWebhookAccountSelect(); loadWebhookStats(); loadActivityLog(); loadPipelineStats(); }
+    else if (viewName === 'api-docs' && !currentEndpoint) { initApiDocs(); }
 
     document.getElementById('sidebar')?.classList.remove('open');
 }
@@ -201,7 +203,7 @@ function initializeEventListeners() {
     // Search clear button
     document.getElementById('searchClearBtn')?.addEventListener('click', () => {
         const input = document.getElementById('accountSearchInput');
-        if (input) { input.value = ''; filterAccounts(''); input.focus(); }
+        if (input) { input.value = ''; filterAccounts(); input.focus(); }
         document.getElementById('searchClearBtn').style.display = 'none';
     });
     document.getElementById('accountSearchInput')?.addEventListener('input', (e) => {
@@ -904,6 +906,8 @@ function renderWebhooks(webhooks, accountId) {
     document.getElementById('webhookTotal').textContent = webhooks.length;
     document.getElementById('webhookActive').textContent = webhooks.filter(w => w.is_active).length;
     document.getElementById('webhookFailed').textContent = webhooks.filter(w => !w.is_active).length;
+    const countBadge = document.getElementById('webhookCountBadge');
+    if (countBadge) countBadge.textContent = `${webhooks.length} configured`;
 
     if (webhooks.length === 0) {
         container.innerHTML = `
@@ -1158,7 +1162,7 @@ function renderAccountsTable() {
             const avatar = renderProfileAvatar(account, 32);
             const displayName = account.pushName ? `${escapeHtml(account.name)} <span class="push-name-label">${escapeHtml(account.pushName)}</span>` : escapeHtml(account.name);
             return `
-            <tr>
+            <tr data-status="${account.runtimeStatus || account.status}">
                 <td>
                     <div style="display: flex; align-items: center; gap: 10px;">
                         ${avatar}
@@ -1277,16 +1281,59 @@ function renderActiveConnections() {
     }).join('');
 }
 
-function filterAccounts(query) {
+function filterAccounts() {
     const tbodyFull = document.getElementById('accountsTableFull');
     if (!tbodyFull) return;
 
-    const q = query.toLowerCase();
+    const q = (document.getElementById('accountSearchInput')?.value || '').toLowerCase();
+    const statusFilter = document.getElementById('accountStatusFilter')?.value || '';
     const rows = tbodyFull.querySelectorAll('tr');
+    let visible = 0;
+    let total = rows.length;
+
     rows.forEach(row => {
         const text = row.textContent.toLowerCase();
-        row.style.display = text.includes(q) ? '' : 'none';
+        const matchesText = !q || text.includes(q);
+        const rowStatus = row.getAttribute('data-status') || '';
+        const matchesStatus = !statusFilter || rowStatus === statusFilter;
+        const show = matchesText && matchesStatus;
+        row.style.display = show ? '' : 'none';
+        if (show) visible++;
     });
+
+    // Update clear button
+    const clearBtn = document.getElementById('searchClearBtn');
+    if (clearBtn) clearBtn.style.display = q ? 'flex' : 'none';
+
+    // Update result count
+    const footer = document.getElementById('accountTableFooter');
+    const countEl = document.getElementById('accountResultCount');
+    const badge = document.getElementById('accountFilterBadge');
+    if (q || statusFilter) {
+        if (footer) footer.style.display = 'flex';
+        if (countEl) countEl.textContent = `Showing ${visible} of ${total} account${total !== 1 ? 's' : ''}`;
+        if (badge) {
+            badge.textContent = `${visible} match${visible !== 1 ? 'es' : ''}`;
+            badge.className = 'card-badge' + (visible === 0 ? '' : ' green');
+        }
+    } else {
+        if (footer) footer.style.display = 'none';
+        if (badge) { badge.textContent = 'All'; badge.className = 'card-badge'; }
+    }
+
+    // Show no-results message
+    if (visible === 0 && total > 0 && (q || statusFilter)) {
+        const existing = tbodyFull.querySelector('.no-results-row');
+        if (!existing) {
+            const noRow = document.createElement('tr');
+            noRow.className = 'no-results-row';
+            noRow.innerHTML = '<td colspan="7" class="empty-state"><div class="empty-icon"><i class="fas fa-search"></i></div><p>No accounts match your search</p></td>';
+            tbodyFull.appendChild(noRow);
+        }
+    } else {
+        const existing = tbodyFull.querySelector('.no-results-row');
+        if (existing) existing.remove();
+    }
 }
 
 function updateStats() {
@@ -1307,22 +1354,604 @@ function updateAccountStatus(accountId, status, phoneNumber) {
 }
 
 // ============================================================================
-// API Docs Helpers
+// API Docs — Full Endpoint Registry & Dynamic Renderer
 // ============================================================================
+
+const API_ENDPOINTS = {
+    // ─── Authentication ─────────────────────────────────────────────────
+    'auth-login': {
+        group: 'auth', method: 'POST', path: '/api/auth/login',
+        desc: 'Authenticate with your admin credentials. Returns a session cookie for dashboard access.',
+        auth: 'None (public)',
+        body: { username: 'admin', password: 'your_password' },
+        response: { success: true, message: 'Login successful' },
+        errors: [
+            { code: 401, body: { success: false, error: 'Invalid credentials' } },
+            { code: 429, body: { success: false, error: 'Too many attempts. Try again later.' } }
+        ],
+        curl: `curl -X POST https://YOUR_DOMAIN/api/auth/login \\
+  -H "Content-Type: application/json" \\
+  -d '{"username": "admin", "password": "your_password"}'`
+    },
+    'auth-logout': {
+        group: 'auth', method: 'POST', path: '/api/auth/logout',
+        desc: 'End your authenticated session.',
+        auth: 'Session cookie',
+        response: { success: true, message: 'Logged out' },
+    },
+    'auth-user': {
+        group: 'auth', method: 'GET', path: '/api/auth/user',
+        desc: 'Get the currently authenticated user info.',
+        auth: 'Session cookie',
+        response: { success: true, user: { username: 'admin' } },
+    },
+
+    // ─── Accounts ────────────────────────────────────────────────────────
+    'get-accounts': {
+        group: 'accounts', method: 'GET', path: '/api/accounts',
+        desc: 'List all WhatsApp accounts with their current status, phone number, and configuration.',
+        auth: 'Session cookie (dashboard)',
+        response: { success: true, accounts: [{ id: 'uuid', name: 'My Account', status: 'ready', phone_number: '919876543210', api_key: 'wk_...', created_at: '2024-01-15T10:00:00Z' }] },
+    },
+    'get-account': {
+        group: 'accounts', method: 'GET', path: '/api/accounts/:id',
+        desc: 'Get details for a single account including runtime status.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, account: { id: 'uuid', name: 'My Account', status: 'ready', runtimeStatus: 'ready', phone_number: '919876543210', api_key: 'wk_...', pushName: 'John' } },
+        errors: [{ code: 404, body: { success: false, error: 'Account not found' } }],
+    },
+    'create-account': {
+        group: 'accounts', method: 'POST', path: '/api/accounts',
+        desc: 'Create a new WhatsApp account. A unique API key is auto-generated. You\'ll need to scan a QR code to connect.',
+        auth: 'Session cookie',
+        body: { name: 'My Business', description: 'Main business line' },
+        response: { success: true, account: { id: 'new-uuid', name: 'My Business', api_key: 'wk_abc123...' } },
+    },
+    'delete-account': {
+        group: 'accounts', method: 'DELETE', path: '/api/accounts/:id',
+        desc: 'Permanently delete an account and disconnect the WhatsApp session.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, message: 'Account deleted' },
+    },
+    'reconnect-account': {
+        group: 'accounts', method: 'POST', path: '/api/accounts/:id/reconnect',
+        desc: 'Reconnect a disconnected account. Starts a new session and generates a fresh QR code.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, message: 'Reconnection initiated' },
+    },
+    'get-qr': {
+        group: 'accounts', method: 'GET', path: '/api/accounts/:id/qr',
+        desc: 'Get the current QR code for account pairing. Returns a base64-encoded data URL image.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, qr: 'data:image/png;base64,...', status: 'qr_ready' },
+        errors: [{ code: 404, body: { success: false, error: 'No QR available yet' } }],
+    },
+    'regenerate-key': {
+        group: 'accounts', method: 'POST', path: '/api/accounts/:id/regenerate-api-key',
+        desc: 'Generate a new API key for the account. The old key is immediately invalidated.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, api_key: 'wk_new_key_here...' },
+    },
+
+    // ─── Messages ────────────────────────────────────────────────────────
+    'send-text': {
+        group: 'messages', method: 'POST', path: '/api/send',
+        desc: 'Send a text message. The "to" field accepts a phone number (auto-formatted) or a JID from a webhook (e.g. 919876543210@s.whatsapp.net).',
+        auth: 'API Key (in body)',
+        body: { api_key: 'YOUR_API_KEY', to: '919876543210', message: 'Hello from WAMulti API!' },
+        bodyFields: [
+            { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
+            { name: 'to', type: 'string', required: true, desc: 'Phone number or JID (from webhook fromJid)' },
+            { name: 'message', type: 'string', required: true, desc: 'Message text' },
+        ],
+        response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
+        errors: [
+            { code: 401, body: { success: false, error: 'Invalid API key' } },
+            { code: 400, body: { success: false, error: 'Account not connected' } },
+            { code: 429, body: { success: false, error: 'Rate limit exceeded (30 msg/min)' } },
+        ],
+        curl: `curl -X POST https://YOUR_DOMAIN/api/send \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "api_key": "YOUR_API_KEY",
+    "to": "919876543210",
+    "message": "Hello from WAMulti!"
+  }'`,
+        tips: [
+            'Use the <code>fromJid</code> field from incoming webhook data to reply to messages',
+            'Rate limited to 30 messages per 60 seconds per account',
+            'Phone numbers are auto-formatted — no need to add country code prefix or @s.whatsapp.net',
+        ],
+    },
+    'send-media': {
+        group: 'messages', method: 'POST', path: '/api/send-media',
+        desc: 'Send media via file upload (multipart/form-data). Supports image, video, audio, and document types.',
+        auth: 'API Key (in form data)',
+        note: 'Uses multipart/form-data — not JSON.',
+        bodyFields: [
+            { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
+            { name: 'to', type: 'string', required: true, desc: 'Phone number or JID' },
+            { name: 'media', type: 'file', required: true, desc: 'The media file to send' },
+            { name: 'mediaType', type: 'string', required: false, desc: 'image | video | audio | document (default: document)' },
+            { name: 'caption', type: 'string', required: false, desc: 'Caption for the media' },
+        ],
+        response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
+        curl: `curl -X POST https://YOUR_DOMAIN/api/send-media \\
+  -F "api_key=YOUR_API_KEY" \\
+  -F "to=919876543210" \\
+  -F "mediaType=image" \\
+  -F "caption=Check this out!" \\
+  -F "media=@/path/to/photo.jpg"`,
+    },
+    'send-media-url': {
+        group: 'messages', method: 'POST', path: '/api/send-media-url',
+        desc: 'Send media via a public URL or Base64-encoded data. Ideal for n8n / Make / automation platforms.',
+        auth: 'API Key (in body)',
+        bodyFields: [
+            { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
+            { name: 'to', type: 'string', required: true, desc: 'Phone number or JID' },
+            { name: 'mediaType', type: 'string', required: true, desc: 'image | video | audio | document' },
+            { name: 'mediaUrl', type: 'string', required: false, desc: 'Public URL of the media file (use this OR mediaBase64)' },
+            { name: 'mediaBase64', type: 'string', required: false, desc: 'Base64-encoded media data (use this OR mediaUrl)' },
+            { name: 'mimetype', type: 'string', required: false, desc: 'MIME type (required with mediaBase64)' },
+            { name: 'filename', type: 'string', required: false, desc: 'Filename (for documents)' },
+            { name: 'caption', type: 'string', required: false, desc: 'Caption for the media' },
+        ],
+        body: { api_key: 'YOUR_API_KEY', to: '919876543210', mediaType: 'image', mediaUrl: 'https://example.com/image.jpg', caption: 'Here is your image!' },
+        response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
+        curl: `curl -X POST https://YOUR_DOMAIN/api/send-media-url \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "api_key": "YOUR_API_KEY",
+    "to": "919876543210",
+    "mediaType": "image",
+    "mediaUrl": "https://example.com/photo.jpg",
+    "caption": "Check this out!"
+  }'`,
+        n8n: `// n8n: Send binary data (e.g. from a previous node)
+{
+  "api_key": "YOUR_API_KEY",
+  "to": "{{ $json.data.fromJid }}",
+  "mediaType": "document",
+  "mediaBase64": "{{ $binary.data.data }}",
+  "mimetype": "{{ $binary.data.mimeType }}",
+  "filename": "{{ $binary.data.fileName }}",
+  "caption": "Your document"
+}`,
+    },
+    'send-poll': {
+        group: 'messages', method: 'POST', path: '/api/send-poll',
+        desc: 'Send an interactive poll. Voters can select one or multiple options depending on selectableCount.',
+        auth: 'API Key (in body)',
+        bodyFields: [
+            { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
+            { name: 'to', type: 'string', required: true, desc: 'Phone number or JID' },
+            { name: 'name', type: 'string', required: true, desc: 'Poll question / title' },
+            { name: 'options', type: 'string[]', required: true, desc: 'Array of poll options (min 2, max 12)' },
+            { name: 'selectableCount', type: 'number', required: false, desc: '0 = unlimited selections, 1 = single choice (default: 0)' },
+        ],
+        body: { api_key: 'YOUR_API_KEY', to: '919876543210', name: 'What is your favorite color?', options: ['Red', 'Blue', 'Green', 'Yellow'], selectableCount: 1 },
+        response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
+        curl: `curl -X POST https://YOUR_DOMAIN/api/send-poll \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "api_key": "YOUR_API_KEY",
+    "to": "919876543210",
+    "name": "What is your favorite color?",
+    "options": ["Red", "Blue", "Green", "Yellow"],
+    "selectableCount": 1
+  }'`,
+    },
+
+    // ─── Webhooks ────────────────────────────────────────────────────────
+    'get-webhooks': {
+        group: 'webhooks', method: 'GET', path: '/api/accounts/:id/webhooks',
+        desc: 'List all webhooks configured for an account.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, webhooks: [{ id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message'], is_active: true, secret: null }] },
+    },
+    'create-webhook': {
+        group: 'webhooks', method: 'POST', path: '/api/accounts/:id/webhooks',
+        desc: 'Create a new webhook endpoint for an account. Events specify which types of messages trigger delivery.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        bodyFields: [
+            { name: 'url', type: 'string', required: true, desc: 'HTTPS URL to receive POST requests' },
+            { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, poll, poll_vote, * (default: ["message"])' },
+            { name: 'secret', type: 'string', required: false, desc: 'HMAC secret for signature verification' },
+        ],
+        body: { url: 'https://n8n.example.com/webhook/abc', events: ['message', 'connection'], secret: 'whsec_your_secret' },
+        response: { success: true, webhook: { id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message', 'connection'], is_active: true } },
+    },
+    'update-webhook': {
+        group: 'webhooks', method: 'PUT', path: '/api/webhooks/:id',
+        desc: 'Update a webhook\'s active status, URL, events, or secret.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Webhook UUID' }],
+        body: { is_active: false },
+        response: { success: true, webhook: { id: 'wh-uuid', is_active: false } },
+    },
+    'delete-webhook': {
+        group: 'webhooks', method: 'DELETE', path: '/api/webhooks/:id',
+        desc: 'Permanently delete a webhook.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Webhook UUID' }],
+        response: { success: true, message: 'Webhook deleted' },
+    },
+    'test-webhook': {
+        group: 'webhooks', method: 'POST', path: '/api/webhooks/:id/test',
+        desc: 'Send a test payload to a specific webhook to verify delivery.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Webhook UUID' }],
+        response: { success: true, statusCode: 200, duration: 142, message: 'Test delivered successfully' },
+    },
+    'test-dispatch': {
+        group: 'webhooks', method: 'POST', path: '/api/accounts/:id/webhooks/test-dispatch',
+        desc: 'Simulate a full message dispatch through the pipeline to all matching webhooks for the account.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, totalWebhooks: 2, diagnostics: [{ webhookId: 'wh-1', matchesMessage: true, queued: true }] },
+    },
+    'webhook-payload': {
+        group: 'webhooks', method: 'INFO', path: 'Webhook Payload Reference',
+        desc: 'This is the JSON payload your webhook URL receives when a message arrives. Use these fields to build automations.',
+        isReference: true,
+        referencePayload: `{
+  "event": "message",
+  "timestamp": "2026-02-10T12:00:00.000Z",
+  "account_id": "uuid-here",
+  "data": {
+    "messageId": "ABC123",
+    "from": "918005780278",
+    "fromJid": "918005780278@s.whatsapp.net",
+    "isLidSender": false,
+    "message": "Hello!",
+    "messageType": "text",
+    "isGroup": false,
+    "pushName": "John Doe"
+  }
+}`,
+        payloadFields: [
+            { name: 'event', desc: 'Event type: message, message.status, connection, poll, poll_vote' },
+            { name: 'timestamp', desc: 'ISO 8601 timestamp of when the event occurred' },
+            { name: 'account_id', desc: 'Your WAMulti account UUID' },
+            { name: 'data.messageId', desc: 'Unique message identifier' },
+            { name: 'data.from', desc: 'Sender phone number (without @s.whatsapp.net)' },
+            { name: 'data.fromJid', desc: 'Full JID — use this in the "to" field when replying' },
+            { name: 'data.message', desc: 'The message text content' },
+            { name: 'data.messageType', desc: 'Type: text, image, video, audio, document, sticker, poll, etc.' },
+            { name: 'data.isGroup', desc: 'true if message is from a group chat' },
+            { name: 'data.pushName', desc: 'Sender\'s display name on WhatsApp' },
+        ],
+        n8nAccess: `// n8n field access:
+// Reply To:     {{ $json.data.fromJid }}
+// Message:      {{ $json.data.message }}
+// Sender Name:  {{ $json.data.pushName }}
+// Message Type: {{ $json.data.messageType }}
+// Is Group:     {{ $json.data.isGroup }}`,
+        signatureCode: `const crypto = require('crypto');
+const signature = $input.first().headers['x-webhook-signature-256'];
+const payload = JSON.stringify($input.first().json);
+const secret = 'YOUR_WEBHOOK_SECRET';
+
+const expected = 'sha256=' + crypto
+  .createHmac('sha256', secret)
+  .update(payload)
+  .digest('hex');
+
+if (signature !== expected) {
+  throw new Error('Invalid signature');
+}
+return $input.all();`,
+    },
+
+    // ─── AI Auto-Reply ───────────────────────────────────────────────────
+    'get-ai-config': {
+        group: 'ai', method: 'GET', path: '/api/accounts/:id/ai-config',
+        desc: 'Get the AI auto-reply configuration for an account.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, config: { provider: 'openai', model: 'gpt-4o', is_active: true, system_prompt: '...', temperature: 0.7, memory_enabled: true, memory_limit: 10 } },
+    },
+    'save-ai-config': {
+        group: 'ai', method: 'POST', path: '/api/accounts/:id/ai-config',
+        desc: 'Save or update AI auto-reply settings. Supports OpenAI, Anthropic, Gemini, Groq, and OpenRouter.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        bodyFields: [
+            { name: 'provider', type: 'string', required: true, desc: 'openai | anthropic | gemini | groq | openrouter | openrouter-free' },
+            { name: 'api_key', type: 'string', required: true, desc: 'API key for the selected provider' },
+            { name: 'model', type: 'string', required: true, desc: 'Model name (e.g. gpt-4o, claude-sonnet-4)' },
+            { name: 'system_prompt', type: 'string', required: false, desc: 'System prompt for the AI' },
+            { name: 'temperature', type: 'number', required: false, desc: 'Creativity (0.0 - 1.0, default: 0.7)' },
+            { name: 'is_active', type: 'boolean', required: false, desc: 'Enable/disable auto-reply (default: true)' },
+            { name: 'memory_enabled', type: 'boolean', required: false, desc: 'Enable conversation memory (default: true)' },
+            { name: 'memory_limit', type: 'number', required: false, desc: 'Max messages to remember (default: 10)' },
+        ],
+        body: { provider: 'openai', api_key: 'sk-...', model: 'gpt-4o', system_prompt: 'You are a helpful assistant.', temperature: 0.7, is_active: true },
+        response: { success: true, config: { provider: 'openai', model: 'gpt-4o', is_active: true } },
+    },
+    'delete-ai-config': {
+        group: 'ai', method: 'DELETE', path: '/api/accounts/:id/ai-config',
+        desc: 'Delete AI auto-reply configuration for an account. The AI will stop responding to messages.',
+        auth: 'Session cookie',
+        params: [{ name: ':id', desc: 'Account UUID' }],
+        response: { success: true, message: 'AI config deleted' },
+    },
+
+    // ─── System ──────────────────────────────────────────────────────────
+    'health': {
+        group: 'system', method: 'GET', path: '/api/health',
+        desc: 'Get server health including uptime, memory usage, message metrics, cache stats, and webhook queue status.',
+        auth: 'None (public)',
+        response: { success: true, uptime: 86400, nodeVersion: 'v20.11.0', memory: { heapUsed: 52428800, heapTotal: 104857600 }, metrics: { messagesSent: 1250, messagesReceived: 3400 }, cache: { hitRate: 0.92 }, webhookQueue: { queueSize: 0, isProcessing: false, delivered: 145, failed: 2 } },
+    },
+};
+
+const API_GROUPS = [
+    { key: 'auth', label: 'Authentication', icon: 'fa-key' },
+    { key: 'accounts', label: 'Accounts', icon: 'fa-users' },
+    { key: 'messages', label: 'Messages', icon: 'fa-comment-dots' },
+    { key: 'webhooks', label: 'Webhooks', icon: 'fa-link' },
+    { key: 'ai', label: 'AI Auto-Reply', icon: 'fa-robot' },
+    { key: 'system', label: 'System', icon: 'fa-server' },
+];
+
+let currentEndpoint = null;
+
+function initApiDocs() {
+    const nav = document.getElementById('apiNav');
+    if (!nav) return;
+
+    let html = '';
+    API_GROUPS.forEach((group, gi) => {
+        const endpoints = Object.entries(API_ENDPOINTS).filter(([, ep]) => ep.group === group.key);
+        if (endpoints.length === 0) return;
+        const isFirst = gi === 2; // Messages group open by default
+        html += `<div class="api-nav-group">
+            <button class="api-nav-group-toggle${isFirst ? ' active' : ''}" onclick="toggleApiGroup(this)">
+                <i class="fas ${group.icon}"></i> ${group.label}
+                <span class="api-nav-count">${endpoints.length}</span>
+                <i class="fas fa-chevron-down toggle-icon"></i>
+            </button>
+            <div class="api-nav-items${isFirst ? ' show' : ''}">`;
+        endpoints.forEach(([key, ep]) => {
+            const methodClass = ep.method === 'INFO' ? 'info-ref' : ep.method.toLowerCase();
+            const methodLabel = ep.method === 'INFO' ? 'REF' : (ep.method === 'DELETE' ? 'DEL' : ep.method);
+            html += `<a href="#" class="api-nav-item" data-endpoint="${key}" onclick="showEndpoint('${key}', event)">
+                <span class="method-badge ${methodClass}">${methodLabel}</span> ${ep.isReference ? ep.path : ep.path.replace('/api/', '/')}
+            </a>`;
+        });
+        html += `</div></div>`;
+    });
+
+    nav.innerHTML = html;
+
+    // Show default endpoint
+    showEndpoint('send-text');
+}
+
+function showEndpoint(key, evt) {
+    if (evt) evt.preventDefault();
+    const ep = API_ENDPOINTS[key];
+    if (!ep) return;
+
+    currentEndpoint = key;
+
+    // Update nav active state
+    document.querySelectorAll('.api-nav-item').forEach(item => {
+        item.classList.toggle('active', item.getAttribute('data-endpoint') === key);
+    });
+
+    // Ensure parent group is open
+    const activeNavItem = document.querySelector(`.api-nav-item[data-endpoint="${key}"]`);
+    if (activeNavItem) {
+        const groupItems = activeNavItem.closest('.api-nav-items');
+        const groupToggle = groupItems?.previousElementSibling;
+        if (groupItems && !groupItems.classList.contains('show')) {
+            groupItems.classList.add('show');
+            groupToggle?.classList.add('active');
+        }
+    }
+
+    const container = document.getElementById('apiEndpointDetail');
+    if (!container) return;
+
+    // Reference page (webhook payload)
+    if (ep.isReference) {
+        container.innerHTML = renderReferenceEndpoint(ep);
+        container.scrollTop = 0;
+        return;
+    }
+
+    let html = '';
+
+    // Header
+    const methodClass = ep.method.toLowerCase();
+    html += `<div class="endpoint-header">
+        <span class="method-badge ${methodClass} large">${ep.method}</span>
+        <code class="endpoint-url">${escapeHtml(ep.path)}</code>
+    </div>
+    <p class="endpoint-desc">${ep.desc}</p>`;
+
+    // Auth badge
+    html += `<div class="endpoint-meta">
+        <span class="meta-tag"><i class="fas fa-shield-halved"></i> ${escapeHtml(ep.auth || 'Session cookie')}</span>
+    </div>`;
+
+    // URL params
+    if (ep.params && ep.params.length > 0) {
+        html += `<div class="api-section"><h4>URL Parameters</h4><div class="params-table">`;
+        ep.params.forEach(p => {
+            html += `<div class="param-row"><code class="param-name">${escapeHtml(p.name)}</code><span class="param-desc">${escapeHtml(p.desc)}</span></div>`;
+        });
+        html += `</div></div>`;
+    }
+
+    // Note
+    if (ep.note) {
+        html += `<div class="api-note"><i class="fas fa-info-circle"></i> ${ep.note}</div>`;
+    }
+
+    // Request body fields table
+    if (ep.bodyFields && ep.bodyFields.length > 0) {
+        html += `<div class="api-section"><h4>Request Body Parameters</h4><div class="params-table params-table-full">`;
+        ep.bodyFields.forEach(f => {
+            html += `<div class="param-row">
+                <code class="param-name">${escapeHtml(f.name)}</code>
+                <span class="param-type">${escapeHtml(f.type)}</span>
+                <span class="param-required ${f.required ? 'required' : 'optional'}">${f.required ? 'Required' : 'Optional'}</span>
+                <span class="param-desc">${f.desc}</span>
+            </div>`;
+        });
+        html += `</div></div>`;
+    }
+
+    // Request body JSON
+    if (ep.body) {
+        html += `<div class="api-section"><h4>Request Body</h4>`;
+        html += renderCodeBlock('JSON', JSON.stringify(ep.body, null, 2), true);
+        html += `</div>`;
+    }
+
+    // Response
+    if (ep.response) {
+        html += `<div class="api-section"><h4>Success Response</h4>`;
+        html += renderCodeBlock('200 OK', JSON.stringify(ep.response, null, 2), false, 'success');
+        html += `</div>`;
+    }
+
+    // Error responses
+    if (ep.errors && ep.errors.length > 0) {
+        html += `<div class="api-section"><h4>Error Responses</h4>`;
+        ep.errors.forEach(err => {
+            html += renderCodeBlock(`${err.code} Error`, JSON.stringify(err.body, null, 2), false, 'error');
+        });
+        html += `</div>`;
+    }
+
+    // cURL
+    if (ep.curl) {
+        html += `<div class="api-section"><h4>cURL Example</h4>`;
+        html += renderCodeBlock('Shell', ep.curl, true);
+        html += `</div>`;
+    }
+
+    // n8n snippet
+    if (ep.n8n) {
+        html += `<div class="api-section"><h4>n8n / Automation Example</h4>`;
+        html += renderCodeBlock('JSON — n8n HTTP Request', ep.n8n, true);
+        html += `</div>`;
+    }
+
+    // Tips
+    if (ep.tips && ep.tips.length > 0) {
+        html += `<div class="api-section"><h4>Tips</h4><ul class="api-tips">`;
+        ep.tips.forEach(t => { html += `<li>${t}</li>`; });
+        html += `</ul></div>`;
+    }
+
+    container.innerHTML = html;
+    container.scrollTop = 0;
+}
+
+function renderReferenceEndpoint(ep) {
+    let html = `<div class="endpoint-header">
+        <span class="method-badge info-ref large">REF</span>
+        <code class="endpoint-url">${escapeHtml(ep.path)}</code>
+    </div>
+    <p class="endpoint-desc">${ep.desc}</p>`;
+
+    // Payload
+    if (ep.referencePayload) {
+        html += `<div class="api-section"><h4>Payload Structure</h4>`;
+        html += renderCodeBlock('Webhook Payload', ep.referencePayload, true);
+        html += `</div>`;
+    }
+
+    // Field reference table
+    if (ep.payloadFields && ep.payloadFields.length > 0) {
+        html += `<div class="api-section"><h4>Field Reference</h4><div class="params-table">`;
+        ep.payloadFields.forEach(f => {
+            html += `<div class="param-row"><code class="param-name">${escapeHtml(f.name)}</code><span class="param-desc">${escapeHtml(f.desc)}</span></div>`;
+        });
+        html += `</div></div>`;
+    }
+
+    // n8n access
+    if (ep.n8nAccess) {
+        html += `<div class="api-section"><h4>n8n Field Access</h4>`;
+        html += renderCodeBlock('n8n Expressions', ep.n8nAccess, true);
+        html += `</div>`;
+    }
+
+    // Signature verification
+    if (ep.signatureCode) {
+        html += `<div class="api-section"><h4>Signature Verification (n8n Code Node)</h4>
+            <p class="section-desc">If you set a webhook secret, verify the HMAC signature before processing:</p>`;
+        html += renderCodeBlock('JavaScript', ep.signatureCode, true);
+        html += `</div>`;
+    }
+
+    // n8n integration guide
+    html += `<div class="integration-card">
+        <div class="integration-header">
+            <div class="integration-icon"><i class="fas fa-diagram-project"></i></div>
+            <div><h4>n8n Integration Guide</h4><p>Step-by-step setup for n8n workflows</p></div>
+        </div>
+        <div class="integration-steps">
+            <div class="step"><span class="step-num">1</span><div><strong>Create Webhook Trigger</strong><p>Add a Webhook node in n8n. Copy the Production URL and add it in the Webhooks section of this dashboard.</p></div></div>
+            <div class="step"><span class="step-num">2</span><div><strong>Add HTTP Request Node</strong><p>Method: POST, URL: https://YOUR_DOMAIN/api/send</p></div></div>
+            <div class="step"><span class="step-num">3</span><div><strong>Set JSON Body</strong><p>Use api_key, to: {{ $json.data.fromJid }}, message: your reply text</p></div></div>
+        </div>
+    </div>`;
+
+    return html;
+}
+
+function renderCodeBlock(label, code, copyable, modifier) {
+    const cls = modifier ? ` ${modifier}` : '';
+    const copyBtn = copyable ? `<button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button>` : '';
+    return `<div class="code-block${cls}">
+        <div class="code-header"><span>${escapeHtml(label)}</span>${copyBtn}</div>
+        <pre><code>${escapeHtml(code)}</code></pre>
+    </div>`;
+}
+
+function filterApiEndpoints(query) {
+    const q = query.toLowerCase();
+    document.querySelectorAll('.api-nav-group').forEach(group => {
+        const items = group.querySelectorAll('.api-nav-item');
+        let anyVisible = false;
+        items.forEach(item => {
+            const text = item.textContent.toLowerCase();
+            const key = item.getAttribute('data-endpoint') || '';
+            const ep = API_ENDPOINTS[key];
+            const desc = ep ? ep.desc.toLowerCase() : '';
+            const visible = !q || text.includes(q) || desc.includes(q) || key.includes(q);
+            item.style.display = visible ? '' : 'none';
+            if (visible) anyVisible = true;
+        });
+        // Show group if any items match
+        group.style.display = anyVisible ? '' : 'none';
+        if (q && anyVisible) {
+            group.querySelector('.api-nav-items')?.classList.add('show');
+            group.querySelector('.api-nav-group-toggle')?.classList.add('active');
+        }
+    });
+}
 
 function toggleApiGroup(btn) {
     const items = btn.nextElementSibling;
     const isActive = btn.classList.contains('active');
     btn.classList.toggle('active', !isActive);
     items.classList.toggle('show', !isActive);
-}
-
-function showEndpoint(endpoint) {
-    // Remove active class from all items
-    document.querySelectorAll('.api-nav-item').forEach(item => item.classList.remove('active'));
-    // Add active to clicked item
-    event.target.closest('.api-nav-item')?.classList.add('active');
-    // For now, scroll to content (all endpoints shown in single view)
 }
 
 function copyCode(btn) {

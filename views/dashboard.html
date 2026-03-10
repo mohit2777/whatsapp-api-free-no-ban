@@ -149,11 +149,19 @@
                         <div class="card-header">
                             <div class="card-title-group">
                                 <h2>Manage Accounts</h2>
+                                <span class="card-badge" id="accountFilterBadge">All</span>
                             </div>
                             <div class="card-actions">
+                                <select id="accountStatusFilter" class="select-modern select-sm" onchange="filterAccounts()">
+                                    <option value="">All Status</option>
+                                    <option value="ready">Connected</option>
+                                    <option value="disconnected">Disconnected</option>
+                                    <option value="initializing">Connecting</option>
+                                    <option value="error">Error</option>
+                                </select>
                                 <div class="search-box">
                                     <i class="fas fa-search"></i>
-                                    <input type="text" id="accountSearchInput" placeholder="Search accounts..." oninput="filterAccounts(this.value)">
+                                    <input type="text" id="accountSearchInput" placeholder="Search accounts..." oninput="filterAccounts()">
                                     <button class="search-clear-btn" id="searchClearBtn" style="display:none;" title="Clear search">
                                         <i class="fas fa-times"></i>
                                     </button>
@@ -180,6 +188,9 @@
                                     <tr><td colspan="7" class="empty-state"><div class="skeleton-group"><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line short"></div><div class="skeleton skeleton-line"></div></div></td></tr>
                                 </tbody>
                             </table>
+                        </div>
+                        <div class="table-footer" id="accountTableFooter" style="display:none;">
+                            <span class="text-muted" id="accountResultCount"></span>
                         </div>
                     </div>
                 </div>
@@ -218,10 +229,20 @@
                         </div>
                     </div>
 
+                    <!-- Webhook Quick Guide -->
+                    <div class="webhook-guide-banner">
+                        <div class="guide-icon"><i class="fas fa-lightbulb"></i></div>
+                        <div class="guide-text">
+                            <strong>How webhooks work:</strong> When a message is received on your WhatsApp account, it's forwarded as an HTTP POST to your webhook URL in real-time. Use services like <strong>n8n</strong>, <strong>Make</strong>, or any HTTP endpoint to receive them.
+                        </div>
+                        <button class="btn btn-sm btn-outline" onclick="switchView('api-docs'); showEndpoint('webhook-payload')">View Payload Docs</button>
+                    </div>
+
                     <div class="card">
                         <div class="card-header">
                             <div class="card-title-group">
                                 <h2>Webhook Configuration</h2>
+                                <span class="card-badge" id="webhookCountBadge">0 configured</span>
                             </div>
                             <div class="card-actions">
                                 <select id="webhookAccountSelect" class="select-modern">
@@ -233,7 +254,8 @@
                             <div id="webhooksList">
                                 <div class="empty-state-card">
                                     <i class="fas fa-link"></i>
-                                    <p>Select an account to manage its webhooks</p>
+                                    <p>Select an account above to view and manage its webhooks</p>
+                                    <p class="text-muted" style="font-size:12px; margin-top:4px;">Each account can have multiple webhooks with different event filters</p>
                                 </div>
                             </div>
                         </div>
@@ -253,21 +275,30 @@
                                 <div class="form-group">
                                     <label>Webhook URL</label>
                                     <input type="url" id="webhookUrl" placeholder="https://your-n8n.com/webhook/..." required class="input-modern">
+                                    <p class="form-hint">The HTTPS endpoint that will receive POST requests when events occur</p>
                                 </div>
                                 <div class="form-group">
-                                    <label>Events</label>
-                                    <div class="checkbox-grid">
+                                    <label>Events <span class="label-hint">(select which events trigger this webhook)</span></label>
+                                    <div class="checkbox-grid checkbox-grid-3">
                                         <label class="checkbox-card">
                                             <input type="checkbox" name="webhookEvents" value="message" checked>
                                             <span><i class="fas fa-envelope"></i> Messages</span>
+                                        </label>
+                                        <label class="checkbox-card">
+                                            <input type="checkbox" name="webhookEvents" value="message.status">
+                                            <span><i class="fas fa-check-double"></i> Msg Status</span>
                                         </label>
                                         <label class="checkbox-card">
                                             <input type="checkbox" name="webhookEvents" value="connection">
                                             <span><i class="fas fa-plug"></i> Connection</span>
                                         </label>
                                         <label class="checkbox-card">
-                                            <input type="checkbox" name="webhookEvents" value="message.status">
-                                            <span><i class="fas fa-check-double"></i> Status</span>
+                                            <input type="checkbox" name="webhookEvents" value="poll">
+                                            <span><i class="fas fa-poll-h"></i> Polls</span>
+                                        </label>
+                                        <label class="checkbox-card">
+                                            <input type="checkbox" name="webhookEvents" value="poll_vote">
+                                            <span><i class="fas fa-vote-yea"></i> Poll Votes</span>
                                         </label>
                                         <label class="checkbox-card">
                                             <input type="checkbox" name="webhookEvents" value="*">
@@ -276,11 +307,12 @@
                                     </div>
                                 </div>
                                 <div class="form-group">
-                                    <label>Secret Key <span class="label-hint">(optional)</span></label>
+                                    <label>Secret Key <span class="label-hint">(optional — for HMAC signature verification)</span></label>
                                     <div class="input-with-btn">
-                                        <input type="text" id="webhookSecret" placeholder="Webhook secret for signature verification" class="input-modern">
+                                        <input type="text" id="webhookSecret" placeholder="whsec_..." class="input-modern">
                                         <button type="button" class="btn btn-secondary btn-sm" onclick="generateSecret()">Generate</button>
                                     </div>
+                                    <p class="form-hint">If set, each delivery includes an <code>x-webhook-signature-256</code> header you can verify</p>
                                 </div>
                                 <button type="submit" class="btn btn-primary">
                                     <i class="fas fa-plus"></i> Save Webhook
@@ -441,277 +473,22 @@
                         <!-- Sidebar Navigation -->
                         <div class="api-sidebar">
                             <div class="api-sidebar-header">
-                                <h3>Endpoints</h3>
+                                <h3>API Reference</h3>
                                 <span class="version-tag">v4.0</span>
                             </div>
-                            <nav class="api-nav">
-                                <div class="api-nav-group">
-                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
-                                        <i class="fas fa-key"></i> Authentication
-                                        <i class="fas fa-chevron-down toggle-icon"></i>
-                                    </button>
-                                    <div class="api-nav-items">
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('auth-login')">
-                                            <span class="method-badge post">POST</span> /api/login
-                                        </a>
-                                    </div>
-                                </div>
-                                <div class="api-nav-group">
-                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
-                                        <i class="fas fa-users"></i> Accounts
-                                        <i class="fas fa-chevron-down toggle-icon"></i>
-                                    </button>
-                                    <div class="api-nav-items">
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('get-accounts')">
-                                            <span class="method-badge get">GET</span> /api/accounts
-                                        </a>
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('create-account')">
-                                            <span class="method-badge post">POST</span> /api/accounts
-                                        </a>
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('delete-account')">
-                                            <span class="method-badge delete">DEL</span> /api/accounts/:id
-                                        </a>
-                                    </div>
-                                </div>
-                                <div class="api-nav-group">
-                                    <button class="api-nav-group-toggle active" onclick="toggleApiGroup(this)">
-                                        <i class="fas fa-comment-dots"></i> Messages
-                                        <i class="fas fa-chevron-down toggle-icon"></i>
-                                    </button>
-                                    <div class="api-nav-items show">
-                                        <a href="#" class="api-nav-item active" onclick="showEndpoint('send-text')">
-                                            <span class="method-badge post">POST</span> /api/send
-                                        </a>
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('send-media')">
-                                            <span class="method-badge post">POST</span> /api/send-media
-                                        </a>
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('send-media-url')">
-                                            <span class="method-badge post">POST</span> /api/send-media-url
-                                        </a>
-                                    </div>
-                                </div>
-                                <div class="api-nav-group">
-                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
-                                        <i class="fas fa-link"></i> Webhooks
-                                        <i class="fas fa-chevron-down toggle-icon"></i>
-                                    </button>
-                                    <div class="api-nav-items">
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('get-webhooks')">
-                                            <span class="method-badge get">GET</span> /api/webhooks/:accountId
-                                        </a>
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('add-webhook')">
-                                            <span class="method-badge post">POST</span> /api/webhooks
-                                        </a>
-                                    </div>
-                                </div>
-                                <div class="api-nav-group">
-                                    <button class="api-nav-group-toggle" onclick="toggleApiGroup(this)">
-                                        <i class="fas fa-server"></i> System
-                                        <i class="fas fa-chevron-down toggle-icon"></i>
-                                    </button>
-                                    <div class="api-nav-items">
-                                        <a href="#" class="api-nav-item" onclick="showEndpoint('health')">
-                                            <span class="method-badge get">GET</span> /api/health
-                                        </a>
-                                    </div>
-                                </div>
+                            <div class="api-search-box">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="apiSearchInput" placeholder="Search endpoints..." oninput="filterApiEndpoints(this.value)">
+                            </div>
+                            <nav class="api-nav" id="apiNav">
+                                <!-- Rendered by JS -->
                             </nav>
                         </div>
 
                         <!-- API Content -->
                         <div class="api-content">
                             <div class="api-endpoint-detail" id="apiEndpointDetail">
-                                <!-- Send Text Message (default) -->
-                                <div class="endpoint-header">
-                                    <span class="method-badge post large">POST</span>
-                                    <code class="endpoint-url">/api/send</code>
-                                </div>
-                                <p class="endpoint-desc">Send a text message to a WhatsApp number or reply using fromJid from webhook.</p>
-
-                                <div class="api-section">
-                                    <h4>Headers</h4>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>Headers</span></div>
-                                        <pre><code>Content-Type: application/json</code></pre>
-                                    </div>
-                                </div>
-
-                                <div class="api-section">
-                                    <h4>Request Body</h4>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>JSON</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>{
-  "api_key": "YOUR_API_KEY",
-  "to": "919876543210",
-  "message": "Hello from WAMulti API!"
-}</code></pre>
-                                    </div>
-                                </div>
-
-                                <div class="api-section">
-                                    <h4>Response</h4>
-                                    <div class="code-block success">
-                                        <div class="code-header"><span>200 OK</span></div>
-                                        <pre><code>{
-  "success": true,
-  "messageId": "3EB0F4A2B3C4D5E6F7",
-  "timestamp": 1706889600000
-}</code></pre>
-                                    </div>
-                                </div>
-
-                                <div class="api-section">
-                                    <h4>cURL Example</h4>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>Shell</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>curl -X POST https://YOUR_DOMAIN/api/send \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "YOUR_API_KEY",
-    "to": "919876543210",
-    "message": "Hello from WAMulti!"
-  }'</code></pre>
-                                    </div>
-                                </div>
-
-                                <div class="api-section">
-                                    <h4>Reply Using Webhook Data</h4>
-                                    <p class="section-desc">When you receive a webhook, use <code>fromJid</code> in the <code>to</code> field to reply:</p>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>JSON - n8n HTTP Request</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>{
-  "api_key": "YOUR_API_KEY",
-  "to": "{{ $json.data.fromJid }}",
-  "message": "Thanks {{ $json.data.pushName }}! You said: {{ $json.data.message }}"
-}</code></pre>
-                                    </div>
-                                </div>
-
-                                <!-- n8n Integration Guide -->
-                                <div class="integration-card">
-                                    <div class="integration-header">
-                                        <div class="integration-icon">
-                                            <i class="fas fa-diagram-project"></i>
-                                        </div>
-                                        <div>
-                                            <h4>n8n Integration Guide</h4>
-                                            <p>Step-by-step setup for n8n workflows</p>
-                                        </div>
-                                    </div>
-                                    <div class="integration-steps">
-                                        <div class="step">
-                                            <span class="step-num">1</span>
-                                            <div>
-                                                <strong>Create Webhook Trigger</strong>
-                                                <p>Add a Webhook node in n8n. Copy the Production URL and add it in the Webhooks section of this dashboard.</p>
-                                            </div>
-                                        </div>
-                                        <div class="step">
-                                            <span class="step-num">2</span>
-                                            <div>
-                                                <strong>Add HTTP Request Node</strong>
-                                                <p>Method: POST, URL: https://YOUR_DOMAIN/api/send</p>
-                                            </div>
-                                        </div>
-                                        <div class="step">
-                                            <span class="step-num">3</span>
-                                            <div>
-                                                <strong>Set JSON Body</strong>
-                                                <p>Use api_key, to: {{ $json.data.fromJid }}, message: your text</p>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Webhook Payload Reference -->
-                                <div class="api-section">
-                                    <h4>Incoming Webhook Payload</h4>
-                                    <p class="section-desc">This is the payload your webhook URL will receive when a message comes in:</p>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>Webhook Payload</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>{
-  "event": "message",
-  "timestamp": "2026-02-10T12:00:00.000Z",
-  "account_id": "uuid-here",
-  "data": {
-    "messageId": "ABC123",
-    "from": "918005780278",
-    "fromJid": "918005780278@s.whatsapp.net",
-    "isLidSender": false,
-    "message": "Hello!",
-    "messageType": "text",
-    "isGroup": false,
-    "pushName": "John Doe"
-  }
-}
-
-// n8n field access:
-// Reply To:     {{ $json.data.fromJid }}
-// Message:      {{ $json.data.message }}
-// Sender Name:  {{ $json.data.pushName }}</code></pre>
-                                    </div>
-                                </div>
-
-                                <!-- Send Media -->
-                                <div class="api-section">
-                                    <h4>Send Media via URL</h4>
-                                    <div class="endpoint-header compact">
-                                        <span class="method-badge post">POST</span>
-                                        <code class="endpoint-url">/api/send-media-url</code>
-                                    </div>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>JSON</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>{
-  "api_key": "YOUR_API_KEY",
-  "to": "{{ $json.data.fromJid }}",
-  "mediaType": "image",
-  "mediaUrl": "https://example.com/image.jpg",
-  "caption": "Here's your image!"
-}
-
-// mediaType options: image, video, audio, document</code></pre>
-                                    </div>
-                                </div>
-
-                                <!-- Send Base64 -->
-                                <div class="api-section">
-                                    <h4>Send Media via Base64</h4>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>JSON - For n8n binary data</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>{
-  "api_key": "YOUR_API_KEY",
-  "to": "{{ $json.data.fromJid }}",
-  "mediaType": "document",
-  "mediaBase64": "{{ $binary.data.data }}",
-  "mimetype": "{{ $binary.data.mimeType }}",
-  "filename": "{{ $binary.data.fileName }}",
-  "caption": "Your document"
-}</code></pre>
-                                    </div>
-                                </div>
-
-                                <!-- Webhook Signature -->
-                                <div class="api-section">
-                                    <h4>Webhook Signature Verification</h4>
-                                    <p class="section-desc">If you set a webhook secret, verify signatures in n8n with a Code node:</p>
-                                    <div class="code-block">
-                                        <div class="code-header"><span>JavaScript - n8n Code Node</span><button class="copy-btn" onclick="copyCode(this)"><i class="fas fa-copy"></i> Copy</button></div>
-                                        <pre><code>const crypto = require('crypto');
-const signature = $input.first().headers['x-webhook-signature-256'];
-const payload = JSON.stringify($input.first().json);
-const secret = 'YOUR_WEBHOOK_SECRET';
-
-const expected = 'sha256=' + crypto
-  .createHmac('sha256', secret)
-  .update(payload)
-  .digest('hex');
-
-if (signature !== expected) {
-  throw new Error('Invalid signature');
-}
-return $input.all();</code></pre>
-                                    </div>
-                                </div>
+                                <!-- Rendered dynamically by showEndpoint() -->
                             </div>
                         </div>
                     </div>
