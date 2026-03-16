@@ -428,26 +428,96 @@ app.post('/api/send', messageLimiter, validate(schemas.sendMessage), async (req,
   }
 });
 
+function decodeBase64Media(mediaBase64, mimetype = '') {
+  if (!mediaBase64 || typeof mediaBase64 !== 'string') {
+    throw new Error('mediaBase64 must be a non-empty string');
+  }
+
+  const raw = mediaBase64.trim();
+  if (!raw) {
+    throw new Error('mediaBase64 must be a non-empty string');
+  }
+
+  let inferredMimetype = '';
+  let base64Payload = raw;
+  const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.+)$/is);
+  if (dataUrlMatch) {
+    inferredMimetype = dataUrlMatch[1];
+    base64Payload = dataUrlMatch[2];
+  }
+
+  let normalized = base64Payload.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  if (!normalized) {
+    throw new Error('mediaBase64 payload is empty');
+  }
+
+  const remainder = normalized.length % 4;
+  if (remainder > 0) {
+    normalized += '='.repeat(4 - remainder);
+  }
+
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) {
+    throw new Error('mediaBase64 is not valid base64 data');
+  }
+
+  const mediaBuffer = Buffer.from(normalized, 'base64');
+  if (!mediaBuffer.length) {
+    throw new Error('Decoded media is empty');
+  }
+
+  const maxBytes = 25 * 1024 * 1024;
+  if (mediaBuffer.length > maxBytes) {
+    throw new Error('Media exceeds 25 MB limit');
+  }
+
+  return {
+    mediaBuffer,
+    detectedMimetype: mimetype || inferredMimetype || null
+  };
+}
+
 // Send media via file upload
 app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, res) => {
   try {
-    const { api_key, to, caption, mediaType } = req.body;
+    const { api_key, to, caption, mediaType, mediaBase64, mimetype, filename } = req.body;
 
-    logger.info(`[API] /api/send-media called - to: ${to}, file: ${req.file?.originalname}, type: ${mediaType}`);
+    logger.info(`[API] /api/send-media called - to: ${to}, file: ${req.file?.originalname}, type: ${mediaType}, hasBase64: ${!!mediaBase64}`);
 
     if (!api_key) {
       logger.warn('[API] Missing api_key');
       return res.status(400).json({ success: false, error: 'api_key is required' });
     }
 
-    if (!req.file) {
-      logger.warn('[API] No media file provided');
-      return res.status(400).json({ success: false, error: 'No media file provided' });
-    }
-
     if (!to) {
       logger.warn('[API] Missing to field');
       return res.status(400).json({ success: false, error: 'Missing required field: to (phone number or JID)' });
+    }
+
+    let mediaBuffer = null;
+    let detectedMimetype = mimetype || null;
+    let detectedFilename = filename || 'file';
+
+    if (req.file) {
+      mediaBuffer = req.file.buffer;
+      detectedMimetype = detectedMimetype || req.file.mimetype;
+      detectedFilename = filename || req.file.originalname;
+    } else if (mediaBase64) {
+      const decoded = decodeBase64Media(mediaBase64, mimetype);
+      mediaBuffer = decoded.mediaBuffer;
+      detectedMimetype = decoded.detectedMimetype;
+    } else {
+      logger.warn('[API] No media file/base64 provided');
+      return res.status(400).json({ success: false, error: 'Provide either multipart field "media" or JSON field "mediaBase64"' });
+    }
+
+    if (!detectedMimetype) {
+      const mimetypeDefaults = {
+        image: 'image/jpeg',
+        video: 'video/mp4',
+        audio: 'audio/mp4',
+        document: 'application/octet-stream'
+      };
+      detectedMimetype = mimetypeDefaults[mediaType] || 'application/octet-stream';
     }
 
     const account = await db.getAccountByApiKey(api_key);
@@ -465,11 +535,11 @@ app.post('/api/send-media', messageLimiter, upload.single('media'), async (req, 
     const result = await whatsappManager.sendMedia(
       account.id,
       to,
-      req.file.buffer,
+      mediaBuffer,
       mediaType || 'document',
       caption || '',
-      req.file.mimetype,
-      req.file.originalname
+      detectedMimetype,
+      detectedFilename
     );
 
     logger.info(`[API] Media sent successfully: ${result.messageId}`);
@@ -518,9 +588,10 @@ app.post('/api/send-poll', messageLimiter, validate(schemas.sendPoll), async (re
 // Send media via Base64 or URL
 app.post('/api/send-media-url', messageLimiter, async (req, res) => {
   try {
-    const { api_key, to, caption, mediaType, mediaUrl, mediaBase64, mimetype, filename } = req.body;
+    const { api_key, to, caption, mediaType, mediaUrl, mediaBase64, mimetype, filename, base64 } = req.body;
+    const resolvedBase64 = mediaBase64 || base64;
 
-    logger.info(`[API] /api/send-media-url called - to: ${to}, type: ${mediaType}, hasUrl: ${!!mediaUrl}, hasBase64: ${!!mediaBase64}`);
+    logger.info(`[API] /api/send-media-url called - to: ${to}, type: ${mediaType}, hasUrl: ${!!mediaUrl}, hasBase64: ${!!resolvedBase64}`);
 
     if (!api_key) {
       logger.warn('[API] Missing api_key');
@@ -532,7 +603,7 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
       return res.status(400).json({ success: false, error: 'to is required (phone number or JID)' });
     }
 
-    if (!mediaUrl && !mediaBase64) {
+    if (!mediaUrl && !resolvedBase64) {
       logger.warn('[API] Missing both mediaUrl and mediaBase64');
       return res.status(400).json({ success: false, error: 'Either mediaUrl or mediaBase64 is required' });
     }
@@ -551,17 +622,10 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
     let mediaBuffer;
     let detectedMimetype = mimetype;
 
-    if (mediaBase64) {
-      // Handle base64 encoded media
-      // Remove data URL prefix if present (e.g., "data:image/png;base64,")
-      const base64Data = mediaBase64.replace(/^data:[^;]+;base64,/, '');
-      mediaBuffer = Buffer.from(base64Data, 'base64');
-      
-      // Try to detect mimetype from data URL if not provided
-      if (!detectedMimetype && mediaBase64.startsWith('data:')) {
-        const match = mediaBase64.match(/^data:([^;]+);base64,/);
-        if (match) detectedMimetype = match[1];
-      }
+    if (resolvedBase64) {
+      const decoded = decodeBase64Media(resolvedBase64, mimetype);
+      mediaBuffer = decoded.mediaBuffer;
+      detectedMimetype = decoded.detectedMimetype;
     } else if (mediaUrl) {
       // SSRF protection: only allow http/https and block internal IPs
       const parsedUrl = new URL(mediaUrl);
@@ -578,10 +642,13 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
       const response = await axios.get(mediaUrl, { 
         responseType: 'arraybuffer',
         timeout: 30000,
-        maxContentLength: 50 * 1024 * 1024, // 50MB limit
+        maxContentLength: 25 * 1024 * 1024,
         maxRedirects: 3
       });
       mediaBuffer = Buffer.from(response.data);
+      if (mediaBuffer.length > 25 * 1024 * 1024) {
+        return res.status(400).json({ success: false, error: 'Media exceeds 25 MB limit' });
+      }
       detectedMimetype = detectedMimetype || response.headers['content-type'];
     }
 

@@ -164,9 +164,12 @@ curl -X POST https://your-app.onrender.com/api/send \
 
 ---
 
-### Send Media (File Upload)
+### Send Media (File Upload or Base64 JSON)
 
-Upload a file directly using `multipart/form-data`.
+You can send media in two ways on the same endpoint: `POST /api/send-media`
+
+- `multipart/form-data` with a binary file (`media` field)
+- `application/json` with `mediaBase64` (best for n8n HTTP Request node)
 
 **Send an image with caption:**
 ```bash
@@ -176,6 +179,32 @@ curl -X POST https://your-app.onrender.com/api/send-media \
   -F "mediaType=image" \
   -F "caption=Check this out!" \
   -F "media=@photo.jpg"
+```
+
+**Send base64 media with caption (JSON / HTTP node):**
+```bash
+curl -X POST https://your-app.onrender.com/api/send-media \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "your-account-api-key",
+    "to": "919876543210",
+    "mediaType": "image",
+    "caption": "Sent from n8n HTTP node",
+    "mediaBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD..."
+  }'
+```
+
+**Same JSON method without data URL prefix:**
+```json
+{
+  "api_key": "your-account-api-key",
+  "to": "919876543210",
+  "mediaType": "document",
+  "caption": "Invoice attached",
+  "filename": "invoice-march.pdf",
+  "mimetype": "application/pdf",
+  "mediaBase64": "JVBERi0xLjQKJcfsj6IK..."
+}
 ```
 
 **Send a PDF document:**
@@ -215,13 +244,20 @@ curl -X POST https://your-app.onrender.com/api/send-media \
 | `to` | string | Yes | Phone with country code (e.g. `919876543210`) or group JID |
 | `mediaType` | string | No | `image`, `video`, `audio`, or `document`. Defaults to `document` if omitted. |
 | `caption` | string | No | Caption text (supported on image, video, document — ignored for audio) |
-| `media` | file | Yes | The media file to send (max 25 MB) |
+| `media` | file | One of | Binary file in multipart request |
+| `mediaBase64` | string | One of | Base64 media string in JSON body (data URL or raw base64) |
+| `mimetype` | string | No | MIME type override (auto-detected from data URL if present) |
+| `filename` | string | No | Useful for document messages (default: `file`) |
+
+> Provide at least one of `media` or `mediaBase64`.
 
 ---
 
 ### Send Media (URL or Base64)
 
-Send media from a public URL or base64-encoded string. Useful for automation (n8n, Make, Zapier).
+Alternative endpoint: `POST /api/send-media-url`.
+
+This endpoint is useful when your automation provides a public file URL. It also supports base64 for backward compatibility.
 
 **Image from URL with caption:**
 ```bash
