@@ -701,7 +701,7 @@ app.post('/api/accounts/:id/webhooks', requireAuth, webhookLimiter, validate(sch
       account_id: req.params.id,
       url: req.body.url,
       secret: req.body.secret || null,
-      events: req.body.events || ['message'],
+      events: req.body.events || ['message', 'message.status'],
       is_active: true
     };
     const webhook = await db.createWebhook(webhookData);

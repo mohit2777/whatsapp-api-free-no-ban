@@ -53,7 +53,7 @@ const schemas = {
   webhook: Joi.object({
     url: Joi.string().uri().max(500).required(),
     secret: Joi.string().max(255).optional().allow(''),
-    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'presence', 'connection', 'connection.update', 'presence.update', 'poll', 'poll_vote', '*')).optional(),
+    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'connection', '*')).optional(),
     is_active: Joi.boolean().optional()
   }),
 
@@ -61,7 +61,7 @@ const schemas = {
   webhookUpdate: Joi.object({
     url: Joi.string().uri().max(500).optional(),
     secret: Joi.string().max(255).optional().allow(''),
-    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'presence', 'connection', 'connection.update', 'presence.update', 'poll', 'poll_vote', '*')).optional(),
+    events: Joi.array().items(Joi.string().valid('message', 'message.status', 'connection', '*')).optional(),
     is_active: Joi.boolean().optional()
   }),
 

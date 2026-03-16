@@ -394,11 +394,11 @@ class WebhookDeliveryService {
    * Handles TEXT[], JSON string, PostgreSQL array literal, null/undefined, or already-an-array.
    */
   normalizeEvents(events) {
-    if (!events) return ['message'];
+    if (!events) return ['message', 'message.status'];
     if (Array.isArray(events)) {
       // Empty array means "no events selected" — default to ['message'] so
       // the webhook isn't silently dead.
-      return events.length > 0 ? events : ['message'];
+      return events.length > 0 ? events : ['message', 'message.status'];
     }
     if (typeof events === 'string') {
       // PostgreSQL TEXT[] literal format: {message,message.status}
@@ -406,19 +406,19 @@ class WebhookDeliveryService {
       // depending on client version / connection pooler.
       if (events.startsWith('{') && events.endsWith('}')) {
         const inner = events.slice(1, -1);
-        if (!inner) return ['message']; // empty array literal '{}'
+        if (!inner) return ['message', 'message.status']; // empty array literal '{}'
         // Split on comma, strip optional quotes around each value
         return inner.split(',').map(s => s.replace(/^"|"$/g, '').trim()).filter(Boolean);
       }
       try {
         const parsed = JSON.parse(events);
-        if (Array.isArray(parsed)) return parsed.length > 0 ? parsed : ['message'];
+        if (Array.isArray(parsed)) return parsed.length > 0 ? parsed : ['message', 'message.status'];
       } catch {
         // Single event name like 'message'
         return [events];
       }
     }
-    return ['message'];
+    return ['message', 'message.status'];
   }
 
   /**

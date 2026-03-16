@@ -944,9 +944,9 @@ function renderWebhooks(webhooks, accountId) {
 
     webhooks.forEach(webhook => {
         const urlShort = webhook.url.length > 45 ? webhook.url.substring(0, 45) + '...' : webhook.url;
-        const events = Array.isArray(webhook.events) ? webhook.events : ['message'];
+        const events = Array.isArray(webhook.events) ? webhook.events : ['message', 'message.status'];
         const eventBadges = events.map(e => {
-            const icons = { 'message': 'fa-envelope', 'message.status': 'fa-check-double', 'connection': 'fa-plug', '*': 'fa-asterisk', 'poll': 'fa-poll-h', 'poll_vote': 'fa-vote-yea' };
+            const icons = { 'message': 'fa-envelope', 'message.status': 'fa-check-double', 'connection': 'fa-plug', '*': 'fa-asterisk' };
             return `<span class="event-badge"><i class="fas ${icons[e] || 'fa-tag'}"></i> ${e}</span>`;
         }).join(' ');
 
@@ -1600,10 +1600,11 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
         bodyFields: [
             { name: 'url', type: 'string', required: true, desc: 'HTTPS URL to receive POST requests' },
             { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, poll, poll_vote, * (default: ["message"])' },
+                        { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, * (default: ["message","message.status"])' },
             { name: 'secret', type: 'string', required: false, desc: 'HMAC secret for signature verification' },
         ],
         body: { url: 'https://n8n.example.com/webhook/abc', events: ['message', 'connection'], secret: 'whsec_your_secret' },
-        response: { success: true, webhook: { id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message', 'connection'], is_active: true } },
+        response: { success: true, webhook: { id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message', 'message.status', 'connection'], is_active: true } },
     },
     'update-webhook': {
         group: 'webhooks', method: 'PUT', path: '/api/webhooks/:id',
