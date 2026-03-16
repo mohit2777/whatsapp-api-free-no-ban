@@ -307,10 +307,31 @@ class WhatsAppManager {
     // negotiation — this was causing the "works once then fails" pattern.
     // Outgoing message rate limiter — prevents burst-sending patterns
     // that WhatsApp's detection systems flag as automation.
-    // Sliding window: max 30 messages per 60s per account.
+    // Sliding window: max 20 messages per 60s per account (reduced from 30 —
+    // 30/min is detectable; 20/min stays below Meta's per-minute threshold).
     this.messageSendTimestamps = new Map(); // accountId -> number[]
-    this.MAX_MESSAGES_PER_WINDOW = 30;
+    this.MAX_MESSAGES_PER_WINDOW = 20;
     this.MESSAGE_WINDOW_MS = 60000;
+    // Hourly rate limiter — secondary guard against sustained high-volume sending.
+    // Meta's detection works on session-level, hourly, and daily buckets.
+    // 80/hour ≈ 1.3/min average leaves room for bursts while avoiding daily limits.
+    this.messageSendTimestampsHourly = new Map(); // accountId -> number[]
+    this.MAX_MESSAGES_PER_HOUR = 80;
+    this.MESSAGE_WINDOW_HOURLY_MS = 60 * 60 * 1000;
+    // Message send serialization — prevents concurrent sends that create
+    // chaotic presence state (two composing states fighting each other).
+    // Every send is queued per account and executed serially.
+    this.sendQueues = new Map(); // accountId -> Promise chain
+    // Minimum gap enforced INSIDE the queue after each send.
+    // Even short messages need some breathing room between sends.
+    this.MIN_SEND_INTERVAL_MS = 3000; // 3 seconds floor
+    this.lastSendTimestamp = new Map(); // accountId -> last send timestamp
+    // Active conversation tracking per JID — avoids the mechanical
+    // available→unavailable toggle for every single message.
+    // Within an active conversation window we skip the global 'available' step
+    // and defer going 'unavailable' much longer.
+    this.lastMessagePerJid = new Map(); // "accountId:jid" -> last outbound timestamp
+    this.ACTIVE_CONVO_WINDOW_MS = 45000; // 45 seconds = in an active conversation
     // onWhatsApp() rate limiter — Meta heavily monitors number-existence checks.
     // Excessive calls trigger "number enumeration" detection → permanent ban.
     this.onWhatsAppTimestamps = new Map(); // accountId -> number[]
@@ -808,6 +829,7 @@ class WhatsAppManager {
   /**
    * Check if account has exceeded outgoing message rate limit.
    * Sliding window: MAX_MESSAGES_PER_WINDOW messages per MESSAGE_WINDOW_MS.
+   * Also enforces a secondary hourly cap (MAX_MESSAGES_PER_HOUR).
    * Prevents burst-sending patterns that WhatsApp flags as automation.
    */
   _checkSendRateLimit(accountId) {
@@ -817,16 +839,50 @@ class WhatsAppManager {
       timestamps = [];
       this.messageSendTimestamps.set(accountId, timestamps);
     }
-    // Evict expired timestamps
+    // Evict expired per-minute timestamps
     const cutoff = now - this.MESSAGE_WINDOW_MS;
     while (timestamps.length > 0 && timestamps[0] <= cutoff) {
       timestamps.shift();
     }
     if (timestamps.length >= this.MAX_MESSAGES_PER_WINDOW) {
-      return false; // rate limited
+      return false; // per-minute rate limited
     }
+
+    // Hourly cap — catch sustained high-volume sending that bypasses per-minute limits
+    let hourlyTimestamps = this.messageSendTimestampsHourly.get(accountId);
+    if (!hourlyTimestamps) {
+      hourlyTimestamps = [];
+      this.messageSendTimestampsHourly.set(accountId, hourlyTimestamps);
+    }
+    const hourlyCutoff = now - this.MESSAGE_WINDOW_HOURLY_MS;
+    while (hourlyTimestamps.length > 0 && hourlyTimestamps[0] <= hourlyCutoff) {
+      hourlyTimestamps.shift();
+    }
+    if (hourlyTimestamps.length >= this.MAX_MESSAGES_PER_HOUR) {
+      logger.warn(`[RATE-LIMIT] Account ${accountId} hit hourly cap (${hourlyTimestamps.length}/${this.MAX_MESSAGES_PER_HOUR} per hour)`);
+      return false; // hourly rate limited
+    }
+
     timestamps.push(now);
+    hourlyTimestamps.push(now);
     return true; // allowed
+  }
+
+  /**
+   * Serialize outbound sends per account via a promise chain.
+   * This prevents concurrent API calls from fighting over the same presence
+   * state (two messages both trying to set composing→paused→send at the same
+   * time, resulting in near-simultaneous sends that look like bulk messaging).
+   *
+   * Usage: return this._enqueueSend(accountId, async () => { ...send logic... });
+   */
+  _enqueueSend(accountId, fn) {
+    const prev = this.sendQueues.get(accountId) || Promise.resolve();
+    // Run fn regardless of whether the previous item succeeded or failed.
+    const next = prev.then(() => fn(), () => fn());
+    // Store a non-rejecting tail so the chain never permanently breaks.
+    this.sendQueues.set(accountId, next.catch(() => {}));
+    return next; // Propagate actual result/error to the caller.
   }
 
   /**
@@ -1378,10 +1434,11 @@ class WhatsAppManager {
         },
         // Firewall / keep-alive tuning — add jitter to avoid perfectly periodic pings
         keepAliveIntervalMs: 20000 + Math.floor(Math.random() * 10000), // 20-30s like real WA Web
-        retryRequestDelayMs: 250,
-        // Keep message retry count conservative — excessive retries generate
-        // abnormal traffic patterns that WhatsApp's detection systems flag.
-        maxMsgRetryCount: 5,
+        // Slower retry delay — 250ms was too fast and generated abnormal traffic.
+        retryRequestDelayMs: 500,
+        // Keep message retry count conservative — fewer retries = less retry traffic.
+        // 3 attempts covers the common pre-key depletion scenario without excess noise.
+        maxMsgRetryCount: 3,
       });
 
       // Store connection
@@ -2112,13 +2169,18 @@ class WhatsAppManager {
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Delayed read receipt — humans don't read instantly
-      const readDelay = readReceiptDelay();
-      setTimeout(() => {
-        sock.readMessages([msg.key]).catch(err => {
-          logger.debug(`Could not send read receipt: ${err.message}`);
-        });
-      }, readDelay);
+      // Delayed read receipt — only ~70% of the time because real users don't always
+      // open every notification immediately. Widen the delay to 3-15s (1.5-5s was
+      // suspiciously fast and consistent). Both the probability and timing add natural
+      // variance that a real WhatsApp client exhibits.
+      if (Math.random() < 0.70) {
+        const readDelay = humanDelay(3000, 15000);
+        setTimeout(() => {
+          sock.readMessages([msg.key]).catch(err => {
+            logger.debug(`Could not send read receipt: ${err.message}`);
+          });
+        }, readDelay);
+      }
       
       const isLidFormat = remoteJid?.includes('@lid');
       const senderInfo = this.extractSenderInfo(msg, sock);
@@ -2558,7 +2620,7 @@ class WhatsAppManager {
 
     // Rate limit check — prevents burst sending that WhatsApp flags
     if (!this._checkSendRateLimit(accountId)) {
-      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+      throw new Error('Rate limit exceeded — max 20 messages per minute. Please slow down.');
     }
 
     // Check for duplicate
@@ -2567,56 +2629,86 @@ class WhatsAppManager {
       throw new Error('Duplicate message detected');
     }
 
-    try {
-      // Go available briefly (like opening a chat)
-      await sock.sendPresenceUpdate('available').catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+    // Serialize sends per account — prevents concurrent API calls from fighting
+    // over the same presence state, which looks like bulk messaging to WA servers.
+    return this._enqueueSend(accountId, async () => {
+      // Enforce minimum inter-message gap inside the queue. Back-to-back sends
+      // without a floor look machine-generated even with typing delays.
+      const lastSend = this.lastSendTimestamp.get(accountId) || 0;
+      const sinceLastSend = Date.now() - lastSend;
+      if (sinceLastSend < this.MIN_SEND_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, this.MIN_SEND_INTERVAL_MS - sinceLastSend));
+      }
+      this.lastSendTimestamp.set(accountId, Date.now());
 
-      // Start typing — duration proportional to message length
-      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-      const delay = typingDelay(message.length);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+      const jidKey = `${accountId}:${jid}`;
+      const lastConvoTime = this.lastMessagePerJid.get(jidKey) || 0;
+      const isActiveConvo = (Date.now() - lastConvoTime) < this.ACTIVE_CONVO_WINDOW_MS;
 
-      // Brief natural pause between typing stop and send
-      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
+      try {
+        // Only broadcast global 'available' on cold-start (opening a chat for the first
+        // time). Toggling available→unavailable around every single message is a mechanical
+        // bot fingerprint — real users stay "available" throughout a conversation.
+        if (!isActiveConvo) {
+          await sock.sendPresenceUpdate('available').catch(() => {});
+          await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+        }
 
-      // Send message
-      const result = await sock.sendMessage(jid, { text: message });
+        // Start typing — duration proportional to message length
+        await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        const delay = typingDelay(message.length);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        await sock.sendPresenceUpdate('paused', jid).catch(() => {});
 
-      // Store sent message for retry system
-      if (result?.key && result?.message) storeMessage(result.key, result.message);
+        // Brief natural pause between typing stop and send
+        await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
-      this.metrics.messagesSent++;
-      
-      // Save to conversation history
-      // Always resolve to phone number for consistent conversation tracking
-      const contactId = this.getPhoneNumber(jid) || phone;
-      await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+        // Send message
+        const result = await sock.sendMessage(jid, { text: message });
 
-      // Schedule debounced session save — Signal pre-keys update on sends but
-      // saving to DB on every single message causes write storms and DB contention.
-      // Disk files are always up-to-date; debounce ensures at most one DB write per 30s.
-      this._scheduleSessionSave(accountId);
+        // Store sent message for retry system
+        if (result?.key && result?.message) storeMessage(result.key, result.message);
 
-      // Go unavailable after sending (like minimizing the window)
-      setTimeout(() => {
-        sock.sendPresenceUpdate('unavailable').catch(() => {});
-      }, humanDelay(2000, 8000));
+        this.metrics.messagesSent++;
+        
+        // Save to conversation history
+        // Always resolve to phone number for consistent conversation tracking
+        const contactId = this.getPhoneNumber(jid) || phone;
+        await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${phone} (resolved: ${jid})`);
+        // Schedule debounced session save — Signal pre-keys update on sends but
+        // saving to DB on every single message causes write storms and DB contention.
+        // Disk files are always up-to-date; debounce ensures at most one DB write per 30s.
+        this._scheduleSessionSave(accountId);
 
-      return {
-        success: true,
-        messageId: result.key.id,
-        to: jid,
-        phone: this.getPhoneNumber(jid) || phone,
-        timestamp: Date.now()
-      };
-    } catch (error) {
-      logger.error(`Failed to send message to ${phone} (${jid}):`, error.message);
-      throw error;
-    }
+        // Mark this JID as "active conversation" so the next message skips 'available'.
+        this.lastMessagePerJid.set(jidKey, Date.now());
+
+        // Go unavailable only after the conversation goes quiet — real users stay visible
+        // for 15-40s after a message, not 2-8s. Only fire if no new message was sent to
+        // this JID in the meantime (avoids rapid off/on flicker during a conversation).
+        const unavailableDelay = humanDelay(15000, 40000);
+        setTimeout(() => {
+          const timeSinceLastMsg = Date.now() - (this.lastMessagePerJid.get(jidKey) || 0);
+          if (timeSinceLastMsg > 10000) {
+            sock.sendPresenceUpdate('unavailable').catch(() => {});
+          }
+        }, unavailableDelay);
+
+        logger.info(`Message sent to ${phone} (resolved: ${jid})`);
+
+        return {
+          success: true,
+          messageId: result.key.id,
+          to: jid,
+          phone: this.getPhoneNumber(jid) || phone,
+          timestamp: Date.now()
+        };
+      } catch (error) {
+        logger.error(`Failed to send message to ${phone} (${jid}):`, error.message);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -2633,7 +2725,7 @@ class WhatsAppManager {
 
     // Rate limit check
     if (!this._checkSendRateLimit(accountId)) {
-      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+      throw new Error('Rate limit exceeded — max 20 messages per minute. Please slow down.');
     }
 
     // Check for duplicate
@@ -2642,52 +2734,76 @@ class WhatsAppManager {
       throw new Error('Duplicate message detected');
     }
 
-    try {
-      // Go available briefly
-      await sock.sendPresenceUpdate('available').catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+    // Serialize sends per account — prevents concurrent presence-state race.
+    return this._enqueueSend(accountId, async () => {
+      // Enforce minimum inter-message gap inside the queue.
+      const lastSend = this.lastSendTimestamp.get(accountId) || 0;
+      const sinceLastSend = Date.now() - lastSend;
+      if (sinceLastSend < this.MIN_SEND_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, this.MIN_SEND_INTERVAL_MS - sinceLastSend));
+      }
+      this.lastSendTimestamp.set(accountId, Date.now());
 
-      // Typing simulation with human-like duration
-      await sock.sendPresenceUpdate('composing', resolvedJid).catch(() => {});
-      const delay = typingDelay(message.length);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => {});
+      const jidKey = `${accountId}:${resolvedJid}`;
+      const lastConvoTime = this.lastMessagePerJid.get(jidKey) || 0;
+      const isActiveConvo = (Date.now() - lastConvoTime) < this.ACTIVE_CONVO_WINDOW_MS;
 
-      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
+      try {
+        // Only send global 'available' on cold-start.
+        if (!isActiveConvo) {
+          await sock.sendPresenceUpdate('available').catch(() => {});
+          await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
+        }
 
-      // Send message
-      const result = await sock.sendMessage(resolvedJid, { text: message });
+        // Typing simulation with human-like duration
+        await sock.sendPresenceUpdate('composing', resolvedJid).catch(() => {});
+        const delay = typingDelay(message.length);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => {});
 
-      // Store sent message for retry system
-      if (result?.key && result?.message) storeMessage(result.key, result.message);
+        await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
-      this.metrics.messagesSent++;
-      
-      // Save to conversation history
-      const contactId = this.getPhoneNumber(resolvedJid) || jid.split('@')[0];
-      await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+        // Send message
+        const result = await sock.sendMessage(resolvedJid, { text: message });
 
-      // Schedule debounced session save (at most once per 30s, not on every send)
-      this._scheduleSessionSave(accountId);
+        // Store sent message for retry system
+        if (result?.key && result?.message) storeMessage(result.key, result.message);
 
-      // Go back to unavailable
-      setTimeout(() => {
-        sock.sendPresenceUpdate('unavailable').catch(() => {});
-      }, humanDelay(2000, 8000));
+        this.metrics.messagesSent++;
+        
+        // Save to conversation history
+        const contactId = this.getPhoneNumber(resolvedJid) || jid.split('@')[0];
+        await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
 
-      logger.info(`Message sent to ${jid} (resolved: ${resolvedJid})`);
+        // Schedule debounced session save (at most once per 30s, not on every send)
+        this._scheduleSessionSave(accountId);
 
-      return {
-        success: true,
-        messageId: result.key.id,
-        to: resolvedJid,
-        phone: this.getPhoneNumber(resolvedJid) || jid.split('@')[0],
-        timestamp: Date.now()
-      };
-    } catch (error) {
-      logger.error(`Failed to send message to ${jid} (${resolvedJid}):`, error.message);
-      throw error;
-    }
+        // Mark this JID as active conversation.
+        this.lastMessagePerJid.set(jidKey, Date.now());
+
+        // Go unavailable only after the conversation goes quiet.
+        const unavailableDelay = humanDelay(15000, 40000);
+        setTimeout(() => {
+          const timeSinceLastMsg = Date.now() - (this.lastMessagePerJid.get(jidKey) || 0);
+          if (timeSinceLastMsg > 10000) {
+            sock.sendPresenceUpdate('unavailable').catch(() => {});
+          }
+        }, unavailableDelay);
+
+        logger.info(`Message sent to ${jid} (resolved: ${resolvedJid})`);
+
+        return {
+          success: true,
+          messageId: result.key.id,
+          to: resolvedJid,
+          phone: this.getPhoneNumber(resolvedJid) || jid.split('@')[0],
+          timestamp: Date.now()
+        };
+      } catch (error) {
+        logger.error(`Failed to send message to ${jid} (${resolvedJid}):`, error.message);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -2719,82 +2835,106 @@ class WhatsAppManager {
 
     // Rate limit check
     if (!this._checkSendRateLimit(accountId)) {
-      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+      throw new Error('Rate limit exceeded — max 20 messages per minute. Please slow down.');
     }
 
-    try {
-      // Human-like media send behavior
-      await sock.sendPresenceUpdate('available').catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
-      
-      // Show composing for realistic duration (media takes time to "select")
-      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(1500, 4000)));
-      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
-
-      let messageContent;
-
-      switch (mediaType) {
-        case 'image':
-          messageContent = {
-            image: mediaBuffer,
-            caption,
-            mimetype: mimetype || 'image/jpeg'
-          };
-          break;
-        case 'document':
-          messageContent = {
-            document: mediaBuffer,
-            caption,
-            mimetype: mimetype || 'application/octet-stream',
-            fileName: filename || 'document'
-          };
-          break;
-        case 'audio':
-          messageContent = {
-            audio: mediaBuffer,
-            mimetype: mimetype || 'audio/mp4'
-          };
-          break;
-        case 'video':
-          messageContent = {
-            video: mediaBuffer,
-            caption,
-            mimetype: mimetype || 'video/mp4'
-          };
-          break;
-        default:
-          throw new Error(`Unsupported media type: ${mediaType}`);
+    // Serialize sends per account — prevents concurrent presence-state race.
+    return this._enqueueSend(accountId, async () => {
+      // Enforce minimum inter-message gap inside the queue.
+      const lastSend = this.lastSendTimestamp.get(accountId) || 0;
+      const sinceLastSend = Date.now() - lastSend;
+      if (sinceLastSend < this.MIN_SEND_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, this.MIN_SEND_INTERVAL_MS - sinceLastSend));
       }
+      this.lastSendTimestamp.set(accountId, Date.now());
 
-      const result = await sock.sendMessage(jid, messageContent);
+      const jidKey = `${accountId}:${jid}`;
+      const lastConvoTime = this.lastMessagePerJid.get(jidKey) || 0;
+      const isActiveConvo = (Date.now() - lastConvoTime) < this.ACTIVE_CONVO_WINDOW_MS;
 
-      // Store sent message for retry system
-      if (result?.key && result?.message) storeMessage(result.key, result.message);
+      try {
+        // Only send global 'available' on cold-start.
+        if (!isActiveConvo) {
+          await sock.sendPresenceUpdate('available').catch(() => {});
+          await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
+        }
+        
+        // Show composing for realistic duration (media takes time to "select")
+        await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, humanDelay(1500, 4000)));
+        await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, humanDelay(300, 800)));
 
-      this.metrics.messagesSent++;
-      logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
+        let messageContent;
 
-      // Schedule debounced session save (at most once per 30s, not on every send)
-      this._scheduleSessionSave(accountId);
+        switch (mediaType) {
+          case 'image':
+            messageContent = {
+              image: mediaBuffer,
+              caption,
+              mimetype: mimetype || 'image/jpeg'
+            };
+            break;
+          case 'document':
+            messageContent = {
+              document: mediaBuffer,
+              caption,
+              mimetype: mimetype || 'application/octet-stream',
+              fileName: filename || 'document'
+            };
+            break;
+          case 'audio':
+            messageContent = {
+              audio: mediaBuffer,
+              mimetype: mimetype || 'audio/mp4'
+            };
+            break;
+          case 'video':
+            messageContent = {
+              video: mediaBuffer,
+              caption,
+              mimetype: mimetype || 'video/mp4'
+            };
+            break;
+          default:
+            throw new Error(`Unsupported media type: ${mediaType}`);
+        }
 
-      // Go back to unavailable after media send
-      setTimeout(() => {
-        sock.sendPresenceUpdate('unavailable').catch(() => {});
-      }, humanDelay(3000, 10000));
+        const result = await sock.sendMessage(jid, messageContent);
 
-      return {
-        success: true,
-        messageId: result.key.id,
-        to: jid,
-        phone: this.getPhoneNumber(jid) || phoneOrJid,
-        timestamp: Date.now()
-      };
-    } catch (error) {
-      logger.error(`Failed to send media to ${phoneOrJid}:`, error.message);
-      throw error;
-    }
+        // Store sent message for retry system
+        if (result?.key && result?.message) storeMessage(result.key, result.message);
+
+        this.metrics.messagesSent++;
+        logger.info(`Media sent to ${phoneOrJid} from account ${accountId}`);
+
+        // Schedule debounced session save (at most once per 30s, not on every send)
+        this._scheduleSessionSave(accountId);
+
+        // Mark this JID as active conversation.
+        this.lastMessagePerJid.set(jidKey, Date.now());
+
+        // Go unavailable only after the conversation goes quiet.
+        const unavailableDelay = humanDelay(15000, 40000);
+        setTimeout(() => {
+          const timeSinceLastMsg = Date.now() - (this.lastMessagePerJid.get(jidKey) || 0);
+          if (timeSinceLastMsg > 10000) {
+            sock.sendPresenceUpdate('unavailable').catch(() => {});
+          }
+        }, unavailableDelay);
+
+        return {
+          success: true,
+          messageId: result.key.id,
+          to: jid,
+          phone: this.getPhoneNumber(jid) || phoneOrJid,
+          timestamp: Date.now()
+        };
+      } catch (error) {
+        logger.error(`Failed to send media to ${phoneOrJid}:`, error.message);
+        throw error;
+      }
+    });
   }
 
   /**
@@ -2814,46 +2954,68 @@ class WhatsAppManager {
 
     // Rate limit check
     if (!this._checkSendRateLimit(accountId)) {
-      throw new Error('Rate limit exceeded — max 30 messages per minute. Please slow down.');
+      throw new Error('Rate limit exceeded — max 20 messages per minute. Please slow down.');
     }
 
-    try {
-      await sock.sendPresenceUpdate('available').catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
-      await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(1000, 2500)));
-      await sock.sendPresenceUpdate('paused', jid).catch(() => {});
-      await new Promise(resolve => setTimeout(resolve, humanDelay(200, 500)));
+    // Serialize sends per account — prevents concurrent presence-state race.
+    return this._enqueueSend(accountId, async () => {
+      // Enforce minimum inter-message gap inside the queue.
+      const lastSend = this.lastSendTimestamp.get(accountId) || 0;
+      const sinceLastSend = Date.now() - lastSend;
+      if (sinceLastSend < this.MIN_SEND_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, this.MIN_SEND_INTERVAL_MS - sinceLastSend));
+      }
+      this.lastSendTimestamp.set(accountId, Date.now());
 
-      const result = await sock.sendMessage(jid, {
-        poll: {
-          name,
-          values,
-          selectableCount: selectableCount || 0
+      const jidKey = `${accountId}:${jid}`;
+      const lastConvoTime = this.lastMessagePerJid.get(jidKey) || 0;
+      const isActiveConvo = (Date.now() - lastConvoTime) < this.ACTIVE_CONVO_WINDOW_MS;
+
+      try {
+        if (!isActiveConvo) {
+          await sock.sendPresenceUpdate('available').catch(() => {});
+          await new Promise(resolve => setTimeout(resolve, humanDelay(500, 1500)));
         }
-      });
+        await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, humanDelay(1000, 2500)));
+        await sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, humanDelay(200, 500)));
 
-      if (result?.key && result?.message) storeMessage(result.key, result.message);
+        const result = await sock.sendMessage(jid, {
+          poll: {
+            name,
+            values,
+            selectableCount: selectableCount || 0
+          }
+        });
 
-      this.metrics.messagesSent++;
-      logger.info(`Poll sent to ${phoneOrJid} from account ${accountId}`);
-      this._scheduleSessionSave(accountId);
+        if (result?.key && result?.message) storeMessage(result.key, result.message);
 
-      setTimeout(() => {
-        sock.sendPresenceUpdate('unavailable').catch(() => {});
-      }, humanDelay(3000, 10000));
+        this.metrics.messagesSent++;
+        logger.info(`Poll sent to ${phoneOrJid} from account ${accountId}`);
+        this._scheduleSessionSave(accountId);
 
-      return {
-        success: true,
-        messageId: result.key.id,
-        to: jid,
-        phone: this.getPhoneNumber(jid) || phoneOrJid,
-        timestamp: Date.now()
-      };
-    } catch (error) {
-      logger.error(`Failed to send poll to ${phoneOrJid}:`, error.message);
-      throw error;
-    }
+        this.lastMessagePerJid.set(jidKey, Date.now());
+        const unavailableDelay = humanDelay(15000, 40000);
+        setTimeout(() => {
+          const timeSinceLastMsg = Date.now() - (this.lastMessagePerJid.get(jidKey) || 0);
+          if (timeSinceLastMsg > 10000) {
+            sock.sendPresenceUpdate('unavailable').catch(() => {});
+          }
+        }, unavailableDelay);
+
+        return {
+          success: true,
+          messageId: result.key.id,
+          to: jid,
+          phone: this.getPhoneNumber(jid) || phoneOrJid,
+          timestamp: Date.now()
+        };
+      } catch (error) {
+        logger.error(`Failed to send poll to ${phoneOrJid}:`, error.message);
+        throw error;
+      }
+    });
   }
 
   /**

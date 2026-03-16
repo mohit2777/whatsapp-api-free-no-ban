@@ -26,11 +26,15 @@ These rules prevent WhatsApp account bans. Every code change touching WhatsApp s
 
 ## Message Sending
 
-- **Rate limit: 30 messages per 60 seconds per account.** This is enforced in `_checkSendRateLimit()`. Never bypass or increase this limit.
+- **Rate limit: 20 messages per 60 seconds per account.** This is enforced in `_checkSendRateLimit()`. Never bypass or increase this limit.
+- **Secondary hourly cap: 80 messages per hour per account.** Also enforced in `_checkSendRateLimit()`. Prevents sustained high-volume sending that bypasses the per-minute window.
 - **Every send method** (`sendMessage`, `sendMessageToJid`, `sendMedia`, `sendPoll`) must check the rate limiter BEFORE sending.
-- **Human-like presence sequence is mandatory:** `available` → `composing` → `paused` → send → `unavailable`. Every send must follow this pattern with randomized delays.
+- **Sends are serialized per account via `_enqueueSend()`.** Concurrent API calls must NOT run their presence sequences in parallel — this creates chaotic presence state that looks like bulk messaging. All four send methods must use `_enqueueSend()` for their core send logic.
+- **Minimum inter-message gap: 3 seconds** (`MIN_SEND_INTERVAL_MS`). Enforced inside `_enqueueSend()` after each send. Back-to-back sends with no floor look machine-generated.
+- **Human-like presence sequence is mandatory:** `composing` → `paused` → send → deferred `unavailable` (15-40s). The global `available` broadcast is sent only on cold-start (first message to a JID, or after 45s of inactivity). Toggling `available`/`unavailable` around every single message is a mechanical bot fingerprint.
+- **Active conversation tracking:** `lastMessagePerJid` records the last outbound timestamp per `accountId:jid` pair. If a message was sent to the same JID within `ACTIVE_CONVO_WINDOW_MS` (45s), skip the global `available` step.
+- **Deferred unavailable:** After each send, schedule `unavailable` with `humanDelay(15000, 40000)`. Only fire if no newer message was sent to the same JID (check `lastMessagePerJid` inside the timeout). This prevents rapid on/off flicker during a burst to the same recipient.
 - **Typing delay must be proportional to message length.** Use `typingDelay()` — never use a fixed delay.
-- **Go unavailable after sending.** Real WhatsApp Web users don't stay online 24/7. The 2-10s delay before `unavailable` is critical.
 - **Never add bulk/batch/broadcast endpoints.** Every message must be a separate API call subject to individual rate limiting.
 - **Duplicate detection is mandatory.** SHA-256 hash + 60s window on `(accountId, jid, message)` triples. Never remove `isDuplicateMessage()`.
 
