@@ -1470,23 +1470,58 @@ const API_ENDPOINTS = {
     },
     'send-media': {
         group: 'messages', method: 'POST', path: '/api/send-media',
-        desc: 'Send media via file upload (multipart/form-data). Supports image, video, audio, and document types.',
-        auth: 'API Key (in form data)',
-        note: 'Uses multipart/form-data — not JSON.',
+        desc: 'Send media using either multipart file upload or direct base64 JSON. Supports image, video, audio, and document types.',
+        auth: 'API Key (form-data or JSON body)',
+        note: 'Provide one of: multipart field media OR JSON field mediaBase64.',
         bodyFields: [
             { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
             { name: 'to', type: 'string', required: true, desc: 'Phone number or JID' },
-            { name: 'media', type: 'file', required: true, desc: 'The media file to send' },
+            { name: 'media', type: 'file', required: false, desc: 'Multipart file to send (use this OR mediaBase64)' },
+            { name: 'mediaBase64', type: 'string', required: false, desc: 'Base64 media (data URL or raw base64; use this OR media)' },
             { name: 'mediaType', type: 'string', required: false, desc: 'image | video | audio | document (default: document)' },
             { name: 'caption', type: 'string', required: false, desc: 'Caption for the media' },
+            { name: 'mimetype', type: 'string', required: false, desc: 'Optional MIME override (auto-detected from data URL when present)' },
+            { name: 'filename', type: 'string', required: false, desc: 'Optional file name (useful for document messages)' },
         ],
+        body: {
+            api_key: 'YOUR_API_KEY',
+            to: '919876543210',
+            mediaType: 'image',
+            caption: 'Sent from HTTP node',
+            mediaBase64: 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD...'
+        },
         response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
         curl: `curl -X POST https://YOUR_DOMAIN/api/send-media \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "api_key": "YOUR_API_KEY",
+    "to": "919876543210",
+    "mediaType": "image",
+    "caption": "Sent via JSON base64",
+    "mediaBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD..."
+  }'
+
+# OR multipart upload
+curl -X POST https://YOUR_DOMAIN/api/send-media \\
   -F "api_key=YOUR_API_KEY" \\
   -F "to=919876543210" \\
   -F "mediaType=image" \\
   -F "caption=Check this out!" \\
   -F "media=@/path/to/photo.jpg"`,
+        n8n: `{
+  "api_key": "YOUR_API_KEY",
+  "to": "{{ $json.data.fromJid }}",
+  "mediaType": "document",
+  "caption": "Your file",
+  "filename": "report.pdf",
+  "mimetype": "application/pdf",
+  "mediaBase64": "{{ $json.base64Data }}"
+}`,
+        tips: [
+            'For n8n HTTP Request node, set Content-Type to application/json and send mediaBase64 directly',
+            'mediaBase64 accepts both data URL format and raw base64 payload',
+            'Caption is supported for image, video, and document (ignored for audio)'
+        ],
     },
     'send-media-url': {
         group: 'messages', method: 'POST', path: '/api/send-media-url',
@@ -1497,8 +1532,9 @@ const API_ENDPOINTS = {
             { name: 'to', type: 'string', required: true, desc: 'Phone number or JID' },
             { name: 'mediaType', type: 'string', required: true, desc: 'image | video | audio | document' },
             { name: 'mediaUrl', type: 'string', required: false, desc: 'Public URL of the media file (use this OR mediaBase64)' },
-            { name: 'mediaBase64', type: 'string', required: false, desc: 'Base64-encoded media data (use this OR mediaUrl)' },
-            { name: 'mimetype', type: 'string', required: false, desc: 'MIME type (required with mediaBase64)' },
+            { name: 'mediaBase64', type: 'string', required: false, desc: 'Base64 media data (use this OR mediaUrl)' },
+            { name: 'base64', type: 'string', required: false, desc: 'Alias for mediaBase64 (backward compatibility)' },
+            { name: 'mimetype', type: 'string', required: false, desc: 'Optional MIME override' },
             { name: 'filename', type: 'string', required: false, desc: 'Filename (for documents)' },
             { name: 'caption', type: 'string', required: false, desc: 'Caption for the media' },
         ],
