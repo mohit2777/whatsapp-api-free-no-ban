@@ -405,8 +405,8 @@ CACHE_TTL=300000
 ### 11.2 Webhook Event Types
 - `message` - Incoming message
 - `message.status` - Delivery status update
-- `presence` - Online/offline/typing status
 - `connection` - Account connection changes
+- `*` - Subscribe to all webhook events
 
 ### 11.3 Supported AI Models
 - OpenAI: gpt-4, gpt-4-turbo, gpt-3.5-turbo

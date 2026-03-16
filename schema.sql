@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
     account_id UUID NOT NULL REFERENCES whatsapp_accounts(id) ON DELETE CASCADE,
     url VARCHAR(500) NOT NULL,
     secret VARCHAR(255),
-    events TEXT[] DEFAULT ARRAY['message'],
+    events TEXT[] DEFAULT ARRAY['message', 'message.status'],
     is_active BOOLEAN DEFAULT true,
     retry_count INTEGER DEFAULT 0,
     last_success_at TIMESTAMP WITH TIME ZONE,
@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS webhooks (
 
 CREATE INDEX IF NOT EXISTS idx_webhooks_account ON webhooks(account_id);
 CREATE INDEX IF NOT EXISTS idx_webhooks_active ON webhooks(is_active);
+
+ALTER TABLE webhooks
+    ALTER COLUMN events SET DEFAULT ARRAY['message', 'message.status'];
+
+UPDATE webhooks
+SET events = ARRAY['message', 'message.status']
+WHERE events IS NULL OR cardinality(events) = 0;
 
 COMMENT ON TABLE webhooks IS 'Webhook configurations for message forwarding';
 

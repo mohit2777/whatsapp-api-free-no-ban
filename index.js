@@ -688,7 +688,11 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
 app.get('/api/accounts/:id/webhooks', requireAuth, apiLimiter, async (req, res) => {
   try {
     const webhooks = await db.getWebhooks(req.params.id);
-    res.json({ success: true, webhooks });
+    const normalizedWebhooks = webhooks.map(webhook => ({
+      ...webhook,
+      events: webhookDeliveryService.normalizeEvents(webhook.events)
+    }));
+    res.json({ success: true, webhooks: normalizedWebhooks });
   } catch (error) {
     logger.error('Error fetching webhooks:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch webhooks' });
@@ -701,7 +705,7 @@ app.post('/api/accounts/:id/webhooks', requireAuth, webhookLimiter, validate(sch
       account_id: req.params.id,
       url: req.body.url,
       secret: req.body.secret || null,
-      events: req.body.events || ['message', 'message.status'],
+      events: webhookDeliveryService.normalizeEvents(req.body.events),
       is_active: true
     };
     const webhook = await db.createWebhook(webhookData);
@@ -715,7 +719,11 @@ app.post('/api/accounts/:id/webhooks', requireAuth, webhookLimiter, validate(sch
 
 app.put('/api/webhooks/:id', requireAuth, webhookLimiter, validate(schemas.webhookUpdate), async (req, res) => {
   try {
-    const webhook = await db.updateWebhook(req.params.id, req.body);
+    const updates = { ...req.body };
+    if (Object.prototype.hasOwnProperty.call(req.body, 'events')) {
+      updates.events = webhookDeliveryService.normalizeEvents(req.body.events);
+    }
+    const webhook = await db.updateWebhook(req.params.id, updates);
     logger.info(`[WEBHOOK] Updated webhook ${req.params.id} → ${JSON.stringify(req.body)}`);
     res.json({ success: true, webhook });
   } catch (error) {

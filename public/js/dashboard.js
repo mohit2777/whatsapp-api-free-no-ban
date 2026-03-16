@@ -1590,7 +1590,7 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
         desc: 'List all webhooks configured for an account.',
         auth: 'Session cookie',
         params: [{ name: ':id', desc: 'Account UUID' }],
-        response: { success: true, webhooks: [{ id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message'], is_active: true, secret: null }] },
+        response: { success: true, webhooks: [{ id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message', 'message.status'], is_active: true, secret: null }] },
     },
     'create-webhook': {
         group: 'webhooks', method: 'POST', path: '/api/accounts/:id/webhooks',
@@ -1599,11 +1599,10 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
         params: [{ name: ':id', desc: 'Account UUID' }],
         bodyFields: [
             { name: 'url', type: 'string', required: true, desc: 'HTTPS URL to receive POST requests' },
-            { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, poll, poll_vote, * (default: ["message"])' },
-                        { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, * (default: ["message","message.status"])' },
+            { name: 'events', type: 'string[]', required: false, desc: 'Event types: message, message.status, connection, * (default: ["message","message.status"])' },
             { name: 'secret', type: 'string', required: false, desc: 'HMAC secret for signature verification' },
         ],
-        body: { url: 'https://n8n.example.com/webhook/abc', events: ['message', 'connection'], secret: 'whsec_your_secret' },
+        body: { url: 'https://n8n.example.com/webhook/abc', events: ['message', 'message.status', 'connection'], secret: 'whsec_your_secret' },
         response: { success: true, webhook: { id: 'wh-uuid', url: 'https://n8n.example.com/webhook/abc', events: ['message', 'message.status', 'connection'], is_active: true } },
     },
     'update-webhook': {
@@ -1655,7 +1654,7 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
   }
 }`,
         payloadFields: [
-            { name: 'event', desc: 'Event type: message, message.status, connection, poll, poll_vote' },
+            { name: 'event', desc: 'Event type: message, message.status, connection' },
             { name: 'timestamp', desc: 'ISO 8601 timestamp of when the event occurred' },
             { name: 'account_id', desc: 'Your WAMulti account UUID' },
             { name: 'data.messageId', desc: 'Unique message identifier' },
