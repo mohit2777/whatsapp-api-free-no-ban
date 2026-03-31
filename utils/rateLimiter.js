@@ -35,9 +35,12 @@ const authLimiter = createLimiter({
 });
 
 // Message sending rate limiter
+// MUST match WhatsApp-level limit (MAX_MESSAGES_PER_WINDOW = 20 in whatsappManager).
+// Was 30 — that allowed 10 extra requests/min to pass HTTP but fail at WA level,
+// causing confusing errors and potential retry storms by API consumers.
 const messageLimiter = createLimiter({
   windowMs: 60 * 1000, // 1 minute
-  max: 30 // 30 messages per minute
+  max: 20 // 20 messages per minute — matches WhatsApp internal rate limit
 });
 
 // Webhook rate limiter

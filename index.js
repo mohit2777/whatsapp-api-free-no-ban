@@ -593,14 +593,22 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
 
     logger.info(`[API] /api/send-media-url called - to: ${to}, type: ${mediaType}, hasUrl: ${!!mediaUrl}, hasBase64: ${!!resolvedBase64}`);
 
-    if (!api_key) {
-      logger.warn('[API] Missing api_key');
-      return res.status(400).json({ success: false, error: 'api_key is required' });
+    // ── Input validation (this endpoint doesn't use Joi middleware) ──
+    if (!api_key || typeof api_key !== 'string' || api_key.length !== 64) {
+      return res.status(400).json({ success: false, error: 'api_key must be a 64-character string' });
     }
 
-    if (!to) {
-      logger.warn('[API] Missing to field');
-      return res.status(400).json({ success: false, error: 'to is required (phone number or JID)' });
+    if (!to || typeof to !== 'string' || to.length < 5 || to.length > 100) {
+      logger.warn('[API] Invalid to field');
+      return res.status(400).json({ success: false, error: 'to must be a string between 5-100 characters (phone number or JID)' });
+    }
+
+    if (mediaType && !['image', 'document', 'audio', 'video'].includes(mediaType)) {
+      return res.status(400).json({ success: false, error: 'mediaType must be one of: image, document, audio, video' });
+    }
+
+    if (caption && (typeof caption !== 'string' || caption.length > 1024)) {
+      return res.status(400).json({ success: false, error: 'caption must be a string of max 1024 characters' });
     }
 
     if (!mediaUrl && !resolvedBase64) {

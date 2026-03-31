@@ -296,7 +296,7 @@ class WhatsAppManager {
     this.minReconnectInterval = 120000; // Minimum 120s between reconnections (doubled for safety)
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
-    this.SESSION_SAVE_DEBOUNCE_MS = 5000; // Save session to DB at most once per 5s (critical for ephemeral filesystems)
+    this.SESSION_SAVE_DEBOUNCE_MS = 3000; // Save session to DB at most once per 3s (reduced from 5s to narrow the data-loss window on ephemeral filesystems — signal key loss → CIPHERTEXT → ban)
     this.periodicSessionSaveTimers = new Map(); // Periodic save timers per account
     this.PERIODIC_SESSION_SAVE_MS = 60000; // Save session to DB every 60s as safety net
     this.lastSessionHashes = new Map(); // Track last saved session hash to skip redundant writes
@@ -355,6 +355,10 @@ class WhatsAppManager {
     // and vice-versa for reverse lookups
     this.lidToPhone = new Map();
     this.phoneToLid = new Map();
+
+    // Memory cleanup interval — evicts stale entries from unbounded Maps
+    // to prevent OOM crashes that trigger reconnection storms → ban risk.
+    this._memoryCleanupInterval = null;
   }
 
   /**
@@ -983,7 +987,17 @@ class WhatsAppManager {
 
       const accounts = await db.getAccounts();
       const toConnect = accounts.filter(a => a.status === 'ready' || a.session_data);
-      logger.info(`Found ${accounts.length} accounts, ${toConnect.length} to initialize`);
+
+      // CRITICAL: Randomize connection order. Connecting accounts in the same
+      // order (alphabetical, creation-date, etc.) on every restart is a detectable
+      // pattern. WhatsApp's systems flag IPs that show identical connection sequences.
+      // Fisher-Yates shuffle for unbiased randomization.
+      for (let i = toConnect.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [toConnect[i], toConnect[j]] = [toConnect[j], toConnect[i]];
+      }
+
+      logger.info(`Found ${accounts.length} accounts, ${toConnect.length} to initialize (randomized order)`);
 
       for (let i = 0; i < toConnect.length; i++) {
         const account = toConnect[i];
@@ -1007,6 +1021,9 @@ class WhatsAppManager {
 
       // Start periodic health monitor after all accounts initialized
       this._startHealthMonitor();
+
+      // Start memory cleanup to prevent OOM → reconnection storms → ban
+      this._startMemoryCleanup();
     } catch (error) {
       logger.error('Failed to initialize accounts:', error.message);
     }
@@ -1071,13 +1088,22 @@ class WhatsAppManager {
           }
 
           // Case 3: Account in 'error' state with a session — try self-healing
+          // CRITICAL: Check total attempts INCLUDING health monitor cycles.
+          // Previously, the health monitor could re-trigger reconnects indefinitely
+          // (every 10min) even after maxReconnectAttempts was reached in the
+          // connection handler, because the counter was only checked/set here locally.
+          // This created a persistent reconnection pattern that WhatsApp detects.
           if (state?.status === 'error' && hasSession) {
             const attempts = this.reconnectAttempts.get(account.id) || 0;
-            // Only auto-heal if we haven't exceeded max attempts recently
+            // Only auto-heal if TOTAL attempts (including health monitor) are under limit
             if (attempts < this.maxReconnectAttempts) {
-              logger.info(`[HEALTH] Account ${account.id} in error state with valid session, attempting recovery`);
+              logger.info(`[HEALTH] Account ${account.id} in error state with valid session, attempting recovery (attempt ${attempts + 1}/${this.maxReconnectAttempts})`);
               this.reconnectAttempts.set(account.id, attempts + 1);
-              this.scheduleReconnect(account.id, humanDelay(30000, 60000));
+              // Use longer delays for health-monitor-triggered reconnects (60-120s)
+              // to avoid rapid reconnection patterns
+              this.scheduleReconnect(account.id, humanDelay(60000, 120000));
+            } else {
+              logger.info(`[HEALTH] Account ${account.id} in error state but max reconnect attempts (${this.maxReconnectAttempts}) reached — requires manual reconnect`);
             }
           }
         }
@@ -1089,6 +1115,100 @@ class WhatsAppManager {
     // Don't prevent process exit
     this._healthMonitorInterval.unref?.();
     logger.info('[HEALTH] Connection health monitor started (10 min interval)');
+  }
+
+  // ============================================================================
+  // MEMORY CLEANUP
+  // ============================================================================
+  // Periodically evicts stale entries from in-memory Maps that grow unbounded.
+  // Without this, long-running instances accumulate entries in lastMessagePerJid,
+  // messageSendTimestamps, onWhatsAppCache, aiReplyTracker, recentMessageHashes,
+  // etc. Eventually this causes OOM → container kill → all accounts disconnect
+  // and reconnect simultaneously from the same IP → ban.
+  // ============================================================================
+  _startMemoryCleanup() {
+    if (this._memoryCleanupInterval) return;
+    const CLEANUP_INTERVAL = 5 * 60 * 1000; // Every 5 minutes
+
+    this._memoryCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      let evicted = 0;
+
+      // Clean lastMessagePerJid — entries older than 5 minutes are dead conversations
+      for (const [key, ts] of this.lastMessagePerJid) {
+        if (now - ts > 5 * 60 * 1000) {
+          this.lastMessagePerJid.delete(key);
+          evicted++;
+        }
+      }
+
+      // Clean messageSendTimestamps — remove per-account lists with all-expired entries
+      for (const [accountId, timestamps] of this.messageSendTimestamps) {
+        const cutoff = now - this.MESSAGE_WINDOW_MS;
+        while (timestamps.length > 0 && timestamps[0] <= cutoff) timestamps.shift();
+        if (timestamps.length === 0) {
+          this.messageSendTimestamps.delete(accountId);
+          evicted++;
+        }
+      }
+      for (const [accountId, timestamps] of this.messageSendTimestampsHourly) {
+        const cutoff = now - this.MESSAGE_WINDOW_HOURLY_MS;
+        while (timestamps.length > 0 && timestamps[0] <= cutoff) timestamps.shift();
+        if (timestamps.length === 0) {
+          this.messageSendTimestampsHourly.delete(accountId);
+          evicted++;
+        }
+      }
+
+      // Clean onWhatsApp timestamps
+      for (const [accountId, timestamps] of this.onWhatsAppTimestamps) {
+        const cutoff = now - this.ON_WHATSAPP_WINDOW_MS;
+        while (timestamps.length > 0 && timestamps[0] <= cutoff) timestamps.shift();
+        if (timestamps.length === 0) {
+          this.onWhatsAppTimestamps.delete(accountId);
+          evicted++;
+        }
+      }
+
+      // Clean onWhatsApp cache — evict entries older than TTL
+      for (const [key, entry] of this.onWhatsAppCache) {
+        if (now - entry.ts > this.ON_WHATSAPP_CACHE_TTL_MS) {
+          this.onWhatsAppCache.delete(key);
+          evicted++;
+        }
+      }
+
+      // Clean AI reply tracker — evict expired windows
+      for (const [key, tracker] of this.aiReplyTracker) {
+        if (now - tracker.firstReplyTs > this.AI_REPLY_WINDOW_MS) {
+          this.aiReplyTracker.delete(key);
+          evicted++;
+        }
+      }
+
+      // Clean recentMessageHashes
+      for (const [key, ts] of recentMessageHashes) {
+        if (now - ts > DUPLICATE_WINDOW_MS) {
+          recentMessageHashes.delete(key);
+          evicted++;
+        }
+      }
+
+      // Clean lastSendTimestamp — remove entries for disconnected accounts
+      for (const [accountId] of this.lastSendTimestamp) {
+        if (!this.connections.has(accountId)) {
+          this.lastSendTimestamp.delete(accountId);
+          evicted++;
+        }
+      }
+
+      if (evicted > 0) {
+        logger.debug(`[MEMORY] Cleaned ${evicted} stale entries from in-memory maps`);
+      }
+    }, CLEANUP_INTERVAL);
+
+    this._memoryCleanupInterval.unref?.();
+    logger.info('[MEMORY] Memory cleanup started (5 min interval)');
   }
 
   /**
@@ -2169,12 +2289,20 @@ class WhatsAppManager {
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Delayed read receipt — only ~70% of the time because real users don't always
-      // open every notification immediately. Widen the delay to 3-15s (1.5-5s was
-      // suspiciously fast and consistent). Both the probability and timing add natural
-      // variance that a real WhatsApp client exhibits.
-      if (Math.random() < 0.70) {
-        const readDelay = humanDelay(3000, 15000);
+      // Delayed read receipt — real users don't read every message, and their
+      // read timing varies wildly (might read in 2s while focused, or 5min later).
+      // Fixed 70% rate is a detectable pattern. Use variable probability per-session
+      // (40-65%) and much wider delay range to mimic real behavior.
+      const readProbability = 0.40 + Math.random() * 0.25; // 40-65% per message
+      if (Math.random() < readProbability) {
+        // Wider range: 3-45s. Most real users don't read within 3s of receive.
+        // Add a long-tail: 10% chance of very delayed read (30-120s).
+        let readDelay;
+        if (Math.random() < 0.10) {
+          readDelay = humanDelay(30000, 120000); // occasional very late read
+        } else {
+          readDelay = humanDelay(3000, 45000);
+        }
         setTimeout(() => {
           sock.readMessages([msg.key]).catch(err => {
             logger.debug(`Could not send read receipt: ${err.message}`);
@@ -2391,9 +2519,11 @@ class WhatsAppManager {
         // Try to decrypt the vote using the stored poll creation message
         if (pollMsgKey?.id) {
           try {
-            const pollCreationMsg = getMessage(pollMsgKey);
+            // Use getStoredMessage (module-level function) — NOT getMessage
+            // (which is only a socket config callback, not in this scope).
+            const pollCreationMsg = getStoredMessage(pollMsgKey);
             if (pollCreationMsg) {
-              const pollEncKey = pollCreationMsg.messageContextInfo?.messageSecret;
+              const pollEncKey = (pollCreationMsg.messageContextInfo || pollCreationMsg.message?.messageContextInfo)?.messageSecret;
               if (pollEncKey && pollUpdate.vote?.encPayload) {
                 const { decryptPollVote } = require('@whiskeysockets/baileys');
                 const meId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
@@ -3451,6 +3581,12 @@ class WhatsAppManager {
     if (this._healthMonitorInterval) {
       clearInterval(this._healthMonitorInterval);
       this._healthMonitorInterval = null;
+    }
+
+    // Stop memory cleanup
+    if (this._memoryCleanupInterval) {
+      clearInterval(this._memoryCleanupInterval);
+      this._memoryCleanupInterval = null;
     }
     
     // Cancel all pending reconnection timers
