@@ -228,11 +228,26 @@ async function apiCall(url, options = {}) {
             headers: { 'Content-Type': 'application/json', ...options.headers },
             ...options
         });
+
+        // ── Auth guard: redirect to login if session expired/invalid ──
+        // Without this, the dashboard stays fully visible after session
+        // expiry because the HTML is already loaded. The server returns
+        // 401 for API calls but the client just showed a toast and kept
+        // displaying stale data — a full auth bypass from the user's POV.
+        if (response.status === 401) {
+            console.warn('[AUTH] Session expired or unauthorized — redirecting to login');
+            window.location.href = '/login';
+            throw new Error('Session expired — redirecting to login');
+        }
+
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Request failed');
         return data;
     } catch (error) {
-        showToast(error.message, 'error');
+        // Don't show toast for auth redirects (already navigating away)
+        if (!error.message.includes('redirecting to login')) {
+            showToast(error.message, 'error');
+        }
         throw error;
     }
 }

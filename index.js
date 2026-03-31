@@ -157,7 +157,8 @@ if (!sessionStore) {
 const sessionSecret = process.env.SESSION_SECRET || require('crypto').randomBytes(32).toString('hex');
 const useSecureCookies = process.env.SESSION_COOKIE_SECURE === 'true';
 
-app.use(session({
+// Build session middleware once — shared between Express and Socket.IO
+const sessionMiddleware = session({
   store: sessionStore,
   secret: sessionSecret,
   name: 'wa.sid',
@@ -170,30 +171,99 @@ app.use(session({
     maxAge: 24 * 60 * 60 * 1000,
     sameSite: useSecureCookies ? 'strict' : 'lax'
   }
-}));
+});
+
+app.use(sessionMiddleware);
 
 app.use(checkSessionTimeout);
 
 // ============================================================================
-// SOCKET.IO
+// REQUEST ID & REQUEST LOGGING
+// ============================================================================
+
+// Assign a unique ID to every request for log correlation
+app.use((req, res, next) => {
+  req.id = require('crypto').randomBytes(4).toString('hex');
+  res.setHeader('X-Request-Id', req.id);
+  next();
+});
+
+// Detailed request logger — logs every request with method, path, status, timing,
+// user, IP, and user-agent. Essential for debugging auth issues, tracking down
+// which API calls fail, and correlating server events with client actions.
+app.use((req, res, next) => {
+  const start = Date.now();
+  const { method, path: reqPath, ip } = req;
+  const user = req.session?.user?.username || 'anon';
+
+  // Log request start at debug level (very verbose but invaluable for debugging)
+  logger.debug(`[REQ] --> ${method} ${reqPath} | user=${user} ip=${ip} reqId=${req.id}`);
+
+  // Capture response finish for timing + status code
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const status = res.statusCode;
+    const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
+
+    // Skip noisy health/keepalive/static pings at info level
+    const isNoise = (reqPath === '/ping' || reqPath === '/keepalive' || reqPath.startsWith('/css/') || reqPath.startsWith('/js/') || reqPath.startsWith('/favicon'));
+    if (isNoise && status < 400) {
+      logger.debug(`[REQ] <-- ${method} ${reqPath} ${status} ${duration}ms | user=${user} reqId=${req.id}`);
+    } else {
+      logger[level](`[REQ] <-- ${method} ${reqPath} ${status} ${duration}ms | user=${user} ip=${ip} reqId=${req.id}`);
+    }
+  });
+
+  next();
+});
+
+// ============================================================================
+// SOCKET.IO — with session-based authentication
 // ============================================================================
 
 whatsappManager.setSocketIO(io);
 
-io.on('connection', (socket) => {
-  logger.debug(`Client connected: ${socket.id}`);
+// Share Express session with Socket.IO so we can check authentication.
+// Without this, ANY browser tab can open a WebSocket and receive real-time
+// account status, QR codes, and system events — even without logging in.
 
-  socket.on('disconnect', () => {
-    logger.debug(`Client disconnected: ${socket.id}`);
+// Wrap Express session middleware for Socket.IO handshake
+io.use((socket, next) => {
+  sessionMiddleware(socket.request, {}, next);
+});
+
+// Reject unauthenticated WebSocket connections
+io.use((socket, next) => {
+  const sess = socket.request.session;
+  if (sess && sess.user) {
+    logger.info(`[WS] Authenticated socket connection — user=${sess.user.username} socketId=${socket.id} ip=${socket.handshake.address}`);
+    next();
+  } else {
+    logger.warn(`[WS] REJECTED unauthenticated socket connection — socketId=${socket.id} ip=${socket.handshake.address}`);
+    next(new Error('Authentication required'));
+  }
+});
+
+io.on('connection', (socket) => {
+  const user = socket.request.session?.user?.username || 'unknown';
+  logger.info(`[WS] Client connected — user=${user} socketId=${socket.id} transport=${socket.conn.transport.name}`);
+
+  socket.on('disconnect', (reason) => {
+    logger.info(`[WS] Client disconnected — user=${user} socketId=${socket.id} reason=${reason}`);
   });
 
   socket.on('subscribe-account', (accountId) => {
     // Validate accountId format to prevent room pollution
     if (!accountId || typeof accountId !== 'string' || accountId.length > 100) {
-      logger.warn(`Invalid accountId in subscribe-account from ${socket.id}`);
+      logger.warn(`[WS] Invalid accountId in subscribe-account — user=${user} socketId=${socket.id} accountId=${JSON.stringify(accountId)?.slice(0, 50)}`);
       return;
     }
     socket.join(`account-${accountId}`);
+    logger.debug(`[WS] Subscribed to account room — user=${user} socketId=${socket.id} accountId=${accountId}`);
+  });
+
+  socket.on('error', (err) => {
+    logger.error(`[WS] Socket error — user=${user} socketId=${socket.id} error=${err.message}`);
   });
 });
 
@@ -216,6 +286,11 @@ app.get('/api/auth/user', getCurrentUser);
 app.get('/', (req, res) => res.redirect('/dashboard'));
 
 app.get('/dashboard', requireAuth, (req, res) => {
+  // Prevent browser from caching the dashboard HTML — after logout, pressing
+  // Back should show the login page, not a stale cached dashboard.
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   res.sendFile(path.join(__dirname, 'views', 'dashboard.html'));
 });
 
@@ -403,27 +478,26 @@ app.post('/api/send', messageLimiter, validate(schemas.sendMessage), async (req,
   try {
     const { api_key, to, message } = req.body;
 
-    logger.info(`[API] /api/send called - to: ${to}, message length: ${message.length}`);
+    logger.info(`[API] /api/send called — to=${to} msgLen=${message.length} reqId=${req.id}`);
 
     const account = await db.getAccountByApiKey(api_key);
     if (!account) {
-      logger.warn(`[API] Invalid API key`);
+      logger.warn(`[API] /api/send REJECTED — invalid API key | to=${to} reqId=${req.id}`);
       return res.status(401).json({ success: false, error: 'Invalid API key' });
     }
 
     if (account.status !== 'ready') {
-      logger.warn(`[API] Account not ready: ${account.status}`);
+      logger.warn(`[API] /api/send REJECTED — account not ready | accountId=${account.id} status=${account.status} to=${to} reqId=${req.id}`);
       return res.status(400).json({ success: false, error: 'Account not connected' });
     }
 
-    logger.info(`[API] Sending message via account ${account.id}`);
-    // Auto-detect if 'to' is a JID (contains @) or phone number
+    logger.info(`[API] Sending message — accountId=${account.id} to=${to} reqId=${req.id}`);
     const result = await whatsappManager.sendMessageAuto(account.id, to, message);
     
-    logger.info(`[API] Message sent successfully: ${result.messageId}`);
+    logger.info(`[API] Message sent OK — messageId=${result.messageId} accountId=${account.id} to=${to} reqId=${req.id}`);
     res.json({ success: true, ...result });
   } catch (error) {
-    logger.error('[API] Error sending message:', error.message);
+    logger.error(`[API] /api/send FAILED — ${error.message} | reqId=${req.id}`);
     res.status(500).json({ success: false, error: error.message || 'Failed to send message' });
   }
 });
@@ -682,9 +756,10 @@ app.post('/api/send-media-url', messageLimiter, async (req, res) => {
       filename || 'file'
     );
 
+    logger.info(`[API] /api/send-media-url sent OK — messageId=${result.messageId} reqId=${req.id}`);
     res.json({ success: true, ...result });
   } catch (error) {
-    logger.error('Error sending media:', error);
+    logger.error(`[API] /api/send-media-url FAILED — ${error.message} | reqId=${req.id}`);
     res.status(500).json({ success: false, error: error.message || 'Failed to send media' });
   }
 });
@@ -884,6 +959,64 @@ app.post('/api/webhooks/pipeline-stats/reset', requireAuth, apiLimiter, async (r
 });
 
 // ============================================================================
+// DEBUG / ADMIN API — requires auth, never expose in production without auth
+// ============================================================================
+
+// Returns active session info, WhatsApp connection states, and memory usage
+// for debugging auth issues, session leaks, and connection problems.
+app.get('/api/debug/status', requireAuth, async (req, res) => {
+  try {
+    const metrics = whatsappManager.getMetrics();
+    const mem = process.memoryUsage();
+    const accounts = await db.getAccounts();
+
+    const connectionStates = {};
+    for (const acct of accounts) {
+      const state = whatsappManager.getAccountStatus(acct.id);
+      connectionStates[acct.id] = {
+        name: acct.name,
+        dbStatus: acct.status,
+        runtimeStatus: state.status,
+        hasSession: !!acct.session_data,
+        lastSessionSaved: acct.last_session_saved || null
+      };
+    }
+
+    logger.info(`[DEBUG] /api/debug/status accessed by ${req.session.user.username} | reqId=${req.id}`);
+
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      server: {
+        uptime: Math.floor(process.uptime()),
+        pid: process.pid,
+        nodeVersion: process.version,
+        memory: {
+          heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+          heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+          rssMB: Math.round(mem.rss / 1024 / 1024),
+          externalMB: Math.round((mem.external || 0) / 1024 / 1024)
+        }
+      },
+      session: {
+        user: req.session.user.username,
+        loginTime: req.session.user.loginTime,
+        lastActivity: req.session.lastActivity,
+        fingerprint: req.session._fingerprint?.slice(0, 8) + '...'
+      },
+      whatsapp: {
+        metrics,
+        connections: connectionStates
+      },
+      cache: db.getCacheStats()
+    });
+  } catch (error) {
+    logger.error(`[DEBUG] /api/debug/status error: ${error.message}`);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================================================
 // AI CONFIG API
 // ============================================================================
 
@@ -922,7 +1055,9 @@ app.delete('/api/accounts/:id/ai-config', requireAuth, apiLimiter, async (req, r
 // ============================================================================
 
 app.use((err, req, res, next) => {
-  logger.error('Unhandled error:', err);
+  const reqId = req.id || '-';
+  const user = req.session?.user?.username || 'anon';
+  logger.error(`[ERROR] Unhandled error — ${req.method} ${req.path} | user=${user} ip=${req.ip} reqId=${reqId} | ${err.stack || err.message}`);
   res.status(500).json({
     success: false,
     error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
@@ -937,16 +1072,32 @@ const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
+    logger.info('='.repeat(60));
+    logger.info('  WhatsApp Multi-Automation API — Starting up');
+    logger.info('='.repeat(60));
+    logger.info(`[STARTUP] Node.js ${process.version} | PID ${process.pid} | Platform ${process.platform}`);
+    logger.info(`[STARTUP] Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB heap used`);
+    logger.info(`[STARTUP] Env: NODE_ENV=${process.env.NODE_ENV || 'development'} LOG_LEVEL=${process.env.LOG_LEVEL || 'default'}`);
+    logger.info(`[STARTUP] Session store: ${sessionStore.constructor.name}`);
+    logger.info(`[STARTUP] Admin user: ${process.env.ADMIN_USERNAME || 'admin'} | Password configured: ${!!process.env.ADMIN_PASSWORD}`);
+    logger.info(`[STARTUP] Secure cookies: ${useSecureCookies} | Trust proxy: 1`);
+
     // Start webhook delivery service
+    logger.info('[STARTUP] Starting webhook delivery service...');
     webhookDeliveryService.start();
 
     // Initialize WhatsApp accounts
+    logger.info('[STARTUP] Initializing WhatsApp accounts...');
     await whatsappManager.initializeAccounts();
 
     // Start server
     server.listen(PORT, () => {
-      logger.info(`🚀 WhatsApp Multi-Automation API running on port ${PORT}`);
-      logger.info(`📊 Dashboard: http://localhost:${PORT}/dashboard`);
+      logger.info(`[STARTUP] Server listening on port ${PORT}`);
+      logger.info(`[STARTUP] Dashboard: http://localhost:${PORT}/dashboard`);
+      logger.info(`[STARTUP] API docs: http://localhost:${PORT}/dashboard -> API Docs tab`);
+      logger.info('='.repeat(60));
+      logger.info('  READY — Accepting connections');
+      logger.info('='.repeat(60));
 
       // Self-ping keep-alive: prevents Render free tier from spinning down
       // after 15 minutes of inactivity (which kills WhatsApp connections).
