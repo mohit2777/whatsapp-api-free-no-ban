@@ -16,8 +16,7 @@ const SESSION_TIMEOUT = 24 * 60 * 60 * 1000;
  */
 function buildSessionFingerprint(req) {
   const ua = req.headers['user-agent'] || 'unknown';
-  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
-  return crypto.createHash('sha256').update(`${ua}|${ip}`).digest('hex').slice(0, 16);
+  return crypto.createHash('sha256').update(ua).digest('hex').slice(0, 16);
 }
 
 /**

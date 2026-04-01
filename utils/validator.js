@@ -8,8 +8,8 @@ const Joi = require('joi');
 const schemas = {
   // Authentication
   login: Joi.object({
-    username: Joi.string().min(3).max(50).required(),
-    password: Joi.string().min(6).max(100).required()
+    username: Joi.string().min(1).max(50).required(),
+    password: Joi.string().min(1).max(100).required()
   }),
 
   // Account creation
