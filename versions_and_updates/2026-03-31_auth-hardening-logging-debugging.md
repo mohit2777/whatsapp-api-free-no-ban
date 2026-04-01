@@ -34,6 +34,15 @@ from any IP/browser to access the dashboard.
 - `requireAuth` validates the fingerprint on every request
 - Fingerprint mismatch destroys the session and logs a `SESSION HIJACK DETECTED` error
 
+### 4. Login Session Persistence Fix
+**File:** `middleware/auth.js`
+**Problem:** Successful logins could redirect to `/dashboard` before the session write
+finished persisting to the PostgreSQL store, which caused the dashboard request to be
+treated as unauthenticated and bounced back to `/login`.
+**Fix:**
+- Login now waits for `req.session.save()` before returning `{ success: true }`
+- Failed session persistence now returns a 500 response instead of a false-positive login success
+
 ---
 
 ## EXTREME DETAILED LOGGING
@@ -102,6 +111,7 @@ from any IP/browser to access the dashboard.
 - `index.js` — Request ID middleware, request logger, Socket.IO auth, dashboard cache headers, debug endpoint, enhanced startup/error logging
 - `utils/logger.js` — Millisecond timestamps, metadata truncation, self-diagnostic log
 - `public/js/dashboard.js` — 401 redirect in apiCall()
+- `middleware/auth.js` — Explicit session save on login to prevent redirecting before persistence completes
 
 ## Files Created
 - `versions_and_updates/2026-03-31_auth-hardening-logging-debugging.md` (this file)

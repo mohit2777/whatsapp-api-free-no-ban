@@ -179,13 +179,26 @@ async function login(req, res) {
 
     logger.info(`[AUTH] LOGIN SUCCESS — user=${adminUsername} | ip=${info.ip} sid=${req.sessionID?.slice(0, 8)}... fp=${fingerprint} reqId=${info.reqId}`);
 
-    res.json({
-      success: true,
-      message: 'Login successful',
-      user: {
-        username: adminUsername,
-        role: 'admin'
+    // Explicitly save session to the store before responding.
+    // Without this, the client may redirect to /dashboard before the
+    // session is persisted to PostgreSQL, causing requireAuth to fail.
+    req.session.save((saveErr) => {
+      if (saveErr) {
+        logger.error(`[AUTH] Session save failed — ${saveErr.message} | user=${adminUsername} ip=${info.ip} reqId=${info.reqId}`);
+        return res.status(500).json({
+          success: false,
+          error: 'Session initialization failed'
+        });
       }
+
+      res.json({
+        success: true,
+        message: 'Login successful',
+        user: {
+          username: adminUsername,
+          role: 'admin'
+        }
+      });
     });
   } catch (error) {
     logger.error(`[AUTH] Login error — ${error.message} | ip=${info.ip} reqId=${info.reqId}`, error);
