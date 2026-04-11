@@ -755,9 +755,9 @@ class WhatsAppManager {
           logger.info(`[RESOLVE] Resolved @lid via onWhatsApp: ${lidNumber}@lid → ${phoneJid}`);
           return phoneJid;
         }
-        // Last resort: send to @lid (may still fail but no other option)
-        logger.warn(`[RESOLVE] No phone mapping for LID ${lidNumber}, sending to @lid as last resort (may cause "Waiting for message")`);
-        return trimmed;
+        // Never send to @lid. Baileys v6 can produce undecryptable messages
+        // and "Waiting for message" when the phone JID is unknown.
+        throw new Error(`Cannot send to unresolved LID ${lidNumber}. Wait for a phone mapping before replying.`);
       }
       
       // @s.whatsapp.net — pass through (already phone format)
@@ -2353,7 +2353,8 @@ class WhatsAppManager {
       }
 
       const senderPhone = senderInfo.phone || senderInfo.lid || null;
-      const replyJid = remoteJid;
+      const directReplyPhone = !isGroup ? (senderInfo.phone || null) : null;
+      const directReplyJid = directReplyPhone ? `${directReplyPhone}@s.whatsapp.net` : null;
       const contactId = senderPhone;
       
       // ====== EXTRACT MESSAGE CONTENT + MEDIA ======
@@ -2643,11 +2644,13 @@ class WhatsAppManager {
       const webhookPayload = {
         messageId: msg.key.id,
         from: senderInfo.phone || senderInfo.lid,  // Best identifier: phone if resolved, else LID
+        phone: senderInfo.phone || null,
         message: messageText,
         messageType,
         isGroup,
         timestamp: msg.messageTimestamp,
         pushName: msg.pushName || 'Unknown',
+        replyTo: isGroup ? remoteJid : directReplyPhone,
       };
 
       // Include LID only when available (useful for LID-based systems)
@@ -2655,9 +2658,8 @@ class WhatsAppManager {
         webhookPayload.lid = senderInfo.lid;
       }
 
-      // Add group info — replyTo only included for groups (carries group JID)
+      // Add group info for automations that need participant context.
       if (isGroup) {
-        webhookPayload.replyTo = remoteJid;
         webhookPayload.groupJid = remoteJid;
         webhookPayload.participant = msg.key.participant || null;
         // Use participantPn from message key first (most reliable), then fallback to mapping
@@ -2705,6 +2707,11 @@ class WhatsAppManager {
       if (contactId) this._resetAiReplyCounter(accountId, contactId);
 
       if (messageType === 'text' && !isGroup && contactId) {
+        if (!directReplyJid) {
+          logger.info(`[AI] Skipping auto-reply to ${contactId} for ${accountId} — no safe phone reply target resolved yet`);
+          return;
+        }
+
         // Loop guard: block if we've already sent MAX consecutive AI replies
         if (!this._checkAiReplyAllowed(accountId, contactId)) {
           logger.info(`[AI] Skipping auto-reply to ${contactId} for ${accountId} — loop guard active`);
@@ -2718,7 +2725,7 @@ class WhatsAppManager {
               message: messageText
             }).then(aiReply => {
               if (aiReply) {
-                this.sendMessageToJid(accountId, replyJid, aiReply).catch(err => {
+                this.sendMessageToJid(accountId, directReplyJid, aiReply).catch(err => {
                   logger.error(`Failed to send AI reply: ${err.message}`);
                 });
               }
@@ -2804,7 +2811,9 @@ class WhatsAppManager {
         // Save to conversation history
         // Always resolve to phone number for consistent conversation tracking
         const contactId = this.getPhoneNumber(jid) || phone;
-        await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+        db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text').catch(dbErr => {
+          logger.error(`[MESSAGE] Failed to save outgoing conversation for ${accountId}/${contactId}: ${dbErr.message}`);
+        });
 
         // Schedule debounced session save — Signal pre-keys update on sends but
         // saving to DB on every single message causes write storms and DB contention.
@@ -2903,7 +2912,9 @@ class WhatsAppManager {
         
         // Save to conversation history
         const contactId = this.getPhoneNumber(resolvedJid) || jid.split('@')[0];
-        await db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text');
+        db.addConversationMessage(accountId, contactId, 'outgoing', message, 'text').catch(dbErr => {
+          logger.error(`[MESSAGE] Failed to save outgoing conversation for ${accountId}/${contactId}: ${dbErr.message}`);
+        });
 
         // Schedule debounced session save (at most once per 30s, not on every send)
         this._scheduleSessionSave(accountId);

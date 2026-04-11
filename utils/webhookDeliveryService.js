@@ -422,6 +422,15 @@ class WebhookDeliveryService {
   }
 
   /**
+   * Only message and status events belong in the message pipeline mismatch counter.
+   * Connection events are optional lifecycle hooks and should not pollute the
+   * message diagnostics when a webhook intentionally subscribes only to messages.
+   */
+  isPipelineEvent(event) {
+    return event === 'message' || event === 'message.status';
+  }
+
+  /**
    * Dispatch webhook to all active webhooks for an account
    */
   async dispatch(accountId, event, data) {
@@ -484,14 +493,25 @@ class WebhookDeliveryService {
       }
     }
 
-    this._logActivity({ type: 'dispatch', accountId, event, webhookCount: webhooks.length, queued, status: queued > 0 ? 'queued' : 'no_match' });
+    const isPipelineEvent = this.isPipelineEvent(event);
+    const dispatchStatus = queued > 0
+      ? 'queued'
+      : isPipelineEvent
+        ? 'no_match'
+        : 'optional_no_match';
+
+    this._logActivity({ type: 'dispatch', accountId, event, webhookCount: webhooks.length, queued, status: dispatchStatus });
 
     if (queued > 0) {
       this.pipelineStats.dispatch_queued++;
       logger.info(`[WEBHOOK] Queued ${queued}/${webhooks.length} webhook(s) for event '${event}'`);
     } else if (webhooks.length > 0) {
-      this.pipelineStats.dispatch_event_mismatch++;
-      logger.warn(`[WEBHOOK] No webhooks matched event '${event}' for account ${accountId} — check event subscriptions in dashboard`);
+      if (isPipelineEvent) {
+        this.pipelineStats.dispatch_event_mismatch++;
+        logger.warn(`[WEBHOOK] No webhooks matched event '${event}' for account ${accountId} — check event subscriptions in dashboard`);
+      } else {
+        logger.info(`[WEBHOOK] Optional event '${event}' has no subscribers for account ${accountId}`);
+      }
     }
   }
 }

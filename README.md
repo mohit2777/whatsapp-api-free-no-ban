@@ -475,9 +475,9 @@ Webhooks send real-time events to your specified URL. Configure via dashboard or
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `from` | string | Sender phone number with country code |
-| `phone` | string | Resolved phone number (null if unavailable) |
-| `replyTo` | string | Use this value as `to` in `/api/send` to reply |
+| `from` | string | Best sender identifier: resolved phone number when available, otherwise the sender LID |
+| `phone` | string | Resolved phone number (`null` if WhatsApp only exposed an unresolved LID) |
+| `replyTo` | string | Safe reply target for `/api/send`: direct chats use the resolved phone number, groups use the group JID, unresolved direct LIDs return `null` |
 | `messageType` | string | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, `ptt`, `poll`, `poll_vote` |
 | `pushName` | string | Sender's WhatsApp display name |
 | `isGroup` | boolean | Whether the message is from a group chat |
@@ -581,6 +581,8 @@ When someone votes on a poll, you receive their selected options:
 }
 ```
 
+If your webhook subscribes only to `message` or `message.status`, the dashboard may still show connection dispatch attempts in the live activity log. Those are local webhook-subscription checks only; they do not send anything back to WhatsApp and do not create Meta automation signals by themselves.
+
 ---
 
 ### Using `replyTo` for Auto-Replies (n8n / Make / Zapier)
@@ -615,6 +617,8 @@ function verifyWebhook(payload, signature, secret) {
   return signature === expected;
 }
 ```
+
+If `replyTo` is `null`, do not auto-reply yet. That means the sender is currently identified only by an unresolved LID, and forcing a reply can produce `Waiting for message` / decryption failures.
 
 ---
 

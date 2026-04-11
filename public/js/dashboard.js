@@ -374,7 +374,7 @@ function renderPipelineStats(p) {
     const dispatchStats = [
         { label: 'dispatch() called', value: p.dispatch_called, icon: '📤' },
         { label: 'No webhooks in DB', value: p.dispatch_no_webhooks, icon: '⚠️' },
-        { label: 'Event mismatch', value: p.dispatch_event_mismatch, icon: '🔀' },
+        { label: 'Message event mismatch', value: p.dispatch_event_mismatch, icon: '🔀' },
         { label: 'Successfully queued', value: p.dispatch_queued, icon: '✅' },
     ];
 
@@ -412,7 +412,7 @@ function renderPipelineStats(p) {
     html += '<div class="pipeline-dispatch"><div class="pipeline-drops-title">Webhook dispatch:</div>';
     for (const d of dispatchStats) {
         const highlight = d.value > 0 && d.label === 'Successfully queued' ? ' pipeline-success' : '';
-        const warn = d.value > 0 && (d.label === 'No webhooks in DB' || d.label === 'Event mismatch') ? ' pipeline-warn' : '';
+        const warn = d.value > 0 && (d.label === 'No webhooks in DB' || d.label === 'Message event mismatch') ? ' pipeline-warn' : '';
         html += `<div class="pipeline-drop-item${highlight}${warn}">
             <span class="pipeline-icon">${d.icon}</span>
             <span class="pipeline-drop-value">${d.value}</span>
@@ -456,12 +456,17 @@ function renderActivityLog(entries) {
             </div>`;
         }
         if (e.type === 'dispatch') {
-            const statusClass = e.status === 'queued' ? 'activity-ok' : (e.status === 'no_webhooks' ? 'activity-warn' : 'activity-warn');
-            const icon = e.status === 'queued' ? '🚀' : '⚠️';
+            const optionalNoMatch = e.status === 'optional_no_match';
+            const statusClass = e.status === 'queued'
+                ? 'activity-ok'
+                : e.status === 'no_webhooks' || e.status === 'no_match'
+                    ? 'activity-warn'
+                    : '';
+            const icon = e.status === 'queued' ? '🚀' : optionalNoMatch ? 'ℹ️' : '⚠️';
             return `<div class="activity-entry ${statusClass}">
                 <span class="activity-time">${time}</span>
                 <span class="activity-icon">${icon}</span>
-                <span class="activity-text">Dispatch <strong>${e.event}</strong> → ${e.queued || 0}/${e.webhookCount || 0} webhook(s) ${e.status === 'no_webhooks' ? '<em>(no active webhooks!)</em>' : e.status === 'no_match' ? '<em>(no event match)</em>' : ''}</span>
+                <span class="activity-text">Dispatch <strong>${e.event}</strong> → ${e.queued || 0}/${e.webhookCount || 0} webhook(s) ${e.status === 'no_webhooks' ? '<em>(no active webhooks!)</em>' : e.status === 'no_match' ? '<em>(no event match)</em>' : optionalNoMatch ? '<em>(optional event has no subscribers)</em>' : ''}</span>
                 <span class="activity-account">${(e.accountId || '').substring(0, 8)}</span>
             </div>`;
         }
@@ -1456,19 +1461,19 @@ const API_ENDPOINTS = {
     // ─── Messages ────────────────────────────────────────────────────────
     'send-text': {
         group: 'messages', method: 'POST', path: '/api/send',
-        desc: 'Send a text message. The "to" field accepts a phone number (auto-formatted) or a JID from a webhook (e.g. 919876543210@s.whatsapp.net).',
+            desc: 'Send a text message. The "to" field accepts a phone number, a group JID, or the safe `replyTo` value from an incoming webhook.',
         auth: 'API Key (in body)',
         body: { api_key: 'YOUR_API_KEY', to: '919876543210', message: 'Hello from WAMulti API!' },
         bodyFields: [
             { name: 'api_key', type: 'string', required: true, desc: 'Your account API key' },
-            { name: 'to', type: 'string', required: true, desc: 'Phone number or JID (from webhook fromJid)' },
+                { name: 'to', type: 'string', required: true, desc: 'Phone number, group JID, or webhook data.replyTo value' },
             { name: 'message', type: 'string', required: true, desc: 'Message text' },
         ],
         response: { success: true, messageId: '3EB0F4A2B3C4D5E6F7', timestamp: 1706889600000 },
         errors: [
             { code: 401, body: { success: false, error: 'Invalid API key' } },
             { code: 400, body: { success: false, error: 'Account not connected' } },
-            { code: 429, body: { success: false, error: 'Rate limit exceeded (30 msg/min)' } },
+                { code: 429, body: { success: false, error: 'Too many requests', message: 'Please wait before making more requests. Limit: 20 requests per 60 seconds.' } },
         ],
         curl: `curl -X POST https://YOUR_DOMAIN/api/send \\
   -H "Content-Type: application/json" \\
@@ -1478,9 +1483,9 @@ const API_ENDPOINTS = {
     "message": "Hello from WAMulti!"
   }'`,
         tips: [
-            'Use the <code>fromJid</code> field from incoming webhook data to reply to messages',
-            'Rate limited to 30 messages per 60 seconds per account',
-            'Phone numbers are auto-formatted — no need to add country code prefix or @s.whatsapp.net',
+            'Use the <code>replyTo</code> field from incoming webhook data when replying to messages',
+            'The WhatsApp send path is capped at 20 messages per minute and 80 per hour per account',
+            'Phone numbers are auto-formatted — use full country-code digits, but do not add +, spaces, or @s.whatsapp.net',
         ],
     },
     'send-media': {
@@ -1525,7 +1530,7 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
   -F "media=@/path/to/photo.jpg"`,
         n8n: `{
   "api_key": "YOUR_API_KEY",
-  "to": "{{ $json.data.fromJid }}",
+      "to": "{{ $json.data.replyTo }}",
   "mediaType": "document",
   "caption": "Your file",
   "filename": "report.pdf",
@@ -1567,7 +1572,7 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
         n8n: `// n8n: Send binary data (e.g. from a previous node)
 {
   "api_key": "YOUR_API_KEY",
-  "to": "{{ $json.data.fromJid }}",
+    "to": "{{ $json.data.replyTo }}",
   "mediaType": "document",
   "mediaBase64": "{{ $binary.data.data }}",
   "mimetype": "{{ $binary.data.mimeType }}",
@@ -1660,12 +1665,13 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
   "data": {
     "messageId": "ABC123",
     "from": "918005780278",
-    "fromJid": "918005780278@s.whatsapp.net",
-    "isLidSender": false,
+        "phone": "918005780278",
     "message": "Hello!",
     "messageType": "text",
     "isGroup": false,
-    "pushName": "John Doe"
+        "timestamp": 1741521600,
+        "pushName": "John Doe",
+        "replyTo": "918005780278"
   }
 }`,
         payloadFields: [
@@ -1673,15 +1679,17 @@ curl -X POST https://YOUR_DOMAIN/api/send-media \\
             { name: 'timestamp', desc: 'ISO 8601 timestamp of when the event occurred' },
             { name: 'account_id', desc: 'Your WAMulti account UUID' },
             { name: 'data.messageId', desc: 'Unique message identifier' },
-            { name: 'data.from', desc: 'Sender phone number (without @s.whatsapp.net)' },
-            { name: 'data.fromJid', desc: 'Full JID — use this in the "to" field when replying' },
+            { name: 'data.from', desc: 'Best sender identifier: resolved phone when available, otherwise the sender LID' },
+            { name: 'data.phone', desc: 'Resolved phone number (`null` when WhatsApp only exposed an unresolved LID)' },
             { name: 'data.message', desc: 'The message text content' },
             { name: 'data.messageType', desc: 'Type: text, image, video, audio, document, sticker, poll, etc.' },
             { name: 'data.isGroup', desc: 'true if message is from a group chat' },
+            { name: 'data.timestamp', desc: 'Original WhatsApp message timestamp' },
             { name: 'data.pushName', desc: 'Sender\'s display name on WhatsApp' },
+            { name: 'data.replyTo', desc: 'Safe reply target for /api/send; direct chats use the phone number, groups use the group JID, unresolved direct LIDs return null' },
         ],
         n8nAccess: `// n8n field access:
-// Reply To:     {{ $json.data.fromJid }}
+    // Reply To:     {{ $json.data.replyTo }}
 // Message:      {{ $json.data.message }}
 // Sender Name:  {{ $json.data.pushName }}
 // Message Type: {{ $json.data.messageType }}
@@ -1959,7 +1967,7 @@ function renderReferenceEndpoint(ep) {
         <div class="integration-steps">
             <div class="step"><span class="step-num">1</span><div><strong>Create Webhook Trigger</strong><p>Add a Webhook node in n8n. Copy the Production URL and add it in the Webhooks section of this dashboard.</p></div></div>
             <div class="step"><span class="step-num">2</span><div><strong>Add HTTP Request Node</strong><p>Method: POST, URL: https://YOUR_DOMAIN/api/send</p></div></div>
-            <div class="step"><span class="step-num">3</span><div><strong>Set JSON Body</strong><p>Use api_key, to: {{ $json.data.fromJid }}, message: your reply text</p></div></div>
+            <div class="step"><span class="step-num">3</span><div><strong>Set JSON Body</strong><p>Use api_key, to: {{ $json.data.replyTo }}, message: your reply text. If replyTo is null, wait for a resolved phone target before replying.</p></div></div>
         </div>
     </div>`;
 
