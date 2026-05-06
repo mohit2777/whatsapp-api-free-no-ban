@@ -296,7 +296,7 @@ class WhatsAppManager {
     this.minReconnectInterval = 120000; // Minimum 120s between reconnections (doubled for safety)
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
-    this.SESSION_SAVE_DEBOUNCE_MS = 3000; // Save session to DB at most once per 3s (reduced from 5s to narrow the data-loss window on ephemeral filesystems — signal key loss → CIPHERTEXT → ban)
+    this.SESSION_SAVE_DEBOUNCE_MS = 1000; // Save session to DB at most once per 1s (reduced from 3s to further narrow data-loss window on ephemeral filesystems — signal key loss → CIPHERTEXT → ban)
     this.periodicSessionSaveTimers = new Map(); // Periodic save timers per account
     this.PERIODIC_SESSION_SAVE_MS = 60000; // Save session to DB every 60s as safety net
     this.lastSessionHashes = new Map(); // Track last saved session hash to skip redundant writes
@@ -359,6 +359,10 @@ class WhatsAppManager {
     // Memory cleanup interval — evicts stale entries from unbounded Maps
     // to prevent OOM crashes that trigger reconnection storms → ban risk.
     this._memoryCleanupInterval = null;
+
+    // Pre-key replenishment guard — tracks which accounts have had their
+    // pre-keys verified since startup to avoid first-contact encrypt failures.
+    this._preKeysChecked = new Set();
   }
 
   /**
@@ -887,6 +891,44 @@ class WhatsAppManager {
     // Store a non-rejecting tail so the chain never permanently breaks.
     this.sendQueues.set(accountId, next.catch(() => {}));
     return next; // Propagate actual result/error to the caller.
+  }
+
+  /**
+   * Pre-send Signal session + pre-key guard.
+   * Ensures the Signal session with the target JID exists and that pre-keys
+   * are available on the server before attempting to encrypt a message.
+   *
+   * Without this:
+   * - First-contact sends can fail if no session exists yet
+   * - After restart, pre-keys may be depleted → CIPHERTEXT on first message
+   * - The error is intermittent because it depends on whether the contact
+   *   has previously established a session with this device
+   *
+   * This method is idempotent and safe to call before every send — the
+   * pre-key upload is done once per account per startup, and assertSessions
+   * is a no-op when the session already exists.
+   */
+  async _ensureSignalSession(accountId, sock, jid) {
+    // Step 1: Assert Signal session exists for this JID
+    // false = don't force-reset existing sessions (only create if missing)
+    try {
+      await sock.assertSessions([jid], false);
+    } catch (sessionErr) {
+      logger.warn(`[SEND] Pre-send session assertion failed for ${jid}: ${sessionErr.message}`);
+      // Don't throw — let sendMessage try anyway (it has its own retry)
+    }
+
+    // Step 2: Ensure pre-keys are uploaded (once per account per startup)
+    if (!this._preKeysChecked.has(accountId)) {
+      try {
+        await sock.uploadPreKeysToServerIfRequired();
+        this._preKeysChecked.add(accountId);
+        logger.debug(`[SEND] Pre-key check completed for ${accountId}`);
+      } catch (preKeyErr) {
+        logger.warn(`[SEND] Pre-key upload check failed for ${accountId}: ${preKeyErr.message}`);
+        // Don't throw — pre-keys might still be available from the on-connect upload
+      }
+    }
   }
 
   /**
@@ -2289,26 +2331,14 @@ class WhatsAppManager {
       const remoteJid = msg.key.remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Delayed read receipt — real users don't read every message, and their
-      // read timing varies wildly (might read in 2s while focused, or 5min later).
-      // Fixed 70% rate is a detectable pattern. Use variable probability per-session
-      // (40-65%) and much wider delay range to mimic real behavior.
-      const readProbability = 0.40 + Math.random() * 0.25; // 40-65% per message
-      if (Math.random() < readProbability) {
-        // Wider range: 3-45s. Most real users don't read within 3s of receive.
-        // Add a long-tail: 10% chance of very delayed read (30-120s).
-        let readDelay;
-        if (Math.random() < 0.10) {
-          readDelay = humanDelay(30000, 120000); // occasional very late read
-        } else {
-          readDelay = humanDelay(3000, 45000);
-        }
-        setTimeout(() => {
-          sock.readMessages([msg.key]).catch(err => {
-            logger.debug(`Could not send read receipt: ${err.message}`);
-          });
-        }, readDelay);
-      }
+      // Read receipt with human-like delay (2-15s).
+      // Always sent — no probability skip — but delayed enough to look natural.
+      const readDelay = humanDelay(2000, 15000);
+      setTimeout(() => {
+        sock.readMessages([msg.key]).catch(err => {
+          logger.debug(`Could not send read receipt: ${err.message}`);
+        });
+      }, readDelay);
       
       const isLidFormat = remoteJid?.includes('@lid');
       const senderInfo = this.extractSenderInfo(msg, sock);
@@ -2800,6 +2830,9 @@ class WhatsAppManager {
         // Brief natural pause between typing stop and send
         await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
 
+        // Ensure Signal session + pre-keys before sending (prevents intermittent encrypt failures)
+        await this._ensureSignalSession(accountId, sock, jid);
+
         // Send message
         const result = await sock.sendMessage(jid, { text: message });
 
@@ -2901,6 +2934,9 @@ class WhatsAppManager {
         await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => {});
 
         await new Promise(resolve => setTimeout(resolve, humanDelay(200, 600)));
+
+        // Ensure Signal session + pre-keys before sending (prevents intermittent encrypt failures)
+        await this._ensureSignalSession(accountId, sock, resolvedJid);
 
         // Send message
         const result = await sock.sendMessage(resolvedJid, { text: message });
@@ -3041,6 +3077,9 @@ class WhatsAppManager {
             throw new Error(`Unsupported media type: ${mediaType}`);
         }
 
+        // Ensure Signal session + pre-keys before sending (prevents intermittent encrypt failures)
+        await this._ensureSignalSession(accountId, sock, jid);
+
         const result = await sock.sendMessage(jid, messageContent);
 
         // Store sent message for retry system
@@ -3121,6 +3160,9 @@ class WhatsAppManager {
         await new Promise(resolve => setTimeout(resolve, humanDelay(1000, 2500)));
         await sock.sendPresenceUpdate('paused', jid).catch(() => {});
         await new Promise(resolve => setTimeout(resolve, humanDelay(200, 500)));
+
+        // Ensure Signal session + pre-keys before sending (prevents intermittent encrypt failures)
+        await this._ensureSignalSession(accountId, sock, jid);
 
         const result = await sock.sendMessage(jid, {
           poll: {
