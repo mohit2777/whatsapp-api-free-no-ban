@@ -963,7 +963,7 @@ body {
 .activity-entry.activity-message { border-left-color: var(--primary); background: rgba(99, 102, 241, 0.05); }
 .activity-time { color: var(--text-muted); min-width: 70px; flex-shrink: 0; }
 .activity-icon { flex-shrink: 0; }
-.activity-text { flex: 1; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity-text { flex: 1; color: var(--text-secondary); word-break: break-all; }
 .activity-text strong { color: var(--text-primary); }
 .activity-text em { color: var(--text-muted); font-style: italic; }
 .activity-account { color: var(--text-muted); font-size: 10px; min-width: 58px; text-align: right; flex-shrink: 0; }

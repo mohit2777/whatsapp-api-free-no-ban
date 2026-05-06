@@ -511,13 +511,7 @@ function renderActivityLog(entries) {
 
 function truncateUrl(url) {
     if (!url) return '?';
-    try {
-        const u = new URL(url);
-        const path = u.pathname.length > 30 ? u.pathname.substring(0, 27) + '...' : u.pathname;
-        return u.hostname + path;
-    } catch {
-        return url.length > 50 ? url.substring(0, 47) + '...' : url;
-    }
+    return url;
 }
 
 async function createAccount(e) {
