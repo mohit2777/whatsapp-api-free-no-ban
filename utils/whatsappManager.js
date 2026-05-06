@@ -296,7 +296,7 @@ class WhatsAppManager {
     this.minReconnectInterval = 120000; // Minimum 120s between reconnections (doubled for safety)
     this.qrTimeoutMs = 60000; // QR code generation timeout (60 seconds)
     this.sessionSaveTimers = new Map(); // Debounced session save timers per account
-    this.SESSION_SAVE_DEBOUNCE_MS = 1000; // Save session to DB at most once per 1s (reduced from 3s to further narrow data-loss window on ephemeral filesystems — signal key loss → CIPHERTEXT → ban)
+    this.SESSION_SAVE_DEBOUNCE_MS = 3000; // Save session to DB at most once per 3s (reduced from 5s to narrow the data-loss window on ephemeral filesystems — signal key loss → CIPHERTEXT → ban)
     this.periodicSessionSaveTimers = new Map(); // Periodic save timers per account
     this.PERIODIC_SESSION_SAVE_MS = 60000; // Save session to DB every 60s as safety net
     this.lastSessionHashes = new Map(); // Track last saved session hash to skip redundant writes
